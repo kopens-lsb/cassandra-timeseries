@@ -326,4 +326,26 @@ public class TimeSeriesFctsTest extends CQLTester
                                   org.apache.cassandra.exceptions.InvalidRequestException.class,
                                   "SELECT histogram(v, 20, 0, 4) FROM %s WHERE k = 1");
     }
+
+    @Test
+    public void testApproxCountDistinct() throws Throwable
+    {
+        createTable("CREATE TABLE %s (k int, ts timestamp, v int, PRIMARY KEY (k, ts))");
+        // Six rows but only three distinct values; HyperLogLog++ is exact at this tiny cardinality.
+        execute("INSERT INTO %s (k, ts, v) VALUES (1, '2024-01-01 09:00:00+0000', 1)");
+        execute("INSERT INTO %s (k, ts, v) VALUES (1, '2024-01-01 09:00:01+0000', 1)");
+        execute("INSERT INTO %s (k, ts, v) VALUES (1, '2024-01-01 09:00:02+0000', 2)");
+        execute("INSERT INTO %s (k, ts, v) VALUES (1, '2024-01-01 09:00:03+0000', 3)");
+        execute("INSERT INTO %s (k, ts, v) VALUES (1, '2024-01-01 09:00:04+0000', 3)");
+        execute("INSERT INTO %s (k, ts, v) VALUES (1, '2024-01-01 09:00:05+0000', 2)");
+
+        assertRows(execute("SELECT approx_count_distinct(v) FROM %s WHERE k = 1"), row(3L));
+    }
+
+    @Test
+    public void testApproxCountDistinctEmptyIsZero() throws Throwable
+    {
+        createTable("CREATE TABLE %s (k int, ts timestamp, v int, PRIMARY KEY (k, ts))");
+        assertRows(execute("SELECT approx_count_distinct(v) FROM %s WHERE k = 1"), row(0L));
+    }
 }

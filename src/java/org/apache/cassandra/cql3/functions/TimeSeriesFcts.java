@@ -22,6 +22,9 @@ import java.util.ArrayList;
 import java.util.Collections;
 import java.util.List;
 
+import com.clearspring.analytics.stream.cardinality.HyperLogLogPlus;
+import com.clearspring.analytics.stream.cardinality.ICardinality;
+
 import org.apache.cassandra.cql3.CQL3Type;
 import org.apache.cassandra.cql3.Duration;
 import org.apache.cassandra.cql3.FunctionContext;
@@ -33,6 +36,7 @@ import org.apache.cassandra.db.marshal.LongType;
 import org.apache.cassandra.db.marshal.NumberType;
 import org.apache.cassandra.db.marshal.TimestampType;
 import org.apache.cassandra.exceptions.InvalidRequestException;
+import org.apache.cassandra.utils.ByteBufferUtil;
 
 import static org.apache.cassandra.cql3.statements.RequestValidations.invalidRequest;
 
@@ -144,6 +148,69 @@ public final class TimeSeriesFcts
                 return makeHistogramFunction(argTypes);
             }
         });
+
+        // approx_count_distinct(value): HyperLogLog cardinality estimate over any value type
+        functions.add(new FunctionFactory("approx_count_distinct", FunctionParameter.anyType(false))
+        {
+            @Override
+            protected NativeFunction doGetOrCreateFunction(List<AbstractType<?>> argTypes, AbstractType<?> receiverType)
+            {
+                return makeApproxCountDistinctFunction(argTypes.get(0));
+            }
+        });
+    }
+
+    /**
+     * Builds the {@code approx_count_distinct(value)} aggregate: an estimate of the number of distinct values using a
+     * HyperLogLog++ sketch (the same {@code stream-lib} estimator used for SSTable cardinality). Memory is bounded
+     * regardless of cardinality, and the sketch merges associatively so the result is order-independent. Returns 0 for
+     * an empty group. Distinct values are identified by their serialized bytes.
+     *
+     * @param valueType the type of the value argument
+     */
+    private static NativeAggregateFunction makeApproxCountDistinctFunction(AbstractType<?> valueType)
+    {
+        return new NativeAggregateFunction("approx_count_distinct", LongType.instance, valueType)
+        {
+            @Override
+            public Arguments newArguments(FunctionContext context)
+            {
+                // The value is hashed as raw bytes, so no deserialization is needed.
+                return FunctionArguments.newNoopInstance(context, 1);
+            }
+
+            @Override
+            public Aggregate newAggregate()
+            {
+                return new Aggregate()
+                {
+                    // p=14 gives ~0.8% standard error with a fixed ~16KB footprint.
+                    private ICardinality cardinality = new HyperLogLogPlus(14, 25);
+
+                    @Override
+                    public void reset()
+                    {
+                        cardinality = new HyperLogLogPlus(14, 25);
+                    }
+
+                    @Override
+                    public void addInput(Arguments arguments)
+                    {
+                        ByteBuffer value = arguments.get(0);
+                        if (value == null)
+                            return;
+
+                        cardinality.offer(ByteBufferUtil.getArray(value));
+                    }
+
+                    @Override
+                    public ByteBuffer compute(FunctionContext context)
+                    {
+                        return LongType.instance.decompose(cardinality.cardinality());
+                    }
+                };
+            }
+        };
     }
 
     /** Builds the {@code variance}/{@code stddev} aggregate factory (sample, i.e. divided by n-1). */
