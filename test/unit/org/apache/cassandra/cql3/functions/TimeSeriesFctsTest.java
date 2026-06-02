@@ -236,6 +236,36 @@ public class TimeSeriesFctsTest extends CQLTester
     }
 
     @Test
+    public void testCorrelationAndCovariance() throws Throwable
+    {
+        createTable("CREATE TABLE %s (k int, ts timestamp, x double, y double, PRIMARY KEY (k, ts))");
+        // Perfect positive linear relationship y = 2x over (1,2),(2,4),(3,6).
+        execute("INSERT INTO %s (k, ts, x, y) VALUES (1, '2024-01-01 09:00:00+0000', 1, 2)");
+        execute("INSERT INTO %s (k, ts, x, y) VALUES (1, '2024-01-01 09:00:01+0000', 2, 4)");
+        execute("INSERT INTO %s (k, ts, x, y) VALUES (1, '2024-01-01 09:00:02+0000', 3, 6)");
+
+        // corr = 1.0; covar_pop = 4/3; covar_samp = 2.0.
+        assertRows(execute("SELECT corr(y, x), covar_pop(y, x), covar_samp(y, x) FROM %s WHERE k = 1"),
+                   row(1.0, 4.0 / 3.0, 2.0));
+    }
+
+    @Test
+    public void testCorrelationEdgeCases() throws Throwable
+    {
+        createTable("CREATE TABLE %s (k int, ts timestamp, x double, y double, PRIMARY KEY (k, ts))");
+        // Empty: all null.
+        assertRows(execute("SELECT corr(y, x), covar_pop(y, x), covar_samp(y, x) FROM %s WHERE k = 1"),
+                   row(null, null, null));
+        // Single row: corr and covar_samp undefined; covar_pop = 0.
+        execute("INSERT INTO %s (k, ts, x, y) VALUES (1, '2024-01-01 09:00:00+0000', 5, 9)");
+        assertRows(execute("SELECT corr(y, x), covar_pop(y, x), covar_samp(y, x) FROM %s WHERE k = 1"),
+                   row(null, 0.0, null));
+        // Zero variance in x (constant) -> corr undefined (null).
+        execute("INSERT INTO %s (k, ts, x, y) VALUES (1, '2024-01-01 09:00:01+0000', 5, 12)");
+        assertRows(execute("SELECT corr(y, x) FROM %s WHERE k = 1"), row((Object) null));
+    }
+
+    @Test
     public void testPercentile() throws Throwable
     {
         createTable("CREATE TABLE %s (k int, ts timestamp, v double, PRIMARY KEY (k, ts))");
