@@ -31,6 +31,7 @@ All examples are runnable in `cqlsh`. Function reference (argument order matters
 | `delta` | `delta(value, timestamp)` | `double` |
 | `rate` | `rate(value, timestamp)` | `double` (per second) |
 | `derivative` | `derivative(value, timestamp)` | `double` (per second, least-squares slope) |
+| `counter_delta` / `counter_rate` | `counter_delta(value, ts)` / `counter_rate(value, ts)` | `double` (reset-aware counter increase / per second) |
 | `percentile` | `percentile(value, q)` with `q` in `[0,1]` | `double` |
 | `time_weighted_average` | `time_weighted_average(value, timestamp)` | `double` |
 | `variance` / `stddev` | `variance(value)` / `stddev(value)` | `double` (sample) |
@@ -219,8 +220,9 @@ CREATE TABLE counters (
     PRIMARY KEY (series, ts)
 );                                     -- counters cannot use TWCS/TTL; shown for the query shape
 
--- Requests per second over each minute (gauge semantics; counter resets are not compensated)
-SELECT time_bucket(1m, ts) AS minute, rate(total, ts) AS req_per_sec
+-- Requests per second over each minute. counter_rate compensates for counter resets (use it, not rate(),
+-- for monotonic counters); rate() would treat a reset as a large negative step.
+SELECT time_bucket(1m, ts) AS minute, counter_rate(total, ts) AS req_per_sec
 FROM   counters
 WHERE  series = 'api.requests'
 GROUP  BY series, time_bucket(1m, ts);

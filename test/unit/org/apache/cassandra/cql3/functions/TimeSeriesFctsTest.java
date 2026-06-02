@@ -196,6 +196,46 @@ public class TimeSeriesFctsTest extends CQLTester
     }
 
     @Test
+    public void testCounterDeltaAndRateWithReset() throws Throwable
+    {
+        createTable("CREATE TABLE %s (k int, ts timestamp, v int, PRIMARY KEY (k, ts))");
+        // Monotonic counter with a reset at 09:00:20 (10 -> 5): increase = 10 + 5(after reset) + 10 = 25 over 30s.
+        execute("INSERT INTO %s (k, ts, v) VALUES (1, '2024-01-01 09:00:00+0000', 0)");
+        execute("INSERT INTO %s (k, ts, v) VALUES (1, '2024-01-01 09:00:10+0000', 10)");
+        execute("INSERT INTO %s (k, ts, v) VALUES (1, '2024-01-01 09:00:20+0000', 5)");
+        execute("INSERT INTO %s (k, ts, v) VALUES (1, '2024-01-01 09:00:30+0000', 15)");
+
+        assertRows(execute("SELECT counter_delta(v, ts), counter_rate(v, ts) FROM %s WHERE k = 1"),
+                   row(25.0, 25.0 / 30.0));
+    }
+
+    @Test
+    public void testCounterMonotonicNoReset() throws Throwable
+    {
+        createTable("CREATE TABLE %s (k int, ts timestamp, v int, PRIMARY KEY (k, ts))");
+        execute("INSERT INTO %s (k, ts, v) VALUES (1, '2024-01-01 09:00:00+0000', 0)");
+        execute("INSERT INTO %s (k, ts, v) VALUES (1, '2024-01-01 09:00:10+0000', 10)");
+        execute("INSERT INTO %s (k, ts, v) VALUES (1, '2024-01-01 09:00:30+0000', 30)");
+
+        // No reset: increase = 30 over 30s -> rate 1.0/s.
+        assertRows(execute("SELECT counter_delta(v, ts), counter_rate(v, ts) FROM %s WHERE k = 1"),
+                   row(30.0, 1.0));
+    }
+
+    @Test
+    public void testCounterEdgeCases() throws Throwable
+    {
+        createTable("CREATE TABLE %s (k int, ts timestamp, v int, PRIMARY KEY (k, ts))");
+        // Empty: both null.
+        assertRows(execute("SELECT counter_delta(v, ts), counter_rate(v, ts) FROM %s WHERE k = 1"),
+                   row(null, null));
+        // Single sample: delta 0, rate undefined (no span).
+        execute("INSERT INTO %s (k, ts, v) VALUES (1, '2024-01-01 09:00:00+0000', 7)");
+        assertRows(execute("SELECT counter_delta(v, ts), counter_rate(v, ts) FROM %s WHERE k = 1"),
+                   row(0.0, null));
+    }
+
+    @Test
     public void testPercentile() throws Throwable
     {
         createTable("CREATE TABLE %s (k int, ts timestamp, v double, PRIMARY KEY (k, ts))");
