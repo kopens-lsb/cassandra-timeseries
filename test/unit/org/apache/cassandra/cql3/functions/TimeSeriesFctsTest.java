@@ -240,4 +240,61 @@ public class TimeSeriesFctsTest extends CQLTester
         createTable("CREATE TABLE %s (k int, ts timestamp, v double, PRIMARY KEY (k, ts))");
         assertRows(execute("SELECT percentile(v, 0.5) FROM %s WHERE k = 1"), row((Object) null));
     }
+
+    @Test
+    public void testTimeWeightedAverageEqualsMeanForUniformSpacing() throws Throwable
+    {
+        createTable("CREATE TABLE %s (k int, ts timestamp, v double, PRIMARY KEY (k, ts))");
+        // Linear values at uniform 10s spacing: time-weighted average equals the plain mean (10).
+        execute("INSERT INTO %s (k, ts, v) VALUES (1, '2024-01-01 09:00:00+0000', 0)");
+        execute("INSERT INTO %s (k, ts, v) VALUES (1, '2024-01-01 09:00:10+0000', 10)");
+        execute("INSERT INTO %s (k, ts, v) VALUES (1, '2024-01-01 09:00:20+0000', 20)");
+
+        assertRows(execute("SELECT time_weighted_average(v, ts) FROM %s WHERE k = 1"), row(10.0));
+    }
+
+    @Test
+    public void testTimeWeightedAverageWeightsByDuration() throws Throwable
+    {
+        createTable("CREATE TABLE %s (k int, ts timestamp, v double, PRIMARY KEY (k, ts))");
+        // 0 held for 1s, then ramps to 10 over 10s. Trapezoidal area = 0*1 + (0+10)/2*10 = 50 over 11s.
+        execute("INSERT INTO %s (k, ts, v) VALUES (1, '2024-01-01 09:00:00+0000', 0)");
+        execute("INSERT INTO %s (k, ts, v) VALUES (1, '2024-01-01 09:00:01+0000', 0)");
+        execute("INSERT INTO %s (k, ts, v) VALUES (1, '2024-01-01 09:00:11+0000', 10)");
+
+        // Time-weighted (50/11) differs from the plain mean of the values (10/3).
+        assertRows(execute("SELECT time_weighted_average(v, ts) FROM %s WHERE k = 1"),
+                   row(50.0 / 11.0));
+    }
+
+    @Test
+    public void testTimeWeightedAverageSinglePointAndEmpty() throws Throwable
+    {
+        createTable("CREATE TABLE %s (k int, ts timestamp, v double, PRIMARY KEY (k, ts))");
+        assertRows(execute("SELECT time_weighted_average(v, ts) FROM %s WHERE k = 1"), row((Object) null));
+
+        execute("INSERT INTO %s (k, ts, v) VALUES (1, '2024-01-01 09:00:00+0000', 7)");
+        assertRows(execute("SELECT time_weighted_average(v, ts) FROM %s WHERE k = 1"), row(7.0));
+    }
+
+    @Test
+    public void testVarianceAndStddev() throws Throwable
+    {
+        createTable("CREATE TABLE %s (k int, ts timestamp, v double, PRIMARY KEY (k, ts))");
+        // Values 2,4,6: mean 4, sample variance = (4+0+4)/2 = 4, stddev = 2.
+        execute("INSERT INTO %s (k, ts, v) VALUES (1, '2024-01-01 09:00:00+0000', 2)");
+        execute("INSERT INTO %s (k, ts, v) VALUES (1, '2024-01-01 09:00:01+0000', 4)");
+        execute("INSERT INTO %s (k, ts, v) VALUES (1, '2024-01-01 09:00:02+0000', 6)");
+
+        assertRows(execute("SELECT variance(v), stddev(v) FROM %s WHERE k = 1"), row(4.0, 2.0));
+    }
+
+    @Test
+    public void testVarianceNeedsTwoValues() throws Throwable
+    {
+        createTable("CREATE TABLE %s (k int, ts timestamp, v double, PRIMARY KEY (k, ts))");
+        execute("INSERT INTO %s (k, ts, v) VALUES (1, '2024-01-01 09:00:00+0000', 5)");
+        // Sample variance is undefined for a single value.
+        assertRows(execute("SELECT variance(v), stddev(v) FROM %s WHERE k = 1"), row(null, null));
+    }
 }

@@ -103,6 +103,43 @@ public final class TimeSeriesFcts
                 return makePercentileFunction(argTypes.get(0), argTypes.get(1));
             }
         });
+
+        // time_weighted_average(value, timestamp): trapezoidal time-weighted mean of a numeric series
+        functions.add(new FunctionFactory("time_weighted_average",
+                                          FunctionParameter.anyType(false),
+                                          FunctionParameter.fixed(CQL3Type.Native.TIMESTAMP, CQL3Type.Native.BIGINT))
+        {
+            @Override
+            protected NativeFunction doGetOrCreateFunction(List<AbstractType<?>> argTypes, AbstractType<?> receiverType)
+            {
+                if (!(argTypes.get(0) instanceof NumberType))
+                    throw invalidRequest("Function time_weighted_average requires a numeric value argument, " +
+                                         "but found type %s", argTypes.get(0).asCQL3Type());
+
+                return makeTimeWeightedAverageFunction(argTypes.get(0), argTypes.get(1));
+            }
+        });
+
+        // variance / stddev (sample) of a numeric column
+        functions.add(varianceFactory("variance", false));
+        functions.add(varianceFactory("stddev", true));
+    }
+
+    /** Builds the {@code variance}/{@code stddev} aggregate factory (sample, i.e. divided by n-1). */
+    private static FunctionFactory varianceFactory(String functionName, boolean sqrt)
+    {
+        return new FunctionFactory(functionName, FunctionParameter.anyType(false))
+        {
+            @Override
+            protected NativeFunction doGetOrCreateFunction(List<AbstractType<?>> argTypes, AbstractType<?> receiverType)
+            {
+                if (!(argTypes.get(0) instanceof NumberType))
+                    throw invalidRequest("Function %s requires a numeric argument, but found type %s",
+                                         functionName, argTypes.get(0).asCQL3Type());
+
+                return makeVarianceFunction(functionName, sqrt, argTypes.get(0));
+            }
+        };
     }
 
     /**
@@ -460,6 +497,139 @@ public final class TimeSeriesFcts
                                         : values.get(lower) + (rank - lower) * (values.get(upper) - values.get(lower));
 
                         return DoubleType.instance.decompose(result);
+                    }
+                };
+            }
+        };
+    }
+
+    /**
+     * Builds the {@code time_weighted_average(value, timestamp)} aggregate: the time-weighted mean of a numeric series,
+     * computed as the trapezoidal integral of the value over time divided by the total time span.
+     *
+     * <p>Keeps the group's {@code (timestamp, value)} pairs and sorts them by timestamp on
+     * {@link Aggregate#compute}, so the result is independent of row arrival order. A group with a single sample
+     * returns that sample's value; an empty group returns {@code null}.
+     *
+     * @param valueType the numeric type of the value argument
+     * @param timestampType the type of the timestamp argument ({@code timestamp} or {@code bigint})
+     */
+    private static NativeAggregateFunction makeTimeWeightedAverageFunction(AbstractType<?> valueType,
+                                                                           AbstractType<?> timestampType)
+    {
+        return new NativeAggregateFunction("time_weighted_average", DoubleType.instance, valueType, timestampType)
+        {
+            @Override
+            public Aggregate newAggregate()
+            {
+                return new Aggregate()
+                {
+                    // Each entry is {timestampMillis, value}; sorted by timestamp at compute time.
+                    private final List<double[]> points = new ArrayList<>();
+
+                    @Override
+                    public void reset()
+                    {
+                        points.clear();
+                    }
+
+                    @Override
+                    public void addInput(Arguments arguments)
+                    {
+                        Number value = arguments.get(0);
+                        Number timestamp = arguments.get(1);
+
+                        if (value == null || timestamp == null)
+                            return;
+
+                        points.add(new double[]{ timestamp.longValue(), value.doubleValue() });
+                    }
+
+                    @Override
+                    public ByteBuffer compute(FunctionContext context)
+                    {
+                        if (points.isEmpty())
+                            return null;
+
+                        if (points.size() == 1)
+                            return DoubleType.instance.decompose(points.get(0)[1]);
+
+                        points.sort((a, b) -> Double.compare(a[0], b[0]));
+
+                        double totalMillis = points.get(points.size() - 1)[0] - points.get(0)[0];
+                        if (totalMillis == 0)
+                            return DoubleType.instance.decompose(points.get(0)[1]);
+
+                        // Trapezoidal integral of value over time, divided by the total span.
+                        double area = 0;
+                        for (int i = 1; i < points.size(); i++)
+                        {
+                            double dt = points.get(i)[0] - points.get(i - 1)[0];
+                            double meanValue = (points.get(i)[1] + points.get(i - 1)[1]) / 2.0;
+                            area += meanValue * dt;
+                        }
+
+                        return DoubleType.instance.decompose(area / totalMillis);
+                    }
+                };
+            }
+        };
+    }
+
+    /**
+     * Builds the {@code variance}/{@code stddev} aggregate (sample statistics, dividing by {@code n - 1}).
+     *
+     * @param name the function name
+     * @param sqrt {@code true} for {@code stddev} (square root of the variance), {@code false} for {@code variance}
+     * @param valueType the numeric type of the argument
+     */
+    private static NativeAggregateFunction makeVarianceFunction(String name, boolean sqrt, AbstractType<?> valueType)
+    {
+        return new NativeAggregateFunction(name, DoubleType.instance, valueType)
+        {
+            @Override
+            public Aggregate newAggregate()
+            {
+                return new Aggregate()
+                {
+                    private long count;
+                    private double sum;
+                    private double sumOfSquares;
+
+                    @Override
+                    public void reset()
+                    {
+                        count = 0;
+                        sum = 0;
+                        sumOfSquares = 0;
+                    }
+
+                    @Override
+                    public void addInput(Arguments arguments)
+                    {
+                        Number value = arguments.get(0);
+                        if (value == null)
+                            return;
+
+                        double v = value.doubleValue();
+                        sum += v;
+                        sumOfSquares += v * v;
+                        count++;
+                    }
+
+                    @Override
+                    public ByteBuffer compute(FunctionContext context)
+                    {
+                        // Sample variance is undefined for fewer than two values.
+                        if (count < 2)
+                            return null;
+
+                        double variance = (sumOfSquares - (sum * sum) / count) / (count - 1);
+                        // Guard against tiny negative values from floating-point cancellation.
+                        if (variance < 0)
+                            variance = 0;
+
+                        return DoubleType.instance.decompose(sqrt ? Math.sqrt(variance) : variance);
                     }
                 };
             }
