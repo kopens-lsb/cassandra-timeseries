@@ -21,6 +21,7 @@ import java.nio.ByteBuffer;
 import java.util.ArrayList;
 import java.util.Collection;
 import java.util.Collections;
+import java.util.Collections;
 import java.util.Comparator;
 import java.util.EnumSet;
 import java.util.Iterator;
@@ -89,7 +90,9 @@ import org.apache.cassandra.db.SinglePartitionReadCommand;
 import org.apache.cassandra.db.SinglePartitionReadQuery;
 import org.apache.cassandra.db.Slice;
 import org.apache.cassandra.db.Slices;
+import org.apache.cassandra.cql3.Duration;
 import org.apache.cassandra.db.aggregation.AggregationSpecification;
+import org.apache.cassandra.db.aggregation.TimeBucketGapFiller;
 import org.apache.cassandra.db.aggregation.GroupMaker;
 import org.apache.cassandra.db.filter.ClusteringIndexFilter;
 import org.apache.cassandra.db.filter.ClusteringIndexNamesFilter;
@@ -100,7 +103,9 @@ import org.apache.cassandra.db.filter.IndexHints;
 import org.apache.cassandra.db.filter.RowFilter;
 import org.apache.cassandra.db.guardrails.Guardrails;
 import org.apache.cassandra.db.marshal.CompositeType;
+import org.apache.cassandra.db.marshal.DurationType;
 import org.apache.cassandra.db.marshal.Int32Type;
+import org.apache.cassandra.db.marshal.TimestampType;
 import org.apache.cassandra.db.partitions.PartitionIterator;
 import org.apache.cassandra.db.rows.Row;
 import org.apache.cassandra.db.rows.RowIterator;
@@ -131,6 +136,7 @@ import org.apache.cassandra.service.pager.QueryPager;
 import org.apache.cassandra.transport.Dispatcher;
 import org.apache.cassandra.transport.ProtocolVersion;
 import org.apache.cassandra.transport.messages.ResultMessage;
+import org.apache.cassandra.utils.ByteBufferUtil;
 import org.apache.cassandra.utils.FBUtilities;
 import org.apache.cassandra.utils.NoSpamLogger;
 
@@ -189,6 +195,12 @@ public class SelectStatement implements CQLStatement.SingleKeyspaceCqlStatement,
     private final AggregationSpecification.Factory aggregationSpecFactory;
 
     /**
+     * Set when the query groups by {@code time_bucket_gapfill(...)}; drives gap-filling of the result. Null otherwise.
+     * Populated after construction by the {@code RawStatement} builder.
+     */
+    private GapFillSpec gapFillSpec;
+
+    /**
      * The comparator used to orders results when multiple keys are selected (using IN).
      */
     private final ColumnComparator<List<ByteBuffer>> orderingComparator;
@@ -230,6 +242,63 @@ public class SelectStatement implements CQLStatement.SingleKeyspaceCqlStatement,
         this.source = source;
         this.selectOptions = selectOptions;
         this.functions = findAllFunctions();
+    }
+
+    /**
+     * Parameters captured at prepare time for a {@code GROUP BY ... time_bucket_gapfill(width, ts, start, finish)}
+     * query, used to densify the aggregated result so every bucket in {@code [start, finish)} is present.
+     *
+     * <p>v1 limitations: only the single-partition case is gap-filled (so synthetic rows are produced within one
+     * series; restrict the partition key in {@code WHERE}), the bucket width must be fixed-width (no month component),
+     * and the bucket column must not be aliased. Gap-fill is applied per page, so use without paging across buckets.
+     */
+    static final class GapFillSpec
+    {
+        private final int bucketIndex;
+        private final Selector.Factory widthFactory;
+        private final Selector.Factory startFactory;
+        private final Selector.Factory finishFactory;
+
+        GapFillSpec(int bucketIndex,
+                    Selector.Factory widthFactory,
+                    Selector.Factory startFactory,
+                    Selector.Factory finishFactory)
+        {
+            this.bucketIndex = bucketIndex;
+            this.widthFactory = widthFactory;
+            this.startFactory = startFactory;
+            this.finishFactory = finishFactory;
+        }
+
+        private void densify(ResultSet cqlRows, QueryOptions options)
+        {
+            ProtocolVersion version = options.getProtocolVersion();
+            Duration width = DurationType.instance.compose(widthFactory.newInstance(options).getOutput(version));
+            // v1: only fixed-width buckets can be enumerated by a constant millisecond step.
+            if (width.getMonths() != 0)
+                return;
+            long step = width.getDays() * 86_400_000L + width.getNanoseconds() / 1_000_000L;
+            if (step <= 0)
+                return;
+
+            ByteBuffer startBytes = startFactory.newInstance(options).getOutput(version);
+            ByteBuffer finishBytes = finishFactory.newInstance(options).getOutput(version);
+            if (startBytes == null || finishBytes == null)
+                return;
+
+            long start = ByteBufferUtil.toLong(startBytes);
+            long finish = ByteBufferUtil.toLong(finishBytes);
+
+            List<List<ByteBuffer>> filled = TimeBucketGapFiller.densify(cqlRows.rows,
+                                                                        bucketIndex,
+                                                                        Collections.emptyList(),
+                                                                        cqlRows.metadata.getColumnCount(),
+                                                                        start,
+                                                                        finish,
+                                                                        step);
+            cqlRows.rows.clear();
+            cqlRows.rows.addAll(filled);
+        }
     }
 
     @Override
@@ -1100,6 +1169,9 @@ public class SelectStatement implements CQLStatement.SingleKeyspaceCqlStatement,
         ResultSet cqlRows = result.build();
         maybeWarn(result, options);
 
+        if (gapFillSpec != null)
+            gapFillSpec.densify(cqlRows, options);
+
         orderResults(cqlRows, options, state);
 
         cqlRows.trim(userLimit);
@@ -1281,6 +1353,9 @@ public class SelectStatement implements CQLStatement.SingleKeyspaceCqlStatement,
         public final StatementSource source;
         public final SelectOptions options;
 
+        // Captured during prepare() when GROUP BY uses time_bucket_gapfill(...); null otherwise.
+        private GapFillSpec gapFillSpec;
+
         public RawStatement(QualifiedName cfName,
                             Parameters parameters,
                             List<RawSelector> selectClause,
@@ -1381,18 +1456,20 @@ public class SelectStatement implements CQLStatement.SingleKeyspaceCqlStatement,
 
             checkNeedsFiltering(table, restrictions);
 
-            return new SelectStatement(table,
-                                       variableSpecifications,
-                                       parameters,
-                                       selection,
-                                       restrictions,
-                                       isReversed,
-                                       aggregationSpecFactory,
-                                       orderingComparator,
-                                       prepareLimit(variableSpecifications, limit, keyspace(), limitReceiver()),
-                                       prepareLimit(variableSpecifications, perPartitionLimit, keyspace(), perPartitionLimitReceiver()),
-                                       source,
-                                       options);
+            SelectStatement stmt = new SelectStatement(table,
+                                                       variableSpecifications,
+                                                       parameters,
+                                                       selection,
+                                                       restrictions,
+                                                       isReversed,
+                                                       aggregationSpecFactory,
+                                                       orderingComparator,
+                                                       prepareLimit(variableSpecifications, limit, keyspace(), limitReceiver()),
+                                                       prepareLimit(variableSpecifications, perPartitionLimit, keyspace(), perPartitionLimitReceiver()),
+                                                       source,
+                                                       options);
+            stmt.gapFillSpec = this.gapFillSpec;
+            return stmt;
         }
 
         private Set<ColumnMetadata> getResultSetOrdering(StatementRestrictions restrictions, Map<ColumnMetadata, Ordering> orderingColumns)
@@ -1599,6 +1676,9 @@ public class SelectStatement implements CQLStatement.SingleKeyspaceCqlStatement,
                     def = columns.get(0);
                     checkTrue(def.isClusteringColumn(),
                               "Group by functions are only supported on clustering columns, got %s", def.name);
+
+                    if (withFunction.function.name().name.equals("time_bucket_gapfill"))
+                        this.gapFillSpec = buildGapFillSpec(metadata, selection, boundNames, withFunction);
                 }
                 else
                 {
@@ -1651,6 +1731,36 @@ public class SelectStatement implements CQLStatement.SingleKeyspaceCqlStatement,
         {
             Function f = withFunction.function;
             checkFalse(f.isAggregate(), "Aggregate functions are not supported within the GROUP BY clause, got: %s", f.name());
+        }
+
+        /**
+         * Builds the {@link GapFillSpec} for a {@code GROUP BY time_bucket_gapfill(width, ts, start, finish)} query, or
+         * returns null if the bucket column is not present (unaliased) in the result so gap-filling cannot be applied.
+         */
+        private GapFillSpec buildGapFillSpec(TableMetadata metadata,
+                                             Selection selection,
+                                             VariableSpecifications boundNames,
+                                             WithFunction withFunction)
+        {
+            // The bucket column index is the (unaliased) time_bucket_gapfill column in the result set.
+            List<ColumnSpecification> names = selection.getResultMetadata().names;
+            int bucketIndex = -1;
+            for (int i = 0; i < names.size(); i++)
+            {
+                if (names.get(i).name.toString().contains("time_bucket_gapfill"))
+                {
+                    bucketIndex = i;
+                    break;
+                }
+            }
+            if (bucketIndex < 0)
+                return null;
+
+            List<Selectable> args = withFunction.args;
+            Selector.Factory width = args.get(0).newSelectorFactory(metadata, DurationType.instance, new ArrayList<>(), boundNames);
+            Selector.Factory start = args.get(2).newSelectorFactory(metadata, TimestampType.instance, new ArrayList<>(), boundNames);
+            Selector.Factory finish = args.get(3).newSelectorFactory(metadata, TimestampType.instance, new ArrayList<>(), boundNames);
+            return new GapFillSpec(bucketIndex, width, start, finish);
         }
 
         private ColumnComparator<List<ByteBuffer>> getOrderingComparator(Selection selection,
