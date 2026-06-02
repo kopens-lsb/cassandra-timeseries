@@ -18,7 +18,7 @@
 
 # Design: Gap-Fill & Interpolation for Time-Series Queries (B1)
 
-Status: **G1 IMPLEMENTED** (densify/null fill) · Branch: `cassandra-timeseries-functions`
+Status: **G1–G3 IMPLEMENTED** (null / locf / interpolate fill) · Branch: `cassandra-timeseries-functions`
 Builds on the native functions in [timeseries-functions-design.md](timeseries-functions-design.md).
 
 G1 is done and verified end-to-end (CQLTester + Docker real CQL): `GROUP BY time_bucket_gapfill(width, ts,
