@@ -253,7 +253,11 @@ public class SelectStatement implements CQLStatement.SingleKeyspaceCqlStatement,
      */
     static final class GapFillSpec
     {
+        // Cap on the number of buckets a single gap-fill query may materialize, to bound synthetic-row memory.
+        private static final long MAX_BUCKETS = 1_000_000;
+
         private final int bucketIndex;
+        private final List<Integer> partitionKeyIndices;
         private final List<Integer> locfColumnIndices;
         private final List<Integer> interpolateColumnIndices;
         private final Selector.Factory widthFactory;
@@ -261,6 +265,7 @@ public class SelectStatement implements CQLStatement.SingleKeyspaceCqlStatement,
         private final Selector.Factory finishFactory;
 
         GapFillSpec(int bucketIndex,
+                    List<Integer> partitionKeyIndices,
                     List<Integer> locfColumnIndices,
                     List<Integer> interpolateColumnIndices,
                     Selector.Factory widthFactory,
@@ -268,6 +273,7 @@ public class SelectStatement implements CQLStatement.SingleKeyspaceCqlStatement,
                     Selector.Factory finishFactory)
         {
             this.bucketIndex = bucketIndex;
+            this.partitionKeyIndices = partitionKeyIndices;
             this.locfColumnIndices = locfColumnIndices;
             this.interpolateColumnIndices = interpolateColumnIndices;
             this.widthFactory = widthFactory;
@@ -294,9 +300,15 @@ public class SelectStatement implements CQLStatement.SingleKeyspaceCqlStatement,
             long start = ByteBufferUtil.toLong(startBytes);
             long finish = ByteBufferUtil.toLong(finishBytes);
 
+            // Guardrail: refuse to materialize an unbounded number of synthetic buckets.
+            long bucketCount = (finish - start) / step;
+            if (bucketCount > MAX_BUCKETS)
+                throw invalidRequest("time_bucket_gapfill would materialize %d buckets, exceeding the limit of %d; " +
+                                     "narrow the [start, finish) range or widen the bucket", bucketCount, MAX_BUCKETS);
+
             List<List<ByteBuffer>> filled = TimeBucketGapFiller.densify(cqlRows.rows,
                                                                         bucketIndex,
-                                                                        Collections.emptyList(),
+                                                                        partitionKeyIndices,
                                                                         locfColumnIndices,
                                                                         interpolateColumnIndices,
                                                                         cqlRows.metadata.getColumnCount(),
@@ -1663,6 +1675,8 @@ public class SelectStatement implements CQLStatement.SingleKeyspaceCqlStatement,
             Iterator<ColumnMetadata> pkColumns = metadata.primaryKeyColumns().iterator();
             List<ColumnMetadata> columns = null;
             Selector.Factory selectorFactory = null;
+            // The plain (non-function) GROUP BY columns identify a series, used to reset gap-fill per partition.
+            List<ColumnMetadata> groupingKeyColumns = new ArrayList<>();
             for (Selectable.Raw raw : parameters.groups)
             {
                 Selectable selectable = raw.prepare(metadata);
@@ -1685,7 +1699,7 @@ public class SelectStatement implements CQLStatement.SingleKeyspaceCqlStatement,
                               "Group by functions are only supported on clustering columns, got %s", def.name);
 
                     if (withFunction.function.name().name.equals("time_bucket_gapfill"))
-                        this.gapFillSpec = buildGapFillSpec(metadata, selection, boundNames, withFunction);
+                        this.gapFillSpec = buildGapFillSpec(metadata, selection, boundNames, withFunction, groupingKeyColumns);
                 }
                 else
                 {
@@ -1693,6 +1707,7 @@ public class SelectStatement implements CQLStatement.SingleKeyspaceCqlStatement,
                     checkTrue(def.isPartitionKey() || def.isClusteringColumn(),
                               "Group by is currently only supported on the columns of the PRIMARY KEY, got %s", def.name);
                     checkNull(selectorFactory, "Functions are only supported on the last element of the GROUP BY clause");
+                    groupingKeyColumns.add(def);
                 }
 
                 while (true)
@@ -1747,13 +1762,15 @@ public class SelectStatement implements CQLStatement.SingleKeyspaceCqlStatement,
         private GapFillSpec buildGapFillSpec(TableMetadata metadata,
                                              Selection selection,
                                              VariableSpecifications boundNames,
-                                             WithFunction withFunction)
+                                             WithFunction withFunction,
+                                             List<ColumnMetadata> groupingKeyColumns)
         {
             // The bucket column index is the (unaliased) time_bucket_gapfill column in the result set.
             List<ColumnSpecification> names = selection.getResultMetadata().names;
             int bucketIndex = -1;
             List<Integer> locfColumnIndices = new ArrayList<>();
             List<Integer> interpolateColumnIndices = new ArrayList<>();
+            List<Integer> partitionKeyIndices = new ArrayList<>();
             for (int i = 0; i < names.size(); i++)
             {
                 String columnName = names.get(i).name.toString();
@@ -1765,6 +1782,9 @@ public class SelectStatement implements CQLStatement.SingleKeyspaceCqlStatement,
                     locfColumnIndices.add(i);
                 else if (columnName.contains("interpolate("))
                     interpolateColumnIndices.add(i);
+                // Series-identifying grouping columns (so gap-fill resets at each partition): matched by name.
+                else if (isGroupingKeyColumn(columnName, groupingKeyColumns))
+                    partitionKeyIndices.add(i);
             }
             if (bucketIndex < 0)
                 return null;
@@ -1773,7 +1793,15 @@ public class SelectStatement implements CQLStatement.SingleKeyspaceCqlStatement,
             Selector.Factory width = args.get(0).newSelectorFactory(metadata, DurationType.instance, new ArrayList<>(), boundNames);
             Selector.Factory start = args.get(2).newSelectorFactory(metadata, TimestampType.instance, new ArrayList<>(), boundNames);
             Selector.Factory finish = args.get(3).newSelectorFactory(metadata, TimestampType.instance, new ArrayList<>(), boundNames);
-            return new GapFillSpec(bucketIndex, locfColumnIndices, interpolateColumnIndices, width, start, finish);
+            return new GapFillSpec(bucketIndex, partitionKeyIndices, locfColumnIndices, interpolateColumnIndices, width, start, finish);
+        }
+
+        private static boolean isGroupingKeyColumn(String resultColumnName, List<ColumnMetadata> groupingKeyColumns)
+        {
+            for (ColumnMetadata c : groupingKeyColumns)
+                if (resultColumnName.equals(c.name.toString()))
+                    return true;
+            return false;
         }
 
         private ColumnComparator<List<ByteBuffer>> getOrderingComparator(Selection selection,

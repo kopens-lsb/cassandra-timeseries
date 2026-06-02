@@ -420,6 +420,37 @@ public class TimeSeriesFctsTest extends CQLTester
     }
 
     @Test
+    public void testTimeBucketGapfillMultiPartition() throws Throwable
+    {
+        createTable("CREATE TABLE %s (k int, ts timestamp, v int, PRIMARY KEY (k, ts))");
+        execute("INSERT INTO %s (k, ts, v) VALUES (1, '2024-01-01 09:30:00+0000', 5)");
+        execute("INSERT INTO %s (k, ts, v) VALUES (1, '2024-01-01 11:15:00+0000', 7)");
+        execute("INSERT INTO %s (k, ts, v) VALUES (2, '2024-01-01 09:30:00+0000', 1)");
+
+        String gf = "time_bucket_gapfill(1h, ts, '2024-01-01 09:00:00+0000', '2024-01-01 12:00:00+0000')";
+        // Each series is gap-filled independently (k identifies the partition).
+        assertRowsIgnoringOrder(execute("SELECT k, " + gf + ", sum(v) FROM %s WHERE k IN (1, 2) GROUP BY k, " + gf),
+                                row(1, date("2024-01-01T09:00:00Z"), 5),
+                                row(1, date("2024-01-01T10:00:00Z"), null),
+                                row(1, date("2024-01-01T11:00:00Z"), 7),
+                                row(2, date("2024-01-01T09:00:00Z"), 1),
+                                row(2, date("2024-01-01T10:00:00Z"), null),
+                                row(2, date("2024-01-01T11:00:00Z"), null));
+    }
+
+    @Test
+    public void testTimeBucketGapfillBucketCountGuardrail() throws Throwable
+    {
+        createTable("CREATE TABLE %s (k int, ts timestamp, v int, PRIMARY KEY (k, ts))");
+        execute("INSERT INTO %s (k, ts, v) VALUES (1, '2024-01-01 00:00:00+0000', 1)");
+        // 12 days at 1-second buckets is ~1.04M buckets, over the 1,000,000 cap.
+        String gf = "time_bucket_gapfill(1s, ts, '2024-01-01 00:00:00+0000', '2024-01-13 00:00:00+0000')";
+        assertInvalidThrowMessage("exceeding the limit",
+                                  org.apache.cassandra.exceptions.InvalidRequestException.class,
+                                  "SELECT " + gf + ", sum(v) FROM %s WHERE k = 1 GROUP BY k, " + gf);
+    }
+
+    @Test
     public void testTimeBucketGapfillRejectsBadRange() throws Throwable
     {
         createTable("CREATE TABLE %s (k int, ts timestamp, v int, PRIMARY KEY (k, ts))");

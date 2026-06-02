@@ -150,8 +150,16 @@ GROUP  BY series, time_bucket_gapfill(1h, ts, '2024-01-01 00:00:00+0000', '2024-
 
 Empty buckets before the first or after the last real value stay null (nothing to interpolate from).
 
-v1 notes: use within a single series (restrict the partition key in `WHERE`), with a fixed-width bucket (no month
-component), without aliasing the bucket column, and without paging across the bucket range.
+Multiple series are gap-filled independently — include the partition key in both `SELECT` and `GROUP BY`:
+
+```sql
+SELECT series, time_bucket_gapfill(1h, ts, '2024-01-01 00:00:00+0000', '2024-01-02 00:00:00+0000'), avg(value)
+FROM   metrics WHERE series IN ('cpu', 'mem')
+GROUP  BY series, time_bucket_gapfill(1h, ts, '2024-01-01 00:00:00+0000', '2024-01-02 00:00:00+0000');
+```
+
+Notes: use a fixed-width bucket (no month component), do not alias the bucket column, and avoid paging across the
+bucket range. A query is rejected if its range/width would materialize more than 1,000,000 buckets.
 
 ---
 
