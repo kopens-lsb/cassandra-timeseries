@@ -721,13 +721,18 @@ public final class TimeSeriesFcts
             {
                 return new Aggregate()
                 {
-                    // Each entry is {timestampMillis, value}; sorted by timestamp at compute time.
-                    private final List<double[]> points = new ArrayList<>();
+                    // Parallel primitive buffers (no per-row object allocation). Rows from a partition usually arrive
+                    // in timestamp order, so we track that and skip sorting in the common case.
+                    private long[] times = new long[16];
+                    private double[] vals = new double[16];
+                    private int size;
+                    private boolean sorted = true;
 
                     @Override
                     public void reset()
                     {
-                        points.clear();
+                        size = 0;
+                        sorted = true;
                     }
 
                     @Override
@@ -739,34 +744,68 @@ public final class TimeSeriesFcts
                         if (value == null || timestamp == null)
                             return;
 
-                        points.add(new double[]{ timestamp.longValue(), value.doubleValue() });
+                        long t = timestamp.longValue();
+                        if (size > 0 && t < times[size - 1])
+                            sorted = false;
+                        if (size == times.length)
+                        {
+                            times = Arrays.copyOf(times, size * 2);
+                            vals = Arrays.copyOf(vals, size * 2);
+                        }
+                        times[size] = t;
+                        vals[size] = value.doubleValue();
+                        size++;
                     }
 
                     @Override
                     public ByteBuffer compute(FunctionContext context)
                     {
-                        if (points.isEmpty())
+                        if (size == 0)
                             return null;
+                        if (size == 1)
+                            return DoubleType.instance.decompose(vals[0]);
 
-                        if (points.size() == 1)
-                            return DoubleType.instance.decompose(points.get(0)[1]);
-
-                        points.sort((a, b) -> Double.compare(a[0], b[0]));
-
-                        double totalMillis = points.get(points.size() - 1)[0] - points.get(0)[0];
+                        // Integrate over timestamp order. The common (already-sorted) case needs no allocation.
+                        int[] order = sortedOrder();
+                        long totalMillis = times[order[size - 1]] - times[order[0]];
                         if (totalMillis == 0)
-                            return DoubleType.instance.decompose(points.get(0)[1]);
+                            return DoubleType.instance.decompose(vals[order[0]]);
 
-                        // Trapezoidal integral of value over time, divided by the total span.
                         double area = 0;
-                        for (int i = 1; i < points.size(); i++)
+                        for (int i = 1; i < size; i++)
                         {
-                            double dt = points.get(i)[0] - points.get(i - 1)[0];
-                            double meanValue = (points.get(i)[1] + points.get(i - 1)[1]) / 2.0;
+                            int prev = order[i - 1], cur = order[i];
+                            double dt = times[cur] - times[prev];
+                            double meanValue = (vals[cur] + vals[prev]) / 2.0;
                             area += meanValue * dt;
                         }
 
                         return DoubleType.instance.decompose(area / totalMillis);
+                    }
+
+                    /** Identity order when input is already sorted; otherwise a timestamp-sorted index permutation. */
+                    private int[] sortedOrder()
+                    {
+                        int[] order = new int[size];
+                        for (int i = 0; i < size; i++)
+                            order[i] = i;
+                        if (!sorted)
+                        {
+                            // Rare path: insertion sort the index permutation by timestamp (stable, no boxing).
+                            for (int i = 1; i < size; i++)
+                            {
+                                int idx = order[i];
+                                long key = times[idx];
+                                int j = i - 1;
+                                while (j >= 0 && times[order[j]] > key)
+                                {
+                                    order[j + 1] = order[j];
+                                    j--;
+                                }
+                                order[j + 1] = idx;
+                            }
+                        }
+                        return order;
                     }
                 };
             }

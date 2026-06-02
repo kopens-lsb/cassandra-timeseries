@@ -257,17 +257,17 @@ public class SelectStatement implements CQLStatement.SingleKeyspaceCqlStatement,
         private static final long MAX_BUCKETS = 1_000_000;
 
         private final int bucketIndex;
-        private final List<Integer> partitionKeyIndices;
-        private final List<Integer> locfColumnIndices;
-        private final List<Integer> interpolateColumnIndices;
+        private final int[] partitionKeyIndices;
+        private final int[] locfColumnIndices;
+        private final int[] interpolateColumnIndices;
         private final Selector.Factory widthFactory;
         private final Selector.Factory startFactory;
         private final Selector.Factory finishFactory;
 
         GapFillSpec(int bucketIndex,
-                    List<Integer> partitionKeyIndices,
-                    List<Integer> locfColumnIndices,
-                    List<Integer> interpolateColumnIndices,
+                    int[] partitionKeyIndices,
+                    int[] locfColumnIndices,
+                    int[] interpolateColumnIndices,
                     Selector.Factory widthFactory,
                     Selector.Factory startFactory,
                     Selector.Factory finishFactory)
@@ -315,8 +315,12 @@ public class SelectStatement implements CQLStatement.SingleKeyspaceCqlStatement,
                                                                         start,
                                                                         finish,
                                                                         step);
-            cqlRows.rows.clear();
-            cqlRows.rows.addAll(filled);
+            // densify returns the same list unchanged when there is nothing to fill; only re-copy when it differs.
+            if (filled != cqlRows.rows)
+            {
+                cqlRows.rows.clear();
+                cqlRows.rows.addAll(filled);
+            }
         }
     }
 
@@ -1793,7 +1797,19 @@ public class SelectStatement implements CQLStatement.SingleKeyspaceCqlStatement,
             Selector.Factory width = args.get(0).newSelectorFactory(metadata, DurationType.instance, new ArrayList<>(), boundNames);
             Selector.Factory start = args.get(2).newSelectorFactory(metadata, TimestampType.instance, new ArrayList<>(), boundNames);
             Selector.Factory finish = args.get(3).newSelectorFactory(metadata, TimestampType.instance, new ArrayList<>(), boundNames);
-            return new GapFillSpec(bucketIndex, partitionKeyIndices, locfColumnIndices, interpolateColumnIndices, width, start, finish);
+            return new GapFillSpec(bucketIndex,
+                                   toIntArray(partitionKeyIndices),
+                                   toIntArray(locfColumnIndices),
+                                   toIntArray(interpolateColumnIndices),
+                                   width, start, finish);
+        }
+
+        private static int[] toIntArray(List<Integer> list)
+        {
+            int[] array = new int[list.size()];
+            for (int i = 0; i < array.length; i++)
+                array[i] = list.get(i);
+            return array;
         }
 
         private static boolean isGroupingKeyColumn(String resultColumnName, List<ColumnMetadata> groupingKeyColumns)

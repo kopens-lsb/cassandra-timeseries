@@ -20,7 +20,6 @@ package org.apache.cassandra.db.aggregation;
 import java.nio.ByteBuffer;
 import java.util.ArrayList;
 import java.util.Arrays;
-import java.util.Collections;
 import java.util.List;
 
 import org.junit.Test;
@@ -53,7 +52,7 @@ public class TimeBucketGapFillerTest
         // Existing buckets 10s and 30s; range [0, 40s) step 10s -> expect 0,10,20,30 with 0 and 20 synthesized.
         List<List<ByteBuffer>> rows = new ArrayList<>(Arrays.asList(row(1, 10_000, 5), row(1, 30_000, 7)));
 
-        List<List<ByteBuffer>> out = TimeBucketGapFiller.densify(rows, BUCKET, Collections.singletonList(PK), Collections.emptyList(), Collections.emptyList(),
+        List<List<ByteBuffer>> out = TimeBucketGapFiller.densify(rows, BUCKET, new int[]{ PK }, new int[0], new int[0],
                                                                  COLS, 0, 40_000, 10_000);
 
         assertEquals(4, out.size());
@@ -78,7 +77,7 @@ public class TimeBucketGapFillerTest
                                                                     row(1, 20_000, 2),
                                                                     row(2, 10_000, 9)));
 
-        List<List<ByteBuffer>> out = TimeBucketGapFiller.densify(rows, BUCKET, Collections.singletonList(PK), Collections.emptyList(), Collections.emptyList(),
+        List<List<ByteBuffer>> out = TimeBucketGapFiller.densify(rows, BUCKET, new int[]{ PK }, new int[0], new int[0],
                                                                  COLS, 0, 30_000, 10_000);
 
         // pk1: 0(1),10(null),20(2) ; pk2: 0(null),10(9),20(null)
@@ -99,7 +98,7 @@ public class TimeBucketGapFillerTest
     public void testNoGapsLeavesRowsUnchanged()
     {
         List<List<ByteBuffer>> rows = new ArrayList<>(Arrays.asList(row(1, 0, 1), row(1, 10_000, 2)));
-        List<List<ByteBuffer>> out = TimeBucketGapFiller.densify(rows, BUCKET, Collections.singletonList(PK), Collections.emptyList(), Collections.emptyList(),
+        List<List<ByteBuffer>> out = TimeBucketGapFiller.densify(rows, BUCKET, new int[]{ PK }, new int[0], new int[0],
                                                                  COLS, 0, 20_000, 10_000);
         assertEquals(2, out.size());
         assertEquals(0, bucketOf(out.get(0)));
@@ -112,8 +111,8 @@ public class TimeBucketGapFillerTest
         // Buckets 10s=5 and 30s=7 over [0,40s) step 10s; the SUM column (index 2) is locf.
         List<List<ByteBuffer>> rows = new ArrayList<>(Arrays.asList(row(1, 10_000, 5), row(1, 30_000, 7)));
 
-        List<List<ByteBuffer>> out = TimeBucketGapFiller.densify(rows, BUCKET, Collections.singletonList(PK),
-                                                                 Collections.singletonList(SUM), Collections.emptyList(), COLS,
+        List<List<ByteBuffer>> out = TimeBucketGapFiller.densify(rows, BUCKET, new int[]{ PK },
+                                                                 new int[]{ SUM }, new int[0], COLS,
                                                                  0, 40_000, 10_000);
 
         // bucket 0: nothing seen yet -> null; 10: 5; 20: carries 5; 30: 7
@@ -132,8 +131,8 @@ public class TimeBucketGapFillerTest
             new ArrayList<>(Arrays.asList(Int32Type.instance.decompose(1), ByteBufferUtil.bytes(0L), ByteBufferUtil.bytes(0.0))),
             new ArrayList<>(Arrays.asList(Int32Type.instance.decompose(1), ByteBufferUtil.bytes(30_000L), ByteBufferUtil.bytes(30.0)))));
 
-        List<List<ByteBuffer>> out = TimeBucketGapFiller.densify(rows, BUCKET, Collections.singletonList(PK),
-                                                                 Collections.emptyList(), Collections.singletonList(SUM),
+        List<List<ByteBuffer>> out = TimeBucketGapFiller.densify(rows, BUCKET, new int[]{ PK },
+                                                                 new int[0], new int[]{ SUM },
                                                                  COLS, 0, 40_000, 10_000);
 
         assertEquals(4, out.size());
@@ -147,7 +146,7 @@ public class TimeBucketGapFillerTest
     public void testEmptyInputProducesNoRows()
     {
         List<List<ByteBuffer>> out = TimeBucketGapFiller.densify(new ArrayList<>(), BUCKET,
-                                                                 Collections.singletonList(PK), Collections.emptyList(), Collections.emptyList(), COLS, 0, 30_000, 10_000);
+                                                                 new int[]{ PK }, new int[0], new int[0], COLS, 0, 30_000, 10_000);
         assertEquals(0, out.size());
     }
 
@@ -156,7 +155,7 @@ public class TimeBucketGapFillerTest
     {
         List<List<ByteBuffer>> rows = new ArrayList<>(Arrays.asList(row(1, 10_000, 5)));
         // finish <= start, and step <= 0: both should pass rows through untouched.
-        assertEquals(rows, TimeBucketGapFiller.densify(rows, BUCKET, Collections.singletonList(PK), Collections.emptyList(), Collections.emptyList(), COLS, 40_000, 0, 10_000));
-        assertEquals(rows, TimeBucketGapFiller.densify(rows, BUCKET, Collections.singletonList(PK), Collections.emptyList(), Collections.emptyList(), COLS, 0, 40_000, 0));
+        assertEquals(rows, TimeBucketGapFiller.densify(rows, BUCKET, new int[]{ PK }, new int[0], new int[0], COLS, 40_000, 0, 10_000));
+        assertEquals(rows, TimeBucketGapFiller.densify(rows, BUCKET, new int[]{ PK }, new int[0], new int[0], COLS, 0, 40_000, 0));
     }
 }

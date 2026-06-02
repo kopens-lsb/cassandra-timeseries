@@ -48,9 +48,9 @@ public final class TimeBucketGapFiller
      */
     public static List<List<ByteBuffer>> densify(List<List<ByteBuffer>> rows,
                                                   int bucketIndex,
-                                                  List<Integer> partitionKeyIndices,
-                                                  List<Integer> locfColumnIndices,
-                                                  List<Integer> interpolateColumnIndices,
+                                                  int[] partitionKeyIndices,
+                                                  int[] locfColumnIndices,
+                                                  int[] interpolateColumnIndices,
                                                   int columnCount,
                                                   long startMillis,
                                                   long finishMillis,
@@ -117,8 +117,8 @@ public final class TimeBucketGapFiller
                                   int from,
                                   int to,
                                   int bucketIndex,
-                                  List<Integer> partitionKeyIndices,
-                                  List<Integer> locfColumnIndices,
+                                  int[] partitionKeyIndices,
+                                  int[] locfColumnIndices,
                                   int columnCount,
                                   long startMillis,
                                   long finishMillis,
@@ -172,7 +172,7 @@ public final class TimeBucketGapFiller
         }
     }
 
-    private static void rememberLocf(List<ByteBuffer> row, List<Integer> locfColumnIndices, ByteBuffer[] lastLocf)
+    private static void rememberLocf(List<ByteBuffer> row, int[] locfColumnIndices, ByteBuffer[] lastLocf)
     {
         for (int idx : locfColumnIndices)
             lastLocf[idx] = row.get(idx);
@@ -180,8 +180,8 @@ public final class TimeBucketGapFiller
 
     private static List<ByteBuffer> syntheticRow(List<ByteBuffer> template,
                                                  int bucketIndex,
-                                                 List<Integer> partitionKeyIndices,
-                                                 List<Integer> locfColumnIndices,
+                                                 int[] partitionKeyIndices,
+                                                 int[] locfColumnIndices,
                                                  ByteBuffer[] lastLocf,
                                                  int columnCount,
                                                  long bucketMillis)
@@ -199,7 +199,7 @@ public final class TimeBucketGapFiller
         return row;
     }
 
-    private static boolean samePartition(List<ByteBuffer> a, List<ByteBuffer> b, List<Integer> partitionKeyIndices)
+    private static boolean samePartition(List<ByteBuffer> a, List<ByteBuffer> b, int[] partitionKeyIndices)
     {
         for (int idx : partitionKeyIndices)
         {
