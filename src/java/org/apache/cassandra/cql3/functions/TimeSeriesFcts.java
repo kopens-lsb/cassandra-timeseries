@@ -162,6 +162,31 @@ public final class TimeSeriesFcts
                 return makeApproxCountDistinctFunction(argTypes.get(0));
             }
         });
+
+        // locf(value): identity for real rows; a marker that tells time_bucket_gapfill to carry the previous
+        // non-empty bucket's value forward into synthesized empty buckets (last-observation-carried-forward).
+        functions.add(new FunctionFactory("locf", FunctionParameter.anyType(true))
+        {
+            @Override
+            protected NativeFunction doGetOrCreateFunction(List<AbstractType<?>> argTypes, AbstractType<?> receiverType)
+            {
+                AbstractType<?> type = argTypes.get(0);
+                return new NativeScalarFunction("locf", type, type)
+                {
+                    @Override
+                    public Arguments newArguments(FunctionContext context)
+                    {
+                        return FunctionArguments.newNoopInstance(context, 1);
+                    }
+
+                    @Override
+                    public ByteBuffer execute(Arguments arguments)
+                    {
+                        return arguments.get(0);
+                    }
+                };
+            }
+        });
     }
 
     /**

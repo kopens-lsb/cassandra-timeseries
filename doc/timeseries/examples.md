@@ -37,6 +37,7 @@ All examples are runnable in `cqlsh`. Function reference (argument order matters
 | `histogram` | `histogram(value, min, max, nbuckets)` | `list<bigint>` (nbuckets+2) |
 | `approx_count_distinct` | `approx_count_distinct(value)` | `bigint` |
 | `time_bucket_gapfill` | `time_bucket_gapfill(width, ts, start, finish)` | `timestamp` (gap-filling GROUP BY selector) |
+| `locf` | `locf(aggregate)` | same as argument (carry-forward fill for gap-filled buckets) |
 
 ---
 
@@ -120,6 +121,20 @@ FROM   metrics
 WHERE  series = 'cpu'
 GROUP  BY series, time_bucket_gapfill(1h, ts, '2024-01-01 00:00:00+0000', '2024-01-02 00:00:00+0000');
 ```
+
+By default empty buckets carry null aggregates. Wrap a selected aggregate in `locf(...)` to instead carry the
+previous non-empty bucket's value forward (last-observation-carried-forward):
+
+```sql
+SELECT time_bucket_gapfill(1h, ts, '2024-01-01 00:00:00+0000', '2024-01-02 00:00:00+0000'),
+       locf(avg(value))   -- empty buckets repeat the previous hour's average instead of null
+FROM   metrics
+WHERE  series = 'cpu'
+GROUP  BY series, time_bucket_gapfill(1h, ts, '2024-01-01 00:00:00+0000', '2024-01-02 00:00:00+0000');
+```
+
+`locf` is a no-op on real rows (returns its argument); it only affects synthesized empty buckets. Buckets before the
+first real value remain null (nothing to carry yet).
 
 v1 notes: use within a single series (restrict the partition key in `WHERE`), with a fixed-width bucket (no month
 component), without aliasing the bucket column, and without paging across the bucket range.
