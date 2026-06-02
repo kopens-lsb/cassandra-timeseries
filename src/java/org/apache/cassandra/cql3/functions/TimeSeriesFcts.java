@@ -114,21 +114,9 @@ public final class TimeSeriesFcts
             }
         });
 
-        // time_weighted_average(value, timestamp): trapezoidal time-weighted mean of a numeric series
-        functions.add(new FunctionFactory("time_weighted_average",
-                                          FunctionParameter.anyType(false),
-                                          FunctionParameter.fixed(CQL3Type.Native.TIMESTAMP, CQL3Type.Native.BIGINT))
-        {
-            @Override
-            protected NativeFunction doGetOrCreateFunction(List<AbstractType<?>> argTypes, AbstractType<?> receiverType)
-            {
-                if (!(argTypes.get(0) instanceof NumberType))
-                    throw invalidRequest("Function time_weighted_average requires a numeric value argument, " +
-                                         "but found type %s", argTypes.get(0).asCQL3Type());
-
-                return makeTimeWeightedAverageFunction(argTypes.get(0), argTypes.get(1));
-            }
-        });
+        // time_weighted_average(value, ts): trapezoidal time-weighted mean; integral(value, ts): area (value-seconds)
+        functions.add(timeIntegralFactory("time_weighted_average", true));
+        functions.add(timeIntegralFactory("integral", false));
 
         // variance / stddev (sample) of a numeric column
         functions.add(varianceFactory("variance", false));
@@ -765,10 +753,31 @@ public final class TimeSeriesFcts
      * @param valueType the numeric type of the value argument
      * @param timestampType the type of the timestamp argument ({@code timestamp} or {@code bigint})
      */
-    private static NativeAggregateFunction makeTimeWeightedAverageFunction(AbstractType<?> valueType,
-                                                                           AbstractType<?> timestampType)
+    /** Builds the {@code time_weighted_average} (average=true) / {@code integral} (average=false) factory. */
+    private static FunctionFactory timeIntegralFactory(String functionName, boolean average)
     {
-        return new NativeAggregateFunction("time_weighted_average", DoubleType.instance, valueType, timestampType)
+        return new FunctionFactory(functionName,
+                                   FunctionParameter.anyType(false),
+                                   FunctionParameter.fixed(CQL3Type.Native.TIMESTAMP, CQL3Type.Native.BIGINT))
+        {
+            @Override
+            protected NativeFunction doGetOrCreateFunction(List<AbstractType<?>> argTypes, AbstractType<?> receiverType)
+            {
+                if (!(argTypes.get(0) instanceof NumberType))
+                    throw invalidRequest("Function %s requires a numeric value argument, but found type %s",
+                                         functionName, argTypes.get(0).asCQL3Type());
+
+                return makeTimeIntegralFunction(functionName, average, argTypes.get(0), argTypes.get(1));
+            }
+        };
+    }
+
+    private static NativeAggregateFunction makeTimeIntegralFunction(String name,
+                                                                    boolean average,
+                                                                    AbstractType<?> valueType,
+                                                                    AbstractType<?> timestampType)
+    {
+        return new NativeAggregateFunction(name, DoubleType.instance, valueType, timestampType)
         {
             @Override
             public Aggregate newAggregate()
@@ -816,15 +825,17 @@ public final class TimeSeriesFcts
                     {
                         if (size == 0)
                             return null;
+                        // With no time span there is no area: the average is the (single) value, the integral is 0.
                         if (size == 1)
-                            return DoubleType.instance.decompose(vals[0]);
+                            return DoubleType.instance.decompose(average ? vals[0] : 0.0);
 
                         // Integrate over timestamp order. The common (already-sorted) case needs no allocation.
                         int[] order = sortedOrder();
                         long totalMillis = times[order[size - 1]] - times[order[0]];
                         if (totalMillis == 0)
-                            return DoubleType.instance.decompose(vals[order[0]]);
+                            return DoubleType.instance.decompose(average ? vals[order[0]] : 0.0);
 
+                        // Trapezoidal area in value-milliseconds.
                         double area = 0;
                         for (int i = 1; i < size; i++)
                         {
@@ -834,7 +845,8 @@ public final class TimeSeriesFcts
                             area += meanValue * dt;
                         }
 
-                        return DoubleType.instance.decompose(area / totalMillis);
+                        // time_weighted_average = area / span; integral = area expressed in value-seconds.
+                        return DoubleType.instance.decompose(average ? area / totalMillis : area / 1000.0);
                     }
 
                     /** Identity order when input is already sorted; otherwise a timestamp-sorted index permutation. */

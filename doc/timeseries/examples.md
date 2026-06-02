@@ -34,6 +34,7 @@ All examples are runnable in `cqlsh`. Function reference (argument order matters
 | `counter_delta` / `counter_rate` | `counter_delta(value, ts)` / `counter_rate(value, ts)` | `double` (reset-aware counter increase / per second) |
 | `percentile` | `percentile(value, q)` with `q` in `[0,1]` | `double` |
 | `time_weighted_average` | `time_weighted_average(value, timestamp)` | `double` |
+| `integral` | `integral(value, timestamp)` | `double` (area under curve, value-seconds) |
 | `variance` / `stddev` | `variance(value)` / `stddev(value)` | `double` (sample) |
 | `corr` / `covar_pop` / `covar_samp` | `corr(y, x)` / `covar_pop(y, x)` / `covar_samp(y, x)` | `double` (two-variable stats) |
 | `regr_slope` / `regr_intercept` / `regr_r2` | `regr_slope(y, x)` / `regr_intercept(y, x)` / `regr_r2(y, x)` | `double` (linear regression of y on x) |

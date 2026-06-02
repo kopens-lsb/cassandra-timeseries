@@ -1,6 +1,6 @@
 7.0
  * Add time-series gap-filling: GROUP BY time_bucket_gapfill(width, ts, start, finish) materializes empty buckets, with locf() and interpolate() fill policies
- * Add native time-series CQL functions: time_bucket, first, last, delta, rate, derivative, percentile, time_weighted_average, variance, stddev, histogram, approx_count_distinct, counter_delta, counter_rate, corr, covar_pop, covar_samp, regr_slope, regr_intercept and regr_r2
+ * Add native time-series CQL functions: time_bucket, first, last, delta, rate, derivative, percentile, time_weighted_average, variance, stddev, histogram, approx_count_distinct, counter_delta, counter_rate, corr, covar_pop, covar_samp, regr_slope, regr_intercept, regr_r2 and integral
  * Avoid using ObjectUtils.getFirstNonNull in Schema (CASSANDRA-21394)
  * Allow nodetool garbagecollect to take a user defined list of SSTables (CASSANDRA-16767)
  * Add a guardrail for misprepared statements (CASSANDRA-21139)
