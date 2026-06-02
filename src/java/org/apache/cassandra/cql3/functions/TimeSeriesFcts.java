@@ -139,6 +139,11 @@ public final class TimeSeriesFcts
         functions.add(counterFactory("counter_delta", false));
         functions.add(counterFactory("counter_rate", true));
 
+        // Two-variable statistics over (y, x): correlation and covariance (population / sample).
+        functions.add(bivariateFactory("corr", BivariateStat.CORR));
+        functions.add(bivariateFactory("covar_pop", BivariateStat.COVAR_POP));
+        functions.add(bivariateFactory("covar_samp", BivariateStat.COVAR_SAMP));
+
         // histogram(value, min, max, nbuckets): frequency counts, with underflow/overflow buckets
         functions.add(new FunctionFactory("histogram",
                                           FunctionParameter.anyType(false),
@@ -304,6 +309,28 @@ public final class TimeSeriesFcts
                                          functionName, argTypes.get(0).asCQL3Type());
 
                 return makeCounterFunction(functionName, perSecond, argTypes.get(0), argTypes.get(1));
+            }
+        };
+    }
+
+    /** The bivariate statistic computed by {@link #makeBivariateFunction}. */
+    private enum BivariateStat { CORR, COVAR_POP, COVAR_SAMP }
+
+    /** Builds the {@code corr}/{@code covar_pop}/{@code covar_samp} factory over two numeric columns {@code (y, x)}. */
+    private static FunctionFactory bivariateFactory(String functionName, BivariateStat kind)
+    {
+        return new FunctionFactory(functionName,
+                                   FunctionParameter.anyType(false),
+                                   FunctionParameter.anyType(false))
+        {
+            @Override
+            protected NativeFunction doGetOrCreateFunction(List<AbstractType<?>> argTypes, AbstractType<?> receiverType)
+            {
+                if (!(argTypes.get(0) instanceof NumberType) || !(argTypes.get(1) instanceof NumberType))
+                    throw invalidRequest("Function %s requires two numeric arguments, but found types %s and %s",
+                                         functionName, argTypes.get(0).asCQL3Type(), argTypes.get(1).asCQL3Type());
+
+                return makeBivariateFunction(functionName, kind, argTypes.get(0), argTypes.get(1));
             }
         };
     }
@@ -1083,6 +1110,93 @@ public final class TimeSeriesFcts
                             result.add(c);
 
                         return histogramType.decompose(result);
+                    }
+                };
+            }
+        };
+    }
+
+    /**
+     * Builds the {@code corr}/{@code covar_pop}/{@code covar_samp} aggregate over two numeric columns {@code (y, x)}.
+     * Uses constant-memory running sums (n, &Sigma;x, &Sigma;y, &Sigma;xy, &Sigma;x&sup2;, &Sigma;y&sup2;), so the
+     * result is independent of row order. Returns {@code null} when undefined (too few rows, or zero variance for
+     * {@code corr}).
+     *
+     * @param name the function name
+     * @param kind the statistic to compute
+     * @param yType the numeric type of the first argument
+     * @param xType the numeric type of the second argument
+     */
+    private static NativeAggregateFunction makeBivariateFunction(String name,
+                                                                 BivariateStat kind,
+                                                                 AbstractType<?> yType,
+                                                                 AbstractType<?> xType)
+    {
+        return new NativeAggregateFunction(name, DoubleType.instance, yType, xType)
+        {
+            @Override
+            public Aggregate newAggregate()
+            {
+                return new Aggregate()
+                {
+                    private long count;
+                    private double sumX;
+                    private double sumY;
+                    private double sumXY;
+                    private double sumXX;
+                    private double sumYY;
+
+                    @Override
+                    public void reset()
+                    {
+                        count = 0;
+                        sumX = sumY = sumXY = sumXX = sumYY = 0;
+                    }
+
+                    @Override
+                    public void addInput(Arguments arguments)
+                    {
+                        Number y = arguments.get(0);
+                        Number x = arguments.get(1);
+                        if (y == null || x == null)
+                            return;
+
+                        double yv = y.doubleValue();
+                        double xv = x.doubleValue();
+                        sumX += xv;
+                        sumY += yv;
+                        sumXY += xv * yv;
+                        sumXX += xv * xv;
+                        sumYY += yv * yv;
+                        count++;
+                    }
+
+                    @Override
+                    public ByteBuffer compute(FunctionContext context)
+                    {
+                        switch (kind)
+                        {
+                            case COVAR_POP:
+                                if (count < 1)
+                                    return null;
+                                return DoubleType.instance.decompose((sumXY - sumX * sumY / count) / count);
+                            case COVAR_SAMP:
+                                if (count < 2)
+                                    return null;
+                                return DoubleType.instance.decompose((sumXY - sumX * sumY / count) / (count - 1));
+                            case CORR:
+                            {
+                                if (count < 2)
+                                    return null;
+                                double denominator = Math.sqrt((count * sumXX - sumX * sumX)
+                                                               * (count * sumYY - sumY * sumY));
+                                if (denominator == 0)
+                                    return null;
+                                return DoubleType.instance.decompose((count * sumXY - sumX * sumY) / denominator);
+                            }
+                            default:
+                                throw new AssertionError(kind);
+                        }
                     }
                 };
             }

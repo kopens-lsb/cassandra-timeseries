@@ -35,6 +35,7 @@ All examples are runnable in `cqlsh`. Function reference (argument order matters
 | `percentile` | `percentile(value, q)` with `q` in `[0,1]` | `double` |
 | `time_weighted_average` | `time_weighted_average(value, timestamp)` | `double` |
 | `variance` / `stddev` | `variance(value)` / `stddev(value)` | `double` (sample) |
+| `corr` / `covar_pop` / `covar_samp` | `corr(y, x)` / `covar_pop(y, x)` / `covar_samp(y, x)` | `double` (two-variable stats) |
 | `histogram` | `histogram(value, min, max, nbuckets)` | `list<bigint>` (nbuckets+2) |
 | `approx_count_distinct` | `approx_count_distinct(value)` | `bigint` |
 | `time_bucket_gapfill` | `time_bucket_gapfill(width, ts, start, finish)` | `timestamp` (gap-filling GROUP BY selector) |
