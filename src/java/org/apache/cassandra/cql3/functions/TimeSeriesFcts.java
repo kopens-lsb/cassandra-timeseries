@@ -134,6 +134,11 @@ public final class TimeSeriesFcts
         functions.add(varianceFactory("variance", false));
         functions.add(varianceFactory("stddev", true));
 
+        // counter_delta / counter_rate: increase of a monotonic counter over (value, timestamp), compensating for
+        // resets (a drop in value is treated as the counter restarting from 0).
+        functions.add(counterFactory("counter_delta", false));
+        functions.add(counterFactory("counter_rate", true));
+
         // histogram(value, min, max, nbuckets): frequency counts, with underflow/overflow buckets
         functions.add(new FunctionFactory("histogram",
                                           FunctionParameter.anyType(false),
@@ -280,6 +285,25 @@ public final class TimeSeriesFcts
                                          functionName, argTypes.get(0).asCQL3Type());
 
                 return makeVarianceFunction(functionName, sqrt, argTypes.get(0));
+            }
+        };
+    }
+
+    /** Builds the {@code counter_delta}/{@code counter_rate} factory over a numeric (value, timestamp) series. */
+    private static FunctionFactory counterFactory(String functionName, boolean perSecond)
+    {
+        return new FunctionFactory(functionName,
+                                   FunctionParameter.anyType(false),
+                                   FunctionParameter.fixed(CQL3Type.Native.TIMESTAMP, CQL3Type.Native.BIGINT))
+        {
+            @Override
+            protected NativeFunction doGetOrCreateFunction(List<AbstractType<?>> argTypes, AbstractType<?> receiverType)
+            {
+                if (!(argTypes.get(0) instanceof NumberType))
+                    throw invalidRequest("Function %s requires a numeric value argument, but found type %s",
+                                         functionName, argTypes.get(0).asCQL3Type());
+
+                return makeCounterFunction(functionName, perSecond, argTypes.get(0), argTypes.get(1));
             }
         };
     }
@@ -786,26 +810,125 @@ public final class TimeSeriesFcts
                     /** Identity order when input is already sorted; otherwise a timestamp-sorted index permutation. */
                     private int[] sortedOrder()
                     {
-                        int[] order = new int[size];
-                        for (int i = 0; i < size; i++)
-                            order[i] = i;
-                        if (!sorted)
+                        return timestampOrder(times, size, sorted);
+                    }
+                };
+            }
+        };
+    }
+
+    /**
+     * Returns an index permutation of {@code [0, size)} ordering {@code times} ascending. When {@code sorted} is true
+     * the input is already ordered and the identity permutation is returned; otherwise a stable, allocation-light
+     * insertion sort of the indices is used (no autoboxing).
+     */
+    private static int[] timestampOrder(long[] times, int size, boolean sorted)
+    {
+        int[] order = new int[size];
+        for (int i = 0; i < size; i++)
+            order[i] = i;
+        if (!sorted)
+        {
+            for (int i = 1; i < size; i++)
+            {
+                int idx = order[i];
+                long key = times[idx];
+                int j = i - 1;
+                while (j >= 0 && times[order[j]] > key)
+                {
+                    order[j + 1] = order[j];
+                    j--;
+                }
+                order[j + 1] = idx;
+            }
+        }
+        return order;
+    }
+
+    /**
+     * Builds the {@code counter_delta}/{@code counter_rate} aggregate over a numeric {@code (value, timestamp)} series.
+     * The total increase of a monotonically increasing counter is summed; when the value drops between consecutive
+     * samples (a counter reset), the post-reset value is taken as that step's increase (Prometheus-style). Order-
+     * independent: samples are buffered and ordered by timestamp at finalization.
+     *
+     * @param name the function name
+     * @param perSecond {@code true} for {@code counter_rate} (increase per second), {@code false} for {@code counter_delta}
+     * @param valueType the numeric type of the value argument
+     * @param timestampType the type of the timestamp argument ({@code timestamp} or {@code bigint})
+     */
+    private static NativeAggregateFunction makeCounterFunction(String name,
+                                                               boolean perSecond,
+                                                               AbstractType<?> valueType,
+                                                               AbstractType<?> timestampType)
+    {
+        return new NativeAggregateFunction(name, DoubleType.instance, valueType, timestampType)
+        {
+            @Override
+            public Aggregate newAggregate()
+            {
+                return new Aggregate()
+                {
+                    private long[] times = new long[16];
+                    private double[] vals = new double[16];
+                    private int size;
+                    private boolean sorted = true;
+
+                    @Override
+                    public void reset()
+                    {
+                        size = 0;
+                        sorted = true;
+                    }
+
+                    @Override
+                    public void addInput(Arguments arguments)
+                    {
+                        Number value = arguments.get(0);
+                        Number timestamp = arguments.get(1);
+
+                        if (value == null || timestamp == null)
+                            return;
+
+                        long t = timestamp.longValue();
+                        if (size > 0 && t < times[size - 1])
+                            sorted = false;
+                        if (size == times.length)
                         {
-                            // Rare path: insertion sort the index permutation by timestamp (stable, no boxing).
-                            for (int i = 1; i < size; i++)
-                            {
-                                int idx = order[i];
-                                long key = times[idx];
-                                int j = i - 1;
-                                while (j >= 0 && times[order[j]] > key)
-                                {
-                                    order[j + 1] = order[j];
-                                    j--;
-                                }
-                                order[j + 1] = idx;
-                            }
+                            times = Arrays.copyOf(times, size * 2);
+                            vals = Arrays.copyOf(vals, size * 2);
                         }
-                        return order;
+                        times[size] = t;
+                        vals[size] = value.doubleValue();
+                        size++;
+                    }
+
+                    @Override
+                    public ByteBuffer compute(FunctionContext context)
+                    {
+                        if (size == 0)
+                            return null;
+                        if (size == 1)
+                            // A single sample has no increase and no time span.
+                            return perSecond ? null : DoubleType.instance.decompose(0.0);
+
+                        int[] order = timestampOrder(times, size, sorted);
+
+                        double increase = 0;
+                        for (int i = 1; i < size; i++)
+                        {
+                            double prev = vals[order[i - 1]];
+                            double cur = vals[order[i]];
+                            // On a reset (value dropped) the counter is assumed to have restarted from 0.
+                            increase += cur >= prev ? cur - prev : cur;
+                        }
+
+                        if (!perSecond)
+                            return DoubleType.instance.decompose(increase);
+
+                        long spanMillis = times[order[size - 1]] - times[order[0]];
+                        if (spanMillis == 0)
+                            return null;
+                        return DoubleType.instance.decompose(increase / (spanMillis / 1000.0));
                     }
                 };
             }
