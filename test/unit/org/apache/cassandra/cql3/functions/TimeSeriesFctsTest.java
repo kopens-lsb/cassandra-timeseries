@@ -247,6 +247,10 @@ public class TimeSeriesFctsTest extends CQLTester
         // corr = 1.0; covar_pop = 4/3; covar_samp = 2.0.
         assertRows(execute("SELECT corr(y, x), covar_pop(y, x), covar_samp(y, x) FROM %s WHERE k = 1"),
                    row(1.0, 4.0 / 3.0, 2.0));
+
+        // Linear regression of y on x for y = 2x: slope 2, intercept 0, r2 1.
+        assertRows(execute("SELECT regr_slope(y, x), regr_intercept(y, x), regr_r2(y, x) FROM %s WHERE k = 1"),
+                   row(2.0, 0.0, 1.0));
     }
 
     @Test

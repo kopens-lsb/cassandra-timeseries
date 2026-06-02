@@ -36,6 +36,7 @@ All examples are runnable in `cqlsh`. Function reference (argument order matters
 | `time_weighted_average` | `time_weighted_average(value, timestamp)` | `double` |
 | `variance` / `stddev` | `variance(value)` / `stddev(value)` | `double` (sample) |
 | `corr` / `covar_pop` / `covar_samp` | `corr(y, x)` / `covar_pop(y, x)` / `covar_samp(y, x)` | `double` (two-variable stats) |
+| `regr_slope` / `regr_intercept` / `regr_r2` | `regr_slope(y, x)` / `regr_intercept(y, x)` / `regr_r2(y, x)` | `double` (linear regression of y on x) |
 | `histogram` | `histogram(value, min, max, nbuckets)` | `list<bigint>` (nbuckets+2) |
 | `approx_count_distinct` | `approx_count_distinct(value)` | `bigint` |
 | `time_bucket_gapfill` | `time_bucket_gapfill(width, ts, start, finish)` | `timestamp` (gap-filling GROUP BY selector) |
