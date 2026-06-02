@@ -297,4 +297,33 @@ public class TimeSeriesFctsTest extends CQLTester
         // Sample variance is undefined for a single value.
         assertRows(execute("SELECT variance(v), stddev(v) FROM %s WHERE k = 1"), row(null, null));
     }
+
+    @Test
+    public void testHistogram() throws Throwable
+    {
+        createTable("CREATE TABLE %s (k int, ts timestamp, v double, PRIMARY KEY (k, ts))");
+        // Buckets over [0, 20) with nbuckets=4 (width 5). Result is [underflow, b1, b2, b3, b4, overflow].
+        execute("INSERT INTO %s (k, ts, v) VALUES (1, '2024-01-01 09:00:00+0000', -1)");  // underflow
+        execute("INSERT INTO %s (k, ts, v) VALUES (1, '2024-01-01 09:00:01+0000', 0)");   // bucket 1 [0,5)
+        execute("INSERT INTO %s (k, ts, v) VALUES (1, '2024-01-01 09:00:02+0000', 1)");   // bucket 1
+        execute("INSERT INTO %s (k, ts, v) VALUES (1, '2024-01-01 09:00:03+0000', 2)");   // bucket 1
+        execute("INSERT INTO %s (k, ts, v) VALUES (1, '2024-01-01 09:00:04+0000', 7)");   // bucket 2 [5,10)
+        execute("INSERT INTO %s (k, ts, v) VALUES (1, '2024-01-01 09:00:05+0000', 100)"); // overflow
+
+        assertRows(execute("SELECT histogram(v, 0, 20, 4) FROM %s WHERE k = 1"),
+                   row(java.util.Arrays.asList(1L, 3L, 1L, 0L, 0L, 1L)));
+    }
+
+    @Test
+    public void testHistogramRejectsBadBounds() throws Throwable
+    {
+        createTable("CREATE TABLE %s (k int, ts timestamp, v double, PRIMARY KEY (k, ts))");
+        execute("INSERT INTO %s (k, ts, v) VALUES (1, '2024-01-01 09:00:00+0000', 1)");
+        assertInvalidThrowMessage("nbuckets > 0",
+                                  org.apache.cassandra.exceptions.InvalidRequestException.class,
+                                  "SELECT histogram(v, 0, 20, 0) FROM %s WHERE k = 1");
+        assertInvalidThrowMessage("max > min",
+                                  org.apache.cassandra.exceptions.InvalidRequestException.class,
+                                  "SELECT histogram(v, 20, 0, 4) FROM %s WHERE k = 1");
+    }
 }

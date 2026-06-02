@@ -28,6 +28,8 @@ import org.apache.cassandra.cql3.FunctionContext;
 import org.apache.cassandra.db.marshal.AbstractType;
 import org.apache.cassandra.db.marshal.DoubleType;
 import org.apache.cassandra.db.marshal.DurationType;
+import org.apache.cassandra.db.marshal.ListType;
+import org.apache.cassandra.db.marshal.LongType;
 import org.apache.cassandra.db.marshal.NumberType;
 import org.apache.cassandra.db.marshal.TimestampType;
 import org.apache.cassandra.exceptions.InvalidRequestException;
@@ -123,6 +125,25 @@ public final class TimeSeriesFcts
         // variance / stddev (sample) of a numeric column
         functions.add(varianceFactory("variance", false));
         functions.add(varianceFactory("stddev", true));
+
+        // histogram(value, min, max, nbuckets): frequency counts, with underflow/overflow buckets
+        functions.add(new FunctionFactory("histogram",
+                                          FunctionParameter.anyType(false),
+                                          FunctionParameter.anyType(false),
+                                          FunctionParameter.anyType(false),
+                                          FunctionParameter.anyType(false))
+        {
+            @Override
+            protected NativeFunction doGetOrCreateFunction(List<AbstractType<?>> argTypes, AbstractType<?> receiverType)
+            {
+                for (int i = 0; i < 4; i++)
+                    if (!(argTypes.get(i) instanceof NumberType))
+                        throw invalidRequest("Function histogram requires numeric arguments, but argument %d has type %s",
+                                             i + 1, argTypes.get(i).asCQL3Type());
+
+                return makeHistogramFunction(argTypes);
+            }
+        });
     }
 
     /** Builds the {@code variance}/{@code stddev} aggregate factory (sample, i.e. divided by n-1). */
@@ -630,6 +651,100 @@ public final class TimeSeriesFcts
                             variance = 0;
 
                         return DoubleType.instance.decompose(sqrt ? Math.sqrt(variance) : variance);
+                    }
+                };
+            }
+        };
+    }
+
+    /**
+     * Builds the {@code histogram(value, min, max, nbuckets)} aggregate: a list of {@code nbuckets + 2} counts — the
+     * first is the underflow count (values {@code < min}), the last is the overflow count (values {@code >= max}), and
+     * the middle {@code nbuckets} entries are equal-width buckets over {@code [min, max)}. Mirrors the histogram
+     * function found in other time-series databases.
+     *
+     * <p>{@code min}, {@code max} and {@code nbuckets} are expected to be constants; they are read from the first row.
+     *
+     * @param argTypes the [value, min, max, nbuckets] argument types
+     */
+    private static NativeAggregateFunction makeHistogramFunction(List<AbstractType<?>> argTypes)
+    {
+        ListType<Long> histogramType = ListType.getInstance(LongType.instance, false);
+        return new NativeAggregateFunction("histogram",
+                                           histogramType,
+                                           argTypes.get(0), argTypes.get(1), argTypes.get(2), argTypes.get(3))
+        {
+            @Override
+            public Aggregate newAggregate()
+            {
+                return new Aggregate()
+                {
+                    private long[] counts;
+                    private double min;
+                    private double max;
+                    private int nbuckets;
+                    private boolean boundsSet;
+
+                    @Override
+                    public void reset()
+                    {
+                        counts = null;
+                        boundsSet = false;
+                    }
+
+                    @Override
+                    public void addInput(Arguments arguments)
+                    {
+                        Number value = arguments.get(0);
+                        Number minArg = arguments.get(1);
+                        Number maxArg = arguments.get(2);
+                        Number nbucketsArg = arguments.get(3);
+
+                        if (!boundsSet)
+                        {
+                            if (minArg == null || maxArg == null || nbucketsArg == null)
+                                return;
+
+                            min = minArg.doubleValue();
+                            max = maxArg.doubleValue();
+                            nbuckets = nbucketsArg.intValue();
+
+                            if (nbuckets <= 0)
+                                throw invalidRequest("Function histogram requires nbuckets > 0, but was %s", nbuckets);
+                            if (max <= min)
+                                throw invalidRequest("Function histogram requires max > min, but was min=%s max=%s",
+                                                     min, max);
+
+                            counts = new long[nbuckets + 2];
+                            boundsSet = true;
+                        }
+
+                        if (value == null)
+                            return;
+
+                        double v = value.doubleValue();
+                        int index;
+                        if (v < min)
+                            index = 0;
+                        else if (v >= max)
+                            index = nbuckets + 1;
+                        else
+                            index = 1 + (int) ((v - min) / (max - min) * nbuckets);
+
+                        counts[index]++;
+                    }
+
+                    @Override
+                    public ByteBuffer compute(FunctionContext context)
+                    {
+                        if (!boundsSet)
+                            return null;
+
+                        List<Long> result = new ArrayList<>(counts.length);
+                        for (long c : counts)
+                            result.add(c);
+
+                        return histogramType.decompose(result);
                     }
                 };
             }
