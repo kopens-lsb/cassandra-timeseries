@@ -187,6 +187,29 @@ public final class TimeSeriesFcts
                 };
             }
         });
+
+        // interpolate(value): on real rows returns the value as a double; a marker that tells time_bucket_gapfill to
+        // linearly interpolate empty buckets between the surrounding non-empty buckets.
+        functions.add(new FunctionFactory("interpolate", FunctionParameter.anyType(false))
+        {
+            @Override
+            protected NativeFunction doGetOrCreateFunction(List<AbstractType<?>> argTypes, AbstractType<?> receiverType)
+            {
+                if (!(argTypes.get(0) instanceof NumberType))
+                    throw invalidRequest("Function interpolate requires a numeric argument, but found type %s",
+                                         argTypes.get(0).asCQL3Type());
+
+                return new NativeScalarFunction("interpolate", DoubleType.instance, argTypes.get(0))
+                {
+                    @Override
+                    public ByteBuffer execute(Arguments arguments)
+                    {
+                        Number value = arguments.get(0);
+                        return value == null ? null : DoubleType.instance.decompose(value.doubleValue());
+                    }
+                };
+            }
+        });
     }
 
     /**

@@ -255,18 +255,21 @@ public class SelectStatement implements CQLStatement.SingleKeyspaceCqlStatement,
     {
         private final int bucketIndex;
         private final List<Integer> locfColumnIndices;
+        private final List<Integer> interpolateColumnIndices;
         private final Selector.Factory widthFactory;
         private final Selector.Factory startFactory;
         private final Selector.Factory finishFactory;
 
         GapFillSpec(int bucketIndex,
                     List<Integer> locfColumnIndices,
+                    List<Integer> interpolateColumnIndices,
                     Selector.Factory widthFactory,
                     Selector.Factory startFactory,
                     Selector.Factory finishFactory)
         {
             this.bucketIndex = bucketIndex;
             this.locfColumnIndices = locfColumnIndices;
+            this.interpolateColumnIndices = interpolateColumnIndices;
             this.widthFactory = widthFactory;
             this.startFactory = startFactory;
             this.finishFactory = finishFactory;
@@ -295,6 +298,7 @@ public class SelectStatement implements CQLStatement.SingleKeyspaceCqlStatement,
                                                                         bucketIndex,
                                                                         Collections.emptyList(),
                                                                         locfColumnIndices,
+                                                                        interpolateColumnIndices,
                                                                         cqlRows.metadata.getColumnCount(),
                                                                         start,
                                                                         finish,
@@ -1749,14 +1753,18 @@ public class SelectStatement implements CQLStatement.SingleKeyspaceCqlStatement,
             List<ColumnSpecification> names = selection.getResultMetadata().names;
             int bucketIndex = -1;
             List<Integer> locfColumnIndices = new ArrayList<>();
+            List<Integer> interpolateColumnIndices = new ArrayList<>();
             for (int i = 0; i < names.size(); i++)
             {
                 String columnName = names.get(i).name.toString();
                 if (columnName.contains("time_bucket_gapfill"))
                     bucketIndex = i;
-                // Columns wrapped in locf(...) carry their previous non-empty value into synthesized buckets.
+                // Columns wrapped in locf(...) carry their previous non-empty value into synthesized buckets;
+                // interpolate(...) columns are linearly interpolated between surrounding non-empty buckets.
                 else if (columnName.contains("locf("))
                     locfColumnIndices.add(i);
+                else if (columnName.contains("interpolate("))
+                    interpolateColumnIndices.add(i);
             }
             if (bucketIndex < 0)
                 return null;
@@ -1765,7 +1773,7 @@ public class SelectStatement implements CQLStatement.SingleKeyspaceCqlStatement,
             Selector.Factory width = args.get(0).newSelectorFactory(metadata, DurationType.instance, new ArrayList<>(), boundNames);
             Selector.Factory start = args.get(2).newSelectorFactory(metadata, TimestampType.instance, new ArrayList<>(), boundNames);
             Selector.Factory finish = args.get(3).newSelectorFactory(metadata, TimestampType.instance, new ArrayList<>(), boundNames);
-            return new GapFillSpec(bucketIndex, locfColumnIndices, width, start, finish);
+            return new GapFillSpec(bucketIndex, locfColumnIndices, interpolateColumnIndices, width, start, finish);
         }
 
         private ColumnComparator<List<ByteBuffer>> getOrderingComparator(Selection selection,

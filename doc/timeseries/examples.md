@@ -38,6 +38,7 @@ All examples are runnable in `cqlsh`. Function reference (argument order matters
 | `approx_count_distinct` | `approx_count_distinct(value)` | `bigint` |
 | `time_bucket_gapfill` | `time_bucket_gapfill(width, ts, start, finish)` | `timestamp` (gap-filling GROUP BY selector) |
 | `locf` | `locf(aggregate)` | same as argument (carry-forward fill for gap-filled buckets) |
+| `interpolate` | `interpolate(aggregate)` | `double` (linear-interpolation fill for gap-filled buckets) |
 
 ---
 
@@ -135,6 +136,19 @@ GROUP  BY series, time_bucket_gapfill(1h, ts, '2024-01-01 00:00:00+0000', '2024-
 
 `locf` is a no-op on real rows (returns its argument); it only affects synthesized empty buckets. Buckets before the
 first real value remain null (nothing to carry yet).
+
+Use `interpolate(...)` instead to linearly interpolate empty buckets between the surrounding non-empty values
+(the result is a `double`):
+
+```sql
+SELECT time_bucket_gapfill(1h, ts, '2024-01-01 00:00:00+0000', '2024-01-02 00:00:00+0000'),
+       interpolate(avg(value))   -- empty buckets ramp linearly between neighbours
+FROM   metrics
+WHERE  series = 'cpu'
+GROUP  BY series, time_bucket_gapfill(1h, ts, '2024-01-01 00:00:00+0000', '2024-01-02 00:00:00+0000');
+```
+
+Empty buckets before the first or after the last real value stay null (nothing to interpolate from).
 
 v1 notes: use within a single series (restrict the partition key in `WHERE`), with a fixed-width bucket (no month
 component), without aliasing the bucket column, and without paging across the bucket range.

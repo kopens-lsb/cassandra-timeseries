@@ -50,6 +50,7 @@ public final class TimeBucketGapFiller
                                                   int bucketIndex,
                                                   List<Integer> partitionKeyIndices,
                                                   List<Integer> locfColumnIndices,
+                                                  List<Integer> interpolateColumnIndices,
                                                   int columnCount,
                                                   long startMillis,
                                                   long finishMillis,
@@ -70,12 +71,46 @@ public final class TimeBucketGapFiller
             while (groupEnd < n && samePartition(first, rows.get(groupEnd), partitionKeyIndices))
                 groupEnd++;
 
+            int groupStartInOut = out.size();
             fillGroup(rows, i, groupEnd, bucketIndex, partitionKeyIndices, locfColumnIndices, columnCount,
                       startMillis, finishMillis, stepMillis, out);
+            // interpolate() columns are filled in a second pass over this group's emitted rows (needs the next value).
+            for (int col : interpolateColumnIndices)
+                interpolateColumn(out, groupStartInOut, out.size(), col);
+
             i = groupEnd;
         }
 
         return out;
+    }
+
+    /**
+     * Linearly interpolates the null cells of {@code col} between bracketing non-null values, over the output rows
+     * {@code [from, to)} of a single partition. Cells before the first non-null or after the last stay null. The column
+     * is assumed to be a {@code double} (the {@code interpolate()} function returns double).
+     */
+    private static void interpolateColumn(List<List<ByteBuffer>> out, int from, int to, int col)
+    {
+        int prev = -1;
+        for (int i = from; i < to; i++)
+        {
+            ByteBuffer cell = out.get(i).get(col);
+            if (cell == null)
+                continue;
+
+            if (prev >= 0 && i - prev > 1)
+            {
+                double prevVal = ByteBufferUtil.toDouble(out.get(prev).get(col));
+                double nextVal = ByteBufferUtil.toDouble(cell);
+                int gap = i - prev;
+                for (int j = prev + 1; j < i; j++)
+                {
+                    double interpolated = prevVal + (nextVal - prevVal) * (j - prev) / gap;
+                    out.get(j).set(col, ByteBufferUtil.bytes(interpolated));
+                }
+            }
+            prev = i;
+        }
     }
 
     private static void fillGroup(List<List<ByteBuffer>> rows,

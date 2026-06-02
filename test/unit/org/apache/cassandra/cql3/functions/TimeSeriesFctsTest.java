@@ -405,6 +405,21 @@ public class TimeSeriesFctsTest extends CQLTester
     }
 
     @Test
+    public void testTimeBucketGapfillWithInterpolate() throws Throwable
+    {
+        createTable("CREATE TABLE %s (k int, ts timestamp, v int, PRIMARY KEY (k, ts))");
+        execute("INSERT INTO %s (k, ts, v) VALUES (1, '2024-01-01 09:30:00+0000', 0)");
+        execute("INSERT INTO %s (k, ts, v) VALUES (1, '2024-01-01 11:15:00+0000', 20)");
+
+        String gf = "time_bucket_gapfill(1h, ts, '2024-01-01 09:00:00+0000', '2024-01-01 12:00:00+0000')";
+        // interpolate(sum(v)) linearly fills the empty 10:00 bucket between 0 and 20 -> 10.0 (result is double).
+        assertRows(execute("SELECT " + gf + ", interpolate(sum(v)) FROM %s WHERE k = 1 GROUP BY k, " + gf),
+                   row(date("2024-01-01T09:00:00Z"), 0.0),
+                   row(date("2024-01-01T10:00:00Z"), 10.0),
+                   row(date("2024-01-01T11:00:00Z"), 20.0));
+    }
+
+    @Test
     public void testTimeBucketGapfillRejectsBadRange() throws Throwable
     {
         createTable("CREATE TABLE %s (k int, ts timestamp, v int, PRIMARY KEY (k, ts))");
