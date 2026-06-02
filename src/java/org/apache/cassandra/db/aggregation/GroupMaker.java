@@ -173,6 +173,8 @@ public abstract class GroupMaker
             super(comparator, clusteringPrefixSize, state);
             this.selector = selector;
             this.input = new Selector.InputRow(ProtocolVersion.CURRENT, columns, false);
+            // Prepare once: prepare() allocates the selector's Arguments, so it must not run per row.
+            this.selector.prepare(ProtocolVersion.CURRENT);
             this.lastOutput = lastClustering == null ? null :
                                                        executeSelector(lastClustering.bufferAt(clusteringPrefixSize - 1));
         }
@@ -185,6 +187,8 @@ public abstract class GroupMaker
             super(comparator, clusteringPrefixSize);
             this.selector = selector;
             this.input = new Selector.InputRow(ProtocolVersion.CURRENT, columns, false);
+            // Prepare once: prepare() allocates the selector's Arguments, so it must not run per row.
+            this.selector.prepare(ProtocolVersion.CURRENT);
         }
 
         @Override
@@ -225,7 +229,7 @@ public abstract class GroupMaker
             input.add(argument);
 
             // For computing groups we do not need to use the specific client protocol version.
-            selector.prepare(ProtocolVersion.CURRENT);
+            // (prepare() is done once in the constructor, not per row.)
             selector.addInput(input);
             ByteBuffer output = selector.getOutput(ProtocolVersion.CURRENT);
             selector.reset();
