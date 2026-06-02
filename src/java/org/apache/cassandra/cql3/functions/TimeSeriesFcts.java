@@ -19,7 +19,7 @@ package org.apache.cassandra.cql3.functions;
 
 import java.nio.ByteBuffer;
 import java.util.ArrayList;
-import java.util.Collections;
+import java.util.Arrays;
 import java.util.List;
 
 import com.clearspring.analytics.stream.cardinality.HyperLogLogPlus;
@@ -36,7 +36,7 @@ import org.apache.cassandra.db.marshal.LongType;
 import org.apache.cassandra.db.marshal.NumberType;
 import org.apache.cassandra.db.marshal.TimestampType;
 import org.apache.cassandra.exceptions.InvalidRequestException;
-import org.apache.cassandra.utils.ByteBufferUtil;
+import org.apache.cassandra.utils.MurmurHash;
 
 import static org.apache.cassandra.cql3.statements.RequestValidations.invalidRequest;
 
@@ -252,7 +252,9 @@ public final class TimeSeriesFcts
                         if (value == null)
                             return;
 
-                        cardinality.offer(ByteBufferUtil.getArray(value));
+                        // Hash the buffer's bytes in place (no array copy) and feed the pre-hashed value to the sketch.
+                        long hash = MurmurHash.hash2_64(value, value.position(), value.remaining(), 0);
+                        cardinality.offerHashed(hash);
                     }
 
                     @Override
@@ -637,14 +639,16 @@ public final class TimeSeriesFcts
             {
                 return new Aggregate()
                 {
-                    private final List<Double> values = new ArrayList<>();
+                    // Primitive growable buffer (avoids boxing every value into a Double).
+                    private double[] values = new double[16];
+                    private int size;
                     private double quantile;
                     private boolean quantileSet;
 
                     @Override
                     public void reset()
                     {
-                        values.clear();
+                        size = 0;
                         quantile = 0;
                         quantileSet = false;
                     }
@@ -666,24 +670,28 @@ public final class TimeSeriesFcts
                         }
 
                         if (value != null)
-                            values.add(value.doubleValue());
+                        {
+                            if (size == values.length)
+                                values = Arrays.copyOf(values, size * 2);
+                            values[size++] = value.doubleValue();
+                        }
                     }
 
                     @Override
                     public ByteBuffer compute(FunctionContext context)
                     {
-                        if (values.isEmpty() || !quantileSet)
+                        if (size == 0 || !quantileSet)
                             return null;
 
-                        Collections.sort(values);
+                        Arrays.sort(values, 0, size);
 
                         // PERCENTILE_CONT: interpolate linearly between the values bracketing the fractional rank.
-                        double rank = quantile * (values.size() - 1);
+                        double rank = quantile * (size - 1);
                         int lower = (int) Math.floor(rank);
                         int upper = (int) Math.ceil(rank);
                         double result = lower == upper
-                                        ? values.get(lower)
-                                        : values.get(lower) + (rank - lower) * (values.get(upper) - values.get(lower));
+                                        ? values[lower]
+                                        : values[lower] + (rank - lower) * (values[upper] - values[lower]);
 
                         return DoubleType.instance.decompose(result);
                     }
