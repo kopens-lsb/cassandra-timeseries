@@ -139,10 +139,13 @@ public final class TimeSeriesFcts
         functions.add(counterFactory("counter_delta", false));
         functions.add(counterFactory("counter_rate", true));
 
-        // Two-variable statistics over (y, x): correlation and covariance (population / sample).
+        // Two-variable statistics over (y, x): correlation, covariance, and linear regression.
         functions.add(bivariateFactory("corr", BivariateStat.CORR));
         functions.add(bivariateFactory("covar_pop", BivariateStat.COVAR_POP));
         functions.add(bivariateFactory("covar_samp", BivariateStat.COVAR_SAMP));
+        functions.add(bivariateFactory("regr_slope", BivariateStat.REGR_SLOPE));
+        functions.add(bivariateFactory("regr_intercept", BivariateStat.REGR_INTERCEPT));
+        functions.add(bivariateFactory("regr_r2", BivariateStat.REGR_R2));
 
         // histogram(value, min, max, nbuckets): frequency counts, with underflow/overflow buckets
         functions.add(new FunctionFactory("histogram",
@@ -314,7 +317,7 @@ public final class TimeSeriesFcts
     }
 
     /** The bivariate statistic computed by {@link #makeBivariateFunction}. */
-    private enum BivariateStat { CORR, COVAR_POP, COVAR_SAMP }
+    private enum BivariateStat { CORR, COVAR_POP, COVAR_SAMP, REGR_SLOPE, REGR_INTERCEPT, REGR_R2 }
 
     /** Builds the {@code corr}/{@code covar_pop}/{@code covar_samp} factory over two numeric columns {@code (y, x)}. */
     private static FunctionFactory bivariateFactory(String functionName, BivariateStat kind)
@@ -1193,6 +1196,35 @@ public final class TimeSeriesFcts
                                 if (denominator == 0)
                                     return null;
                                 return DoubleType.instance.decompose((count * sumXY - sumX * sumY) / denominator);
+                            }
+                            case REGR_SLOPE:
+                            {
+                                if (count < 2)
+                                    return null;
+                                double varX = count * sumXX - sumX * sumX;
+                                if (varX == 0)
+                                    return null;
+                                return DoubleType.instance.decompose((count * sumXY - sumX * sumY) / varX);
+                            }
+                            case REGR_INTERCEPT:
+                            {
+                                if (count < 2)
+                                    return null;
+                                double varX = count * sumXX - sumX * sumX;
+                                if (varX == 0)
+                                    return null;
+                                double slope = (count * sumXY - sumX * sumY) / varX;
+                                return DoubleType.instance.decompose((sumY - slope * sumX) / count);
+                            }
+                            case REGR_R2:
+                            {
+                                if (count < 2)
+                                    return null;
+                                double denom = (count * sumXX - sumX * sumX) * (count * sumYY - sumY * sumY);
+                                if (denom == 0)
+                                    return null;
+                                double cov = count * sumXY - sumX * sumY;
+                                return DoubleType.instance.decompose(cov * cov / denom);
                             }
                             default:
                                 throw new AssertionError(kind);
