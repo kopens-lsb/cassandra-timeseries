@@ -328,6 +328,30 @@ public class TimeSeriesFctsTest extends CQLTester
     }
 
     @Test
+    public void testIntegral() throws Throwable
+    {
+        createTable("CREATE TABLE %s (k int, ts timestamp, v double, PRIMARY KEY (k, ts))");
+        // Constant value 10 held over 30 seconds: integral = 10 * 30 = 300 (value-seconds); TWA = 10.
+        execute("INSERT INTO %s (k, ts, v) VALUES (1, '2024-01-01 09:00:00+0000', 10)");
+        execute("INSERT INTO %s (k, ts, v) VALUES (1, '2024-01-01 09:00:10+0000', 10)");
+        execute("INSERT INTO %s (k, ts, v) VALUES (1, '2024-01-01 09:00:20+0000', 10)");
+        execute("INSERT INTO %s (k, ts, v) VALUES (1, '2024-01-01 09:00:30+0000', 10)");
+
+        assertRows(execute("SELECT integral(v, ts), time_weighted_average(v, ts) FROM %s WHERE k = 1"),
+                   row(300.0, 10.0));
+    }
+
+    @Test
+    public void testIntegralEdgeCases() throws Throwable
+    {
+        createTable("CREATE TABLE %s (k int, ts timestamp, v double, PRIMARY KEY (k, ts))");
+        assertRows(execute("SELECT integral(v, ts) FROM %s WHERE k = 1"), row((Object) null));
+        execute("INSERT INTO %s (k, ts, v) VALUES (1, '2024-01-01 09:00:00+0000', 7)");
+        // A single sample has no time span -> integral 0.
+        assertRows(execute("SELECT integral(v, ts) FROM %s WHERE k = 1"), row(0.0));
+    }
+
+    @Test
     public void testTimeWeightedAverageWeightsByDuration() throws Throwable
     {
         createTable("CREATE TABLE %s (k int, ts timestamp, v double, PRIMARY KEY (k, ts))");
