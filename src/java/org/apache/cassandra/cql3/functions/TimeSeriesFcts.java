@@ -1,0 +1,472 @@
+/*
+ * Licensed to the Apache Software Foundation (ASF) under one
+ * or more contributor license agreements.  See the NOTICE file
+ * distributed with this work for additional information
+ * regarding copyright ownership.  The ASF licenses this file
+ * to you under the Apache License, Version 2.0 (the
+ * "License"); you may not use this file except in compliance
+ * with the License.  You may obtain a copy of the License at
+ *
+ *     http://www.apache.org/licenses/LICENSE-2.0
+ *
+ * Unless required by applicable law or agreed to in writing, software
+ * distributed under the License is distributed on an "AS IS" BASIS,
+ * WITHOUT WARRANTIES OR CONDITIONS OF ANY KIND, either express or implied.
+ * See the License for the specific language governing permissions and
+ * limitations under the License.
+ */
+package org.apache.cassandra.cql3.functions;
+
+import java.nio.ByteBuffer;
+import java.util.ArrayList;
+import java.util.Collections;
+import java.util.List;
+
+import org.apache.cassandra.cql3.CQL3Type;
+import org.apache.cassandra.cql3.Duration;
+import org.apache.cassandra.cql3.FunctionContext;
+import org.apache.cassandra.db.marshal.AbstractType;
+import org.apache.cassandra.db.marshal.DoubleType;
+import org.apache.cassandra.db.marshal.DurationType;
+import org.apache.cassandra.db.marshal.NumberType;
+import org.apache.cassandra.db.marshal.TimestampType;
+import org.apache.cassandra.exceptions.InvalidRequestException;
+
+import static org.apache.cassandra.cql3.statements.RequestValidations.invalidRequest;
+
+/**
+ * Native functions specialised for time-series workloads.
+ *
+ * <p>This family provides:
+ * <ul>
+ *     <li>{@code time_bucket(duration, timestamp [, origin])} - a downsampling/bucketing scalar that rounds a
+ *     timestamp down to the start of the time window of the given width. It is the time-series ergonomic spelling of
+ *     the existing {@code floor(timestamp, duration [, origin])} function (note the swapped argument order, matching
+ *     the convention used by other time-series databases).</li>
+ *     <li>{@code first(value, timestamp)} / {@code last(value, timestamp)} - aggregates returning the {@code value}
+ *     paired with the smallest/largest {@code timestamp} seen within a group. Both arguments are kept as raw bytes so
+ *     the functions are generic over any {@code value} type; timestamps are ordered using the timestamp argument's own
+ *     comparator, which makes the aggregates safe to merge across replicas (the operation is associative and the
+ *     result is independent of row arrival order).</li>
+ * </ul>
+ */
+public final class TimeSeriesFcts
+{
+    public static void addFunctionsTo(NativeFunctions functions)
+    {
+        // time_bucket(duration, timestamp) and time_bucket(duration, timestamp, origin)
+        functions.add(new TimeBucketFunction(false));
+        functions.add(new TimeBucketFunction(true));
+
+        // first(value, timestamp) / last(value, timestamp) for any value type
+        functions.add(new FunctionFactory("first",
+                                           FunctionParameter.anyType(true),
+                                           FunctionParameter.anyType(false))
+        {
+            @Override
+            protected NativeFunction doGetOrCreateFunction(List<AbstractType<?>> argTypes, AbstractType<?> receiverType)
+            {
+                return makeFirstLastFunction("first", argTypes.get(0), argTypes.get(1), true);
+            }
+        });
+        functions.add(new FunctionFactory("last",
+                                          FunctionParameter.anyType(true),
+                                          FunctionParameter.anyType(false))
+        {
+            @Override
+            protected NativeFunction doGetOrCreateFunction(List<AbstractType<?>> argTypes, AbstractType<?> receiverType)
+            {
+                return makeFirstLastFunction("last", argTypes.get(0), argTypes.get(1), false);
+            }
+        });
+
+        // delta / rate / derivative over a numeric (value, timestamp) series
+        functions.add(numericSeriesFactory("delta", SeriesFunction.DELTA));
+        functions.add(numericSeriesFactory("rate", SeriesFunction.RATE));
+        functions.add(numericSeriesFactory("derivative", SeriesFunction.DERIVATIVE));
+
+        // percentile(value, q): exact continuous percentile (linear interpolation) of a numeric column
+        functions.add(new FunctionFactory("percentile",
+                                          FunctionParameter.anyType(false),
+                                          FunctionParameter.anyType(false))
+        {
+            @Override
+            protected NativeFunction doGetOrCreateFunction(List<AbstractType<?>> argTypes, AbstractType<?> receiverType)
+            {
+                if (!(argTypes.get(0) instanceof NumberType))
+                    throw invalidRequest("Function percentile requires a numeric value argument, but found type %s",
+                                         argTypes.get(0).asCQL3Type());
+                if (!(argTypes.get(1) instanceof NumberType))
+                    throw invalidRequest("Function percentile requires a numeric quantile argument, but found type %s",
+                                         argTypes.get(1).asCQL3Type());
+
+                return makePercentileFunction(argTypes.get(0), argTypes.get(1));
+            }
+        });
+    }
+
+    /**
+     * Builds the {@link FunctionFactory} for {@code delta}/{@code rate}/{@code derivative}, validating that the value
+     * argument is numeric and the timestamp argument is a {@code timestamp} or {@code bigint}.
+     */
+    private static FunctionFactory numericSeriesFactory(String functionName, SeriesFunction kind)
+    {
+        return new FunctionFactory(functionName,
+                                   FunctionParameter.anyType(false),
+                                   FunctionParameter.fixed(CQL3Type.Native.TIMESTAMP, CQL3Type.Native.BIGINT))
+        {
+            @Override
+            protected NativeFunction doGetOrCreateFunction(List<AbstractType<?>> argTypes, AbstractType<?> receiverType)
+            {
+                AbstractType<?> valueType = argTypes.get(0);
+                if (!(valueType instanceof NumberType))
+                    throw invalidRequest("Function %s requires a numeric value argument, but found type %s",
+                                         functionName, valueType.asCQL3Type());
+
+                return makeSeriesFunction(functionName, kind, valueType, argTypes.get(1));
+            }
+        };
+    }
+
+    /**
+     * {@code time_bucket(duration, timestamp [, origin])}: rounds {@code timestamp} down to the closest multiple of
+     * {@code duration}, optionally offset by {@code origin}. Equivalent to {@code floor(timestamp, duration [, origin])}
+     * but with the (duration, timestamp) argument order used by time-series databases.
+     */
+    private static final class TimeBucketFunction extends NativeScalarFunction
+    {
+        private final boolean withOrigin;
+
+        private TimeBucketFunction(boolean withOrigin)
+        {
+            super("time_bucket",
+                  TimestampType.instance,
+                  argTypes(withOrigin));
+            this.withOrigin = withOrigin;
+        }
+
+        private static AbstractType<?>[] argTypes(boolean withOrigin)
+        {
+            return withOrigin
+                   ? new AbstractType<?>[]{ DurationType.instance, TimestampType.instance, TimestampType.instance }
+                   : new AbstractType<?>[]{ DurationType.instance, TimestampType.instance };
+        }
+
+        @Override
+        protected boolean isPartialApplicationMonotonic(List<ByteBuffer> partialParameters)
+        {
+            // time_bucket is monotonic in its timestamp argument as long as the duration (and optional origin) are
+            // constants. This mirrors floor() and is what allows time_bucket to be used as a GROUP BY selector.
+            return partialParameters.get(1) == UNRESOLVED
+                   && partialParameters.get(0) != UNRESOLVED
+                   && (partialParameters.size() == 2 || partialParameters.get(2) != UNRESOLVED);
+        }
+
+        @Override
+        public ByteBuffer execute(Arguments arguments) throws InvalidRequestException
+        {
+            if (arguments.containsNulls())
+                return null;
+
+            Duration duration = arguments.get(0);
+            long time = arguments.getAsLong(1);
+            long origin = withOrigin ? arguments.getAsLong(2) : 0L;
+
+            if (!duration.hasMillisecondPrecision())
+                throw invalidRequest("The time_bucket cannot be computed for the %s duration as precision is below " +
+                                     "1 millisecond", duration);
+
+            long floor = Duration.floorTimestamp(time, duration, origin);
+            return TimestampType.instance.fromTimeInMillis(floor);
+        }
+    }
+
+    /**
+     * Builds a {@code first}/{@code last} aggregate for a given (value, timestamp) signature.
+     *
+     * @param name the function name ({@code "first"} or {@code "last"})
+     * @param valueType the type of the value to return
+     * @param timestampType the type used to order rows within the group
+     * @param keepEarliest {@code true} for {@code first} (smallest timestamp wins), {@code false} for {@code last}
+     */
+    private static NativeAggregateFunction makeFirstLastFunction(String name,
+                                                                 AbstractType<?> valueType,
+                                                                 AbstractType<?> timestampType,
+                                                                 boolean keepEarliest)
+    {
+        return new NativeAggregateFunction(name, valueType, valueType, timestampType)
+        {
+            @Override
+            public Arguments newArguments(FunctionContext context)
+            {
+                // Keep both arguments as raw bytes: the value is returned verbatim and timestamps are compared with the
+                // timestamp argument's own (order-preserving) comparator.
+                return FunctionArguments.newNoopInstance(context, 2);
+            }
+
+            @Override
+            public Aggregate newAggregate()
+            {
+                return new Aggregate()
+                {
+                    private ByteBuffer bestTimestamp;
+                    private ByteBuffer bestValue;
+                    private boolean hasValue;
+
+                    @Override
+                    public void reset()
+                    {
+                        bestTimestamp = null;
+                        bestValue = null;
+                        hasValue = false;
+                    }
+
+                    @Override
+                    public ByteBuffer compute(FunctionContext context)
+                    {
+                        return hasValue ? bestValue : null;
+                    }
+
+                    @Override
+                    public void addInput(Arguments arguments)
+                    {
+                        ByteBuffer value = arguments.get(0);
+                        ByteBuffer timestamp = arguments.get(1);
+
+                        // A row with no timestamp cannot be ordered, so it is ignored.
+                        if (timestamp == null)
+                            return;
+
+                        if (!hasValue || winsOver(timestamp))
+                        {
+                            bestTimestamp = timestamp;
+                            bestValue = value;
+                            hasValue = true;
+                        }
+                    }
+
+                    private boolean winsOver(ByteBuffer timestamp)
+                    {
+                        int cmp = timestampType.compare(timestamp, bestTimestamp);
+                        return keepEarliest ? cmp < 0 : cmp > 0;
+                    }
+                };
+            }
+        };
+    }
+
+    /** The kind of change-over-time computation performed by {@link #makeSeriesFunction}. */
+    private enum SeriesFunction
+    {
+        /** Difference between the values at the largest and smallest timestamps. */
+        DELTA,
+        /** {@link #DELTA} divided by the elapsed time, expressed per second. */
+        RATE,
+        /** Least-squares regression slope of value over time, expressed per second. */
+        DERIVATIVE
+    }
+
+    /**
+     * Builds a {@code delta}/{@code rate}/{@code derivative} aggregate over a numeric {@code (value, timestamp)}
+     * series, returning a {@code double}.
+     *
+     * <p>All three are computed from order-independent accumulators (timestamp endpoints for {@code delta}/{@code rate}
+     * and the regression sums n, &Sigma;x, &Sigma;y, &Sigma;xy, &Sigma;x&sup2; for {@code derivative}), so the result
+     * does not depend on the order in which rows are fed to the aggregate. Counter resets are not compensated for; these
+     * functions use gauge semantics.
+     *
+     * @param name the function name
+     * @param kind the computation to perform
+     * @param valueType the numeric type of the value argument
+     * @param timestampType the type of the timestamp argument ({@code timestamp} or {@code bigint})
+     */
+    private static NativeAggregateFunction makeSeriesFunction(String name,
+                                                              SeriesFunction kind,
+                                                              AbstractType<?> valueType,
+                                                              AbstractType<?> timestampType)
+    {
+        return new NativeAggregateFunction(name, DoubleType.instance, valueType, timestampType)
+        {
+            @Override
+            public Aggregate newAggregate()
+            {
+                return new Aggregate()
+                {
+                    // Endpoints used by delta and rate.
+                    private long minTs;
+                    private long maxTs;
+                    private double valueAtMin;
+                    private double valueAtMax;
+                    // Least-squares accumulators used by derivative (x = seconds, y = value). x is measured relative to
+                    // the first timestamp seen rather than the absolute epoch: the regression slope is invariant to
+                    // shifting x by a constant, and keeping x small avoids the catastrophic cancellation that absolute
+                    // epoch-second values (~1e9) would cause in (n*sumXX - sumX*sumX).
+                    private long baseTs;
+                    private long count;
+                    private double sumX;
+                    private double sumY;
+                    private double sumXY;
+                    private double sumXX;
+
+                    @Override
+                    public void reset()
+                    {
+                        minTs = 0;
+                        maxTs = 0;
+                        valueAtMin = 0;
+                        valueAtMax = 0;
+                        baseTs = 0;
+                        count = 0;
+                        sumX = 0;
+                        sumY = 0;
+                        sumXY = 0;
+                        sumXX = 0;
+                    }
+
+                    @Override
+                    public void addInput(Arguments arguments)
+                    {
+                        Number value = arguments.get(0);
+                        Number timestamp = arguments.get(1);
+
+                        // A row missing the value or the timestamp cannot contribute to the series.
+                        if (value == null || timestamp == null)
+                            return;
+
+                        double y = value.doubleValue();
+                        long t = timestamp.longValue();
+
+                        if (count == 0)
+                            baseTs = t;
+
+                        if (count == 0 || t < minTs)
+                        {
+                            minTs = t;
+                            valueAtMin = y;
+                        }
+                        if (count == 0 || t > maxTs)
+                        {
+                            maxTs = t;
+                            valueAtMax = y;
+                        }
+
+                        double x = (t - baseTs) / 1000.0;
+                        sumX += x;
+                        sumY += y;
+                        sumXY += x * y;
+                        sumXX += x * x;
+                        count++;
+                    }
+
+                    @Override
+                    public ByteBuffer compute(FunctionContext context)
+                    {
+                        if (count == 0)
+                            return null;
+
+                        switch (kind)
+                        {
+                            case DELTA:
+                                return DoubleType.instance.decompose(valueAtMax - valueAtMin);
+                            case RATE:
+                            {
+                                long spanMillis = maxTs - minTs;
+                                if (spanMillis == 0)
+                                    return null;
+                                return DoubleType.instance.decompose((valueAtMax - valueAtMin) / (spanMillis / 1000.0));
+                            }
+                            case DERIVATIVE:
+                            {
+                                double denominator = count * sumXX - sumX * sumX;
+                                if (denominator == 0.0)
+                                    return null;
+                                return DoubleType.instance.decompose((count * sumXY - sumX * sumY) / denominator);
+                            }
+                            default:
+                                throw new AssertionError(kind);
+                        }
+                    }
+                };
+            }
+        };
+    }
+
+    /**
+     * Builds the {@code percentile(value, q)} aggregate: the exact continuous percentile (PERCENTILE_CONT, with linear
+     * interpolation between adjacent values) of a numeric column, where {@code q} is a quantile in {@code [0, 1]}.
+     *
+     * <p>This keeps every value of the group in memory and sorts on {@link Aggregate#compute}, so memory is proportional
+     * to the number of rows aggregated. It is intended for downsampled time-series buckets of bounded cardinality.
+     *
+     * @param valueType the numeric type of the value argument
+     * @param quantileType the numeric type of the quantile argument
+     */
+    private static NativeAggregateFunction makePercentileFunction(AbstractType<?> valueType,
+                                                                  AbstractType<?> quantileType)
+    {
+        return new NativeAggregateFunction("percentile", DoubleType.instance, valueType, quantileType)
+        {
+            @Override
+            public Aggregate newAggregate()
+            {
+                return new Aggregate()
+                {
+                    private final List<Double> values = new ArrayList<>();
+                    private double quantile;
+                    private boolean quantileSet;
+
+                    @Override
+                    public void reset()
+                    {
+                        values.clear();
+                        quantile = 0;
+                        quantileSet = false;
+                    }
+
+                    @Override
+                    public void addInput(Arguments arguments)
+                    {
+                        Number value = arguments.get(0);
+                        Number q = arguments.get(1);
+
+                        if (q != null && !quantileSet)
+                        {
+                            double quantileValue = q.doubleValue();
+                            if (quantileValue < 0 || quantileValue > 1)
+                                throw invalidRequest("The quantile argument of percentile must be between 0 and 1, " +
+                                                     "but was %s", quantileValue);
+                            quantile = quantileValue;
+                            quantileSet = true;
+                        }
+
+                        if (value != null)
+                            values.add(value.doubleValue());
+                    }
+
+                    @Override
+                    public ByteBuffer compute(FunctionContext context)
+                    {
+                        if (values.isEmpty() || !quantileSet)
+                            return null;
+
+                        Collections.sort(values);
+
+                        // PERCENTILE_CONT: interpolate linearly between the values bracketing the fractional rank.
+                        double rank = quantile * (values.size() - 1);
+                        int lower = (int) Math.floor(rank);
+                        int upper = (int) Math.ceil(rank);
+                        double result = lower == upper
+                                        ? values.get(lower)
+                                        : values.get(lower) + (rank - lower) * (values.get(upper) - values.get(lower));
+
+                        return DoubleType.instance.decompose(result);
+                    }
+                };
+            }
+        };
+    }
+
+    private TimeSeriesFcts()
+    {
+    }
+}

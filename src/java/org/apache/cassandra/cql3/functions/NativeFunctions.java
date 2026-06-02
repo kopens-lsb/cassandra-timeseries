@@ -38,6 +38,7 @@ public class NativeFunctions
             CastFcts.addFunctionsTo(this);
             UuidFcts.addFunctionsTo(this);
             TimeFcts.addFunctionsTo(this);
+            TimeSeriesFcts.addFunctionsTo(this);
             ToJsonFct.addFunctionsTo(this);
             FromJsonFct.addFunctionsTo(this);
             OperationFcts.addFunctionsTo(this);
