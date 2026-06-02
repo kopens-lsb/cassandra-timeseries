@@ -348,4 +348,39 @@ public class TimeSeriesFctsTest extends CQLTester
         createTable("CREATE TABLE %s (k int, ts timestamp, v int, PRIMARY KEY (k, ts))");
         assertRows(execute("SELECT approx_count_distinct(v) FROM %s WHERE k = 1"), row(0L));
     }
+
+    @Test
+    public void testTimeBucketGapfillGroupsLikeTimeBucket() throws Throwable
+    {
+        createTable("CREATE TABLE %s (k int, ts timestamp, v int, PRIMARY KEY (k, ts))");
+        execute("INSERT INTO %s (k, ts, v) VALUES (1, '2024-01-01 09:05:00+0000', 1)");
+        execute("INSERT INTO %s (k, ts, v) VALUES (1, '2024-01-01 09:35:00+0000', 3)");
+        execute("INSERT INTO %s (k, ts, v) VALUES (1, '2024-01-01 10:15:00+0000', 10)");
+
+        // Scalar: returns the bucket start aligned to the start argument.
+        assertRows(execute("SELECT time_bucket_gapfill(1h, ts, '2024-01-01 00:00:00+0000', " +
+                           "'2024-01-01 12:00:00+0000') FROM %s WHERE k = 1"),
+                   row(date("2024-01-01T09:00:00Z")),
+                   row(date("2024-01-01T09:00:00Z")),
+                   row(date("2024-01-01T10:00:00Z")));
+
+        // As a GROUP BY selector it buckets exactly like time_bucket (gap-fill of empty buckets is layered on later).
+        assertRows(execute("SELECT time_bucket_gapfill(1h, ts, '2024-01-01 00:00:00+0000', " +
+                           "'2024-01-01 12:00:00+0000') AS bucket, sum(v) " +
+                           "FROM %s WHERE k = 1 GROUP BY k, time_bucket_gapfill(1h, ts, '2024-01-01 00:00:00+0000', " +
+                           "'2024-01-01 12:00:00+0000')"),
+                   row(date("2024-01-01T09:00:00Z"), 4),
+                   row(date("2024-01-01T10:00:00Z"), 10));
+    }
+
+    @Test
+    public void testTimeBucketGapfillRejectsBadRange() throws Throwable
+    {
+        createTable("CREATE TABLE %s (k int, ts timestamp, v int, PRIMARY KEY (k, ts))");
+        execute("INSERT INTO %s (k, ts, v) VALUES (1, '2024-01-01 09:05:00+0000', 1)");
+        assertInvalidThrowMessage("finish must be greater than start",
+                                  org.apache.cassandra.exceptions.InvalidRequestException.class,
+                                  "SELECT time_bucket_gapfill(1h, ts, '2024-01-01 12:00:00+0000', " +
+                                  "'2024-01-01 00:00:00+0000') FROM %s WHERE k = 1");
+    }
 }

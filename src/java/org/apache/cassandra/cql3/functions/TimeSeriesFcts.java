@@ -64,6 +64,10 @@ public final class TimeSeriesFcts
         functions.add(new TimeBucketFunction(false));
         functions.add(new TimeBucketFunction(true));
 
+        // time_bucket_gapfill(duration, timestamp, start, finish): buckets like time_bucket (aligned to start) and
+        // additionally declares the dense [start, finish) range that gap-filling will materialize.
+        functions.add(new TimeBucketGapfillFunction());
+
         // first(value, timestamp) / last(value, timestamp) for any value type
         functions.add(new FunctionFactory("first",
                                            FunctionParameter.anyType(true),
@@ -302,6 +306,55 @@ public final class TimeSeriesFcts
                                      "1 millisecond", duration);
 
             long floor = Duration.floorTimestamp(time, duration, origin);
+            return TimestampType.instance.fromTimeInMillis(floor);
+        }
+    }
+
+    /**
+     * {@code time_bucket_gapfill(duration, timestamp, start, finish)}: computes the same bucket as
+     * {@code time_bucket(duration, timestamp, start)} (buckets aligned to {@code start}), and additionally declares the
+     * dense {@code [start, finish)} range over which gap-filling will materialize a row for every bucket. As a plain
+     * scalar this returns the bucket start; the {@code start}/{@code finish} bounds are consumed by the gap-fill result
+     * transform. Like {@code time_bucket} it is monotonic in its timestamp argument so it can be a {@code GROUP BY}
+     * selector.
+     */
+    private static final class TimeBucketGapfillFunction extends NativeScalarFunction
+    {
+        private TimeBucketGapfillFunction()
+        {
+            super("time_bucket_gapfill",
+                  TimestampType.instance,
+                  DurationType.instance, TimestampType.instance, TimestampType.instance, TimestampType.instance);
+        }
+
+        @Override
+        protected boolean isPartialApplicationMonotonic(List<ByteBuffer> partialParameters)
+        {
+            // Monotonic in the timestamp (arg 1) as long as the duration and the start/finish bounds are constants.
+            return partialParameters.get(1) == UNRESOLVED
+                   && partialParameters.get(0) != UNRESOLVED
+                   && partialParameters.get(2) != UNRESOLVED
+                   && partialParameters.get(3) != UNRESOLVED;
+        }
+
+        @Override
+        public ByteBuffer execute(Arguments arguments) throws InvalidRequestException
+        {
+            if (arguments.containsNulls())
+                return null;
+
+            Duration duration = arguments.get(0);
+            long time = arguments.getAsLong(1);
+            long start = arguments.getAsLong(2);
+            long finish = arguments.getAsLong(3);
+
+            if (!duration.hasMillisecondPrecision())
+                throw invalidRequest("The time_bucket_gapfill cannot be computed for the %s duration as precision is " +
+                                     "below 1 millisecond", duration);
+            if (finish <= start)
+                throw invalidRequest("The time_bucket_gapfill finish must be greater than start");
+
+            long floor = Duration.floorTimestamp(time, duration, start);
             return TimestampType.instance.fromTimeInMillis(floor);
         }
     }
