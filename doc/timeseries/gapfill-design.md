@@ -18,8 +18,13 @@
 
 # Design: Gap-Fill & Interpolation for Time-Series Queries (B1)
 
-Status: **DRAFT / Proposal** · Branch: `cassandra-timeseries-functions`
+Status: **G1 IMPLEMENTED** (densify/null fill) · Branch: `cassandra-timeseries-functions`
 Builds on the native functions in [timeseries-functions-design.md](timeseries-functions-design.md).
+
+G1 is done and verified end-to-end (CQLTester + Docker real CQL): `GROUP BY time_bucket_gapfill(width, ts,
+start, finish)` materializes a row for every bucket in `[start, finish)`, empty ones with null aggregates.
+v1 scope: single-partition, fixed-width buckets, unaliased bucket column, non-paged. Next: G2 `locf()` and
+G3 `interpolate()` fill policies, then G4 paging + guardrails.
 
 ## 1. Problem
 

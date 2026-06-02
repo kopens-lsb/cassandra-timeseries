@@ -1,4 +1,5 @@
 7.0
+ * Add time-series gap-filling: GROUP BY time_bucket_gapfill(width, ts, start, finish) materializes empty buckets
  * Add native time-series CQL functions: time_bucket, first, last, delta, rate, derivative, percentile, time_weighted_average, variance, stddev, histogram and approx_count_distinct
  * Avoid using ObjectUtils.getFirstNonNull in Schema (CASSANDRA-21394)
  * Allow nodetool garbagecollect to take a user defined list of SSTables (CASSANDRA-16767)

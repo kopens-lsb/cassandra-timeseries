@@ -36,6 +36,7 @@ All examples are runnable in `cqlsh`. Function reference (argument order matters
 | `variance` / `stddev` | `variance(value)` / `stddev(value)` | `double` (sample) |
 | `histogram` | `histogram(value, min, max, nbuckets)` | `list<bigint>` (nbuckets+2) |
 | `approx_count_distinct` | `approx_count_distinct(value)` | `bigint` |
+| `time_bucket_gapfill` | `time_bucket_gapfill(width, ts, start, finish)` | `timestamp` (gap-filling GROUP BY selector) |
 
 ---
 
@@ -106,6 +107,22 @@ FROM   metrics
 WHERE  series = 'cpu'
 GROUP  BY series, time_bucket(1h, ts, '2024-01-01 00:30:00+0000');
 ```
+
+### 2.4 Gap-filling empty buckets — `time_bucket_gapfill`
+
+Plain `time_bucket` only emits buckets that have data. `time_bucket_gapfill` additionally materializes a row for
+*every* bucket in `[start, finish)`, so dashboards get a continuous time axis (empty buckets carry null aggregates).
+
+```sql
+SELECT time_bucket_gapfill(1h, ts, '2024-01-01 00:00:00+0000', '2024-01-02 00:00:00+0000'),
+       avg(value)
+FROM   metrics
+WHERE  series = 'cpu'
+GROUP  BY series, time_bucket_gapfill(1h, ts, '2024-01-01 00:00:00+0000', '2024-01-02 00:00:00+0000');
+```
+
+v1 notes: use within a single series (restrict the partition key in `WHERE`), with a fixed-width bucket (no month
+component), without aliasing the bucket column, and without paging across the bucket range.
 
 ---
 
