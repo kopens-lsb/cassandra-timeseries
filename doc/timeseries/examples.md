@@ -32,6 +32,10 @@ All examples are runnable in `cqlsh`. Function reference (argument order matters
 | `rate` | `rate(value, timestamp)` | `double` (per second) |
 | `derivative` | `derivative(value, timestamp)` | `double` (per second, least-squares slope) |
 | `percentile` | `percentile(value, q)` with `q` in `[0,1]` | `double` |
+| `time_weighted_average` | `time_weighted_average(value, timestamp)` | `double` |
+| `variance` / `stddev` | `variance(value)` / `stddev(value)` | `double` (sample) |
+| `histogram` | `histogram(value, min, max, nbuckets)` | `list<bigint>` (nbuckets+2) |
+| `approx_count_distinct` | `approx_count_distinct(value)` | `bigint` |
 
 ---
 
@@ -199,6 +203,30 @@ SELECT percentile(value, 0.5) AS median FROM metrics WHERE series = 'cpu';
 `percentile` is an exact continuous percentile (linear interpolation between adjacent values); `q`
 must be between 0 and 1. It keeps the group's values in memory, so it suits bounded downsampled
 buckets rather than unbounded scans.
+
+---
+
+## 5b. Distribution, spread & cardinality
+
+```sql
+-- Time-weighted average: weights each value by how long it was in effect
+-- (use this, not avg(), when samples are irregularly spaced).
+SELECT time_bucket(1h, ts) AS bucket, time_weighted_average(value, ts) AS twa
+FROM   metrics WHERE series = 'cpu' GROUP BY series, time_bucket(1h, ts);
+
+-- Spread of values per bucket
+SELECT time_bucket(1h, ts) AS bucket, variance(value) AS var, stddev(value) AS sd
+FROM   metrics WHERE series = 'cpu' GROUP BY series, time_bucket(1h, ts);
+
+-- Histogram of latencies into 10 equal-width buckets over [0, 1000) ms.
+-- Result is a list: [ <0ms, bucket1, .. bucket10, >=1000ms ].
+SELECT histogram(latency_ms, 0, 1000, 10) AS dist
+FROM   latencies WHERE service = 'checkout';
+
+-- Approximate number of distinct client IPs per minute (HyperLogLog; bounded memory)
+SELECT time_bucket(1m, ts) AS minute, approx_count_distinct(client_ip) AS unique_ips
+FROM   requests WHERE service = 'api' GROUP BY service, time_bucket(1m, ts);
+```
 
 ---
 
