@@ -118,6 +118,34 @@ Each milestone: implementation + CQLTester unit tests (incl. paging in G4) + at 
 the distributed/paged path + Docker real-CQL smoke check + `CHANGES.txt` + examples in
 [examples.md](examples.md).
 
+## 6b. G1 implementation status & remaining wiring (Step 2b)
+
+**Done (pushed):**
+- `time_bucket_gapfill(duration, ts, start, finish)` — a 4-arg monotonic scalar that buckets like
+  `time_bucket` (origin = start) and works as a `GROUP BY` selector (`TimeSeriesFcts`).
+- `TimeBucketGapFiller.densify(rows, bucketIndex, partitionKeyIndices, columnCount, start, finish, step)`
+  — pure logic that inserts synthetic null rows for empty buckets per partition. Unit-tested.
+
+**Remaining — wire densify into the query path (non-paging only, per decision):**
+1. **Capture params at prepare.** In `SelectStatement.RawStatement.getAggregationSpecFactory` (the loop over
+   `parameters.groups`), when the `WithFunction.function` name is `time_bucket_gapfill`, the constant args are
+   `Selectable.WithTerm` (args 0=duration, 2=start, 3=finish). Build a `Selector.Factory` for each via
+   `arg.newSelectorFactory(...)` (or evaluate now), and record the bucket column's index in the result (match the
+   gapfill column name against `getResultMetadata`). Bundle into a `GapFillSpec { Selector.Factory width,start,finish;
+   int bucketIndex; List<Integer> partitionKeyIndices; }`.
+2. **Thread `GapFillSpec` to `SelectStatement`.** Add a field + constructor param. Three call sites:
+   `SelectStatement.java:300`, `:1384` (pass the real spec here), and `ModificationStatement.java:1389` (pass null).
+3. **Evaluate + densify at execute.** In `process(...)` (after `ResultSet cqlRows = result.build()`, before
+   `orderResults`), if `gapFillSpec != null`: build the three arg selectors with `options`, read their `getOutput`
+   → decode width (Duration → fixed `stepMillis`; reject month components in v1), start/finish (timestamp millis);
+   then `cqlRows.rows = TimeBucketGapFiller.densify(...)`. Partition-key indices = the result columns for the
+   grouping PK prefix.
+4. **Guards (v1):** reject/disable when the query is paged (densify is page-local); require literal (non-bind)
+   width/start/finish or bind them via `options`; enforce a bucket-count cap (guardrail) so a huge range can't
+   materialize unbounded synthetic rows.
+5. **Tests:** CQLTester integration tests (empty interior buckets filled with null aggregates; per-partition reset;
+   range edges) + a Docker real-CQL check.
+
 ## 7. Open decisions (sign-off before coding G1)
 
 - **Syntax (A) vs (B).** Recommend (A); no `Cql.g` change if `time_bucket_gapfill`/`locf`/`interpolate`
