@@ -1,0 +1,48 @@
+# CI for cassandra-timeseries: Apache Cassandra 6.0.0 + time-series functions.
+# Builds apache-cassandra-6.0.0.jar with Ant and runs the time-series unit tests.
+
+stages:
+  - build
+  - test
+
+workflow:
+  rules:
+    - if: $CI_PIPELINE_SOURCE == "merge_request_event"
+    - if: $CI_COMMIT_BRANCH
+
+variables:
+  # modules/accord is a git submodule and is required by the build.
+  GIT_SUBMODULE_STRATEGY: recursive
+  GIT_SUBMODULE_DEPTH: 1
+  # Keep the Maven-resolved build dependencies inside the project dir so they can be cached.
+  LOCAL_REPOSITORY: "$CI_PROJECT_DIR/.m2/repository"
+  ANT_OPTS: "-Xmx4g"
+
+default:
+  image: eclipse-temurin:11-jdk
+  before_script:
+    - apt-get update -qq && apt-get install -y -qq --no-install-recommends ant ant-optional python3 > /dev/null
+  cache:
+    key: m2-repository
+    paths:
+      - .m2/repository
+
+build-jar:
+  stage: build
+  timeout: 90m
+  script:
+    - ant -Dlocal.repository="$LOCAL_REPOSITORY" clean jar checkstyle checkstyle-test
+    - ls -l build/apache-cassandra-6.0.0.jar
+  artifacts:
+    name: "apache-cassandra-6.0.0"
+    paths:
+      - build/apache-cassandra-6.0.0.jar
+    expire_in: 1 month
+
+# Targeted tests only — the full Cassandra suite takes hours (see AGENTS.md).
+timeseries-tests:
+  stage: test
+  timeout: 60m
+  script:
+    - ant -Dlocal.repository="$LOCAL_REPOSITORY" testsome -Dtest.name=org.apache.cassandra.db.aggregation.TimeBucketGapFillerTest
+    - ant -Dlocal.repository="$LOCAL_REPOSITORY" testsome -Dtest.name=org.apache.cassandra.cql3.functions.TimeSeriesFctsTest

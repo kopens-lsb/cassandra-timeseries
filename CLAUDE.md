@@ -2,6 +2,19 @@
 
 This file provides guidance to Claude Code (claude.ai/code) when working with code in this repository.
 
+## What this repository is
+
+A fork of **Apache Cassandra 6.0.0** that adds native time-series CQL functions to build a distributed time-series database. Everything from upstream Cassandra applies; the fork-specific delta is:
+
+- [cql3/functions/TimeSeriesFcts.java](src/java/org/apache/cassandra/cql3/functions/TimeSeriesFcts.java) — the time-series scalar/aggregate functions: `time_bucket`, `first`, `last`, `delta`, `rate`, `derivative`, `percentile`, `time_weighted_average`, `variance`, `stddev`, `histogram`, `approx_count_distinct`, `counter_delta`, `counter_rate`, `corr`, `covar_pop`, `covar_samp`, `regr_slope`, `regr_intercept`, `regr_r2`, `integral`.
+- Gap-fill: `GROUP BY time_bucket_gapfill(width, ts, start, finish)` with `locf()`/`interpolate()` fill policies. Core densify logic in [db/aggregation/TimeBucketGapFiller.java](src/java/org/apache/cassandra/db/aggregation/TimeBucketGapFiller.java) (operates on the `ResultSet` row representation, `List<List<byte[]>>`); wired into the query path via `GapFillSpec` in [cql3/statements/SelectStatement.java](src/java/org/apache/cassandra/cql3/statements/SelectStatement.java).
+- Design docs and CQL examples in [doc/timeseries/](doc/timeseries/) (functions, gap-fill, continuous-aggregates designs).
+- Tests: `org.apache.cassandra.cql3.functions.TimeSeriesFctsTest` and `org.apache.cassandra.db.aggregation.TimeBucketGapFillerTest` (both run in CI, see [.gitlab-ci.yml](.gitlab-ci.yml)).
+
+**Versioning rule:** the build must produce `build/apache-cassandra-6.0.0.jar` — keep `base.version` in [build.xml](build.xml) at `6.0.0` (do not let upstream merges reset it to alpha/beta/snapshot versions).
+
+**Upstream tracking rule:** `master` must be kept merged with the latest `cassandra-6.0` branch of GitHub `apache/cassandra` (remote `upstream`). Recurring conflict spots: `CHANGES.txt`, `debian/changelog`, the `modules/accord` submodule pointer, and `SelectStatement.java` (gap-fill wiring). Resolve by keeping both upstream fixes and the time-series features, then build.
+
 ## Workflow, build, test, and style
 
 See **[AGENTS.md](AGENTS.md)** — it is the source of truth for environment, build (`.build/sh/ai-build`), targeted testing (`.build/sh/ai-ci-test <FQCN>`), code style, the git workflow, and hard boundaries (never touch `src/gen-java/`, `lib/`, or the CQL grammar without asking). Do not duplicate or contradict it. The notes below cover only what AGENTS.md does not: the big-picture architecture.
