@@ -19,7 +19,7 @@ variables:
   ANT_OPTS: "-Xmx4g"
 
 default:
-  image: eclipse-temurin:17-jdk
+  image: eclipse-temurin:21-jdk
   before_script:
     - apt-get update -qq && apt-get install -y -qq --no-install-recommends ant ant-optional python3 > /dev/null
 
