@@ -1,0 +1,7 @@
+# Keep the docker build context lean: the multi-stage build only needs the sources (incl. modules/accord).
+.git
+build
+logs
+data
+venv
+docker/dist
