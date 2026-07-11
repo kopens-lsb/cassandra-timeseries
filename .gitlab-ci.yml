@@ -43,6 +43,32 @@ timeseries-tests:
     - ant testsome -Dtest.name=org.apache.cassandra.db.aggregation.TimeBucketGapFillerTest
     - ant testsome -Dtest.name=org.apache.cassandra.cql3.functions.TimeSeriesFctsTest
 
+# Publish the Testcontainers-compatible Docker image (see docker/) to the GitLab container registry.
+# Runs on tag pushes automatically and on-demand (manual) on master. The image is consumed by the
+# plantpulse-jdbc-cassandra-driver integration tests via -Pcassandra.image=$CI_REGISTRY_IMAGE:6.0.0.
+# kaniko builds the multi-stage docker/Dockerfile without a Docker daemon; the full Cassandra build
+# happens inside the image build, so this job does not depend on build-jar artifacts.
+docker-image:
+  stage: release
+  timeout: 90m
+  needs: []
+  image:
+    name: gcr.io/kaniko-project/executor:v1.23.2-debug
+    entrypoint: [""]
+  rules:
+    - if: $CI_COMMIT_TAG
+    - if: $CI_COMMIT_BRANCH == $CI_DEFAULT_BRANCH
+      when: manual
+      allow_failure: true
+  script:
+    - mkdir -p /kaniko/.docker
+    - printf '{"auths":{"%s":{"auth":"%s"}}}' "$CI_REGISTRY" "$(printf '%s:%s' "$CI_REGISTRY_USER" "$CI_REGISTRY_PASSWORD" | base64 -w0)" > /kaniko/.docker/config.json
+    - /kaniko/executor
+      --context "$CI_PROJECT_DIR"
+      --dockerfile "$CI_PROJECT_DIR/docker/Dockerfile"
+      --destination "$CI_REGISTRY_IMAGE:6.0.0"
+      --destination "$CI_REGISTRY_IMAGE:${CI_COMMIT_TAG:-latest}"
+
 # On tag pushes (e.g. 6.0.0-r1), publish a GitLab Release pointing at the built jar.
 release:
   stage: release
