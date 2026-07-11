@@ -16,21 +16,19 @@
  * limitations under the License.
  */
 
-package org.apache.cassandra.tcm.listeners;
+package org.apache.cassandra.tools.nodetool;
 
-import org.apache.cassandra.cql3.QueryProcessor;
-import org.apache.cassandra.tcm.Transformation;
-import org.apache.cassandra.tcm.log.Entry;
-
-public class InitializationListener implements LogListener
+/**
+ * Marker interface for nodetool commands that are known to run entirely locally,
+ * without requiring a JMX connection to the node.
+ * <p>
+ * Commands that implement this interface will not display JMX connection options
+ * (host, port, username, password, etc.) in their help output, since those options
+ * are not applicable to local commands.
+ * <p>
+ * Note: this is different from commands whose locality is determined at runtime
+ * (e.g. {@link Sjk}), which override {@link AbstractCommand#shouldConnect()} instead.
+ */
+public interface LocalCommand
 {
-    @Override
-    public void notify(Entry entry, Transformation.Result result)
-    {
-        if (entry.transform.kind() == Transformation.Kind.INITIALIZE_CMS)
-        {
-            QueryProcessor.clearPreparedStatementsCache();
-            QueryProcessor.clearInternalStatementsCache();
-        }
-    }
 }

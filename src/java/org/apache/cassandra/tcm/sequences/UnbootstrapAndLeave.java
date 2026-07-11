@@ -92,12 +92,12 @@ public class UnbootstrapAndLeave extends MultiStepOperation<Epoch>
      */
     @VisibleForTesting
     UnbootstrapAndLeave(Epoch latestModification,
-                               LockedRanges.Key lockKey,
-                               Transformation.Kind next,
-                               PrepareLeave.StartLeave startLeave,
-                               PrepareLeave.MidLeave midLeave,
-                               PrepareLeave.FinishLeave finishLeave,
-                               LeaveStreams streams)
+                        LockedRanges.Key lockKey,
+                        Transformation.Kind next,
+                        PrepareLeave.StartLeave startLeave,
+                        PrepareLeave.MidLeave midLeave,
+                        PrepareLeave.FinishLeave finishLeave,
+                        LeaveStreams streams)
     {
         super(nextToIndex(next), latestModification);
         this.lockKey = lockKey;
@@ -183,6 +183,7 @@ public class UnbootstrapAndLeave extends MultiStepOperation<Epoch>
                 }
                 catch (Throwable t)
                 {
+                    logger.warn("Exception committing startLeave, will retry", t);
                     JVMStabilityInspector.inspectThrowable(t);
                     return continuable();
                 }
@@ -198,14 +199,15 @@ public class UnbootstrapAndLeave extends MultiStepOperation<Epoch>
                 }
                 catch (ExecutionException e)
                 {
-                    StorageService.instance.markDecommissionFailed();
+                    if (startLeave.nodeId().equals(ClusterMetadata.current().myNodeId()))
+                        StorageService.instance.markDecommissionFailed();
                     JVMStabilityInspector.inspectThrowable(e);
                     logger.error("Error while decommissioning node: {}", e.getCause().getMessage());
                     throw new RuntimeException("Error while decommissioning node: " + e.getCause().getMessage());
                 }
                 catch (Throwable t)
                 {
-                    logger.warn("Error committing midLeave", t);
+                    logger.warn("Exception committing midLeave, will retry", t);
                     JVMStabilityInspector.inspectThrowable(t);
                     return continuable();
                 }
@@ -218,6 +220,7 @@ public class UnbootstrapAndLeave extends MultiStepOperation<Epoch>
                 }
                 catch (Throwable t)
                 {
+                    logger.warn("Exception committing finishLeave, will retry", t);
                     JVMStabilityInspector.inspectThrowable(t);
                     return continuable();
                 }
@@ -250,7 +253,7 @@ public class UnbootstrapAndLeave extends MultiStepOperation<Epoch>
     @Override
     public ClusterMetadata.Transformer cancel(ClusterMetadata metadata)
     {
-        DataPlacements placements = metadata.placements;
+        DataPlacements placements = metadata.placements();
         switch (next)
         {
             // need to undo MID_LEAVE and START_LEAVE, but PrepareLeave doesn't affect placement

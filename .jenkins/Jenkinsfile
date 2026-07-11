@@ -59,7 +59,7 @@
 /** CONSTANTS for both the pipeline and scripting **/
 import groovy.transform.Field
 @Field List<String> archsSupported   = ["amd64", "arm64"]
-@Field List<String> pythonsSupported = ["3.8", "3.11"]
+@Field List<String> pythonsSupported = ["3.8", "3.11", "3.12", "3.13"]
 @Field String       pythonDefault    = "3.8"
 /** CONSTANTS end **********************************/
 
@@ -72,7 +72,7 @@ pipeline {
   }
   parameters {
     string(name: 'repository', defaultValue: params.repository ?: scm.userRemoteConfigs[0].url, description: 'Cassandra Repository')
-    string(name: 'branch', defaultValue: params.branch ?: scm.userRemoteConfigs[0].refspec, description: 'Branch')
+    string(name: 'branch', defaultValue: params.branch ?: scm.branch, description: 'Branch')
 
     choice(name: 'profile', choices: pipelineProfileNames(params.profile ?: ''), description: 'Pick a pipeline profile.')
     string(name: 'profile_custom_regexp', defaultValue: params.profile_custom_regexp ?: '', description: 'Regexp for stages when using custom profile. See `testSteps` in Jenkinsfile for list of stages. Example: stress.*|jvm-dtest.*')
@@ -124,7 +124,7 @@ pipeline {
   }
   post {
     failure {
-      echo "ERROR pipeline failed – not all tests were run"
+      echo "ERROR pipeline failed – not all tests were run"
     }
     always {
       sendNotifications()
@@ -155,6 +155,13 @@ def pipelineProfileNames(putFirst) {
     set = set - putFirst
     set.add(0, putFirst)
     return set
+}
+
+@NonCPS
+def extractBuildXmlProperty(String xml, String name) {
+    def m = xml =~ /property\s*name="${name}"\s*value="([^"]*)"/
+    assert m, "${name} not found in build.xml"
+    return m[0][1]
 }
 
 @Field Map cachedTasks = null
@@ -209,9 +216,9 @@ def tasks() {
     'dtest-upgrade-novnode': [splits: 160, size: 'large'],
     'dtest-upgrade-large': [splits: 40, size: 'large'],
     'dtest-upgrade-large-novnode': [splits: 40, size: 'large'],
-    'microbench-test': [splits: 1, size: 'large', timeout_hours: 2], // TODO implement splits
+    'microbench-test': [splits: 4, size: 'large', timeout_hours: 2],
     // performance tests need 'cassandra-*large-dedicated' nodes
-    'microbench': [splits: 1, size: 'large', timeout_hours: 6, benchmark: true],
+    'microbench': [splits: 4, size: 'large', timeout_hours: 6, benchmark: true],
   ]
   testSteps.each() {
     it.value.put('type', 'test')
@@ -231,12 +238,8 @@ def tasks() {
 
   // find the default JDK and the supported JDKs defined in the build.xml
   def build_xml = readFile(file: 'build.xml')
-  def javaVersionDefaultMatch = (build_xml =~ /property\s*name="java\.default"\s*value="([^"]*)"/)
-  assert javaVersionDefaultMatch, "java.default property not found in build.xml"
-  def javaVersionDefault = javaVersionDefaultMatch[0][1]
-  def javaVersionsSupportedMatch = (build_xml =~ /property\s*name="java\.supported"\s*value="([^"]*)"/)
-  assert javaVersionsSupportedMatch, "java.supported property not found in build.xml"
-  def javaVersionsSupported = javaVersionsSupportedMatch[0][1].split(',') as List
+  def javaVersionDefault   = extractBuildXmlProperty(build_xml, 'java.default')
+  def javaVersionsSupported = extractBuildXmlProperty(build_xml, 'java.supported').split(',') as List
 
   // define matrix axes
   def Map matrix_axes = [
@@ -254,6 +257,7 @@ def tasks() {
     (isStageEnabled(axis['step'])) && // skip disabled steps
     !(axis['python'] != pythonDefault && 'cqlsh-test' != axis['step']) && // Use only python 3.8 for all tests but cqlsh-test
     !(axis['cython'] != 'no' && 'cqlsh-test' != axis['step']) && // cython only for cqlsh-test, disable for others
+    !(axis['cython'] == 'yes' && (axis['python'] == '3.12' || axis['python'] == '3.13')) && // Skip cython for Python 3.12+ see CASSANDRA-21482
     !(axis['jdk'] != javaVersionDefault && ('cqlsh-test' == axis['step'] || 'simulator-dtest' == axis['step'] || axis['step'].contains('dtest-upgrade'))) && // run cqlsh-test, simulator-dtest, *dtest-upgrade only with jdk11
     // Disable splits for all but proper stages
     !(axis['split'] > 1 && !stepsMap.findAll { entry -> entry.value.splits >= axis['split'] }.keySet().contains(axis['step'])) &&
@@ -349,31 +353,46 @@ def build(command, cell) {
       nodeExclusion = "&&!${NODE_NAME}"
       withEnv(cell.collect { k, v -> "${k}=${v}" }) {
         ws("workspace/${JOB_NAME}/${BUILD_NUMBER}/${cell.step}/${cell.arch}/jdk-${cell.jdk}") {
-          fetchSource(cell.step, cell.arch, cell.jdk)
-          sh """
-              test -f .jenkins/Jenkinsfile || { echo "Invalid git fork/branch"; exit 1; }
-              grep -q "Jenkins CI declaration" .jenkins/Jenkinsfile || { echo "Only Cassandra 5.0+ supported"; exit 1; }
-             """
-          fetchDockerImages("redhat" == cell.step ? ['almalinux-build'] : ['debian-build'])
-          def cell_suffix = "_jdk${cell.jdk}_${cell.arch}"
-          def logfile = "stage-logs/${JOB_NAME}_${BUILD_NUMBER}_${cell.step}${cell_suffix}_attempt${attempt}.log.xz"
-          def script_vars = "#!/bin/bash \n set -o pipefail ; " // pipe to tee needs pipefail
-          script_vars = "${script_vars} m2_dir=\'${WORKSPACE}/build/m2\'"
-          timeout(time: 1, unit: 'HOURS') {
-            def status = sh label: "RUNNING ${cell.step}...", script: "${script_vars} ${build_script} ${cell.jdk} 2>&1 | tee >( xz -c > build/${logfile} )", returnStatus: true
-            dir("build") {
-              archiveArtifacts artifacts: "${logfile}", fingerprint: true
-              copyToNightlies("${logfile}", "${cell.step}/jdk${cell.jdk}/${cell.arch}/")
+          try {
+            fetchSource(cell.step, cell.arch, cell.jdk)
+            sh """
+                test -f .jenkins/Jenkinsfile || { echo "Invalid git fork/branch"; exit 1; }
+                grep -q "Jenkins CI declaration" .jenkins/Jenkinsfile || { echo "Only Cassandra 5.0+ supported"; exit 1; }
+              """
+            fetchDockerImages("redhat" == cell.step ? ['almalinux-build'] : ['debian-build'])
+            def cell_suffix = "_jdk${cell.jdk}_${cell.arch}"
+            def logfile = "stage-logs/${JOB_NAME}_${BUILD_NUMBER}_${cell.step}${cell_suffix}_attempt${attempt}.log.xz"
+            def script_vars = "#!/bin/bash \n set -o pipefail ; " // pipe to tee needs pipefail
+            script_vars = "${script_vars} m2_dir=\'${WORKSPACE}/build/m2\'"
+            timeout(time: 1, unit: 'HOURS') {
+              try {
+                def status = sh label: "RUNNING ${cell.step}...", script: "${script_vars} ${build_script} ${cell.jdk} 2>&1 | tee >( xz -c > build/${logfile} )", returnStatus: true
+                dir("build") {
+                  archiveArtifacts artifacts: "${logfile}", fingerprint: true
+                  copyToNightlies("${logfile}", "${cell.step}/jdk${cell.jdk}/${cell.arch}/")
+                }
+                if (0 != status) { error("Stage ${cell.step}${cell_suffix} failed with exit status ${status}") }
+                if ("jar" == cell.step) {
+                  stash name: "${cell.arch}_${cell.jdk}"
+                }
+              } catch (exc) {
+                if ("org.jenkinsci.plugins.workflow.steps.FlowInterruptedException" == exc.getClass().getName()) {
+                  def descriptions = []
+                  for (def cause in exc.getCauses()) {
+                    echo "CauseOfInterruption: ${cause.getClass().getName()} - ${cause.getShortDescription()}"
+                    if (cause.getClass().getName().contains('CauseOfInterruption$UserInterruption')) {
+                      throw exc // user explicitly aborted — do not retry
+                    }
+                    descriptions.add(cause.getShortDescription())
+                  }
+                  error("Retryable interruption: ${descriptions.join(', ')}")
+                }
+                throw exc
+              }
             }
-            if (0 != status) { error("Stage ${cell.step}${cell_suffix} failed with exit status ${status}") }
-            if ("jar" == cell.step) {
-              stash name: "${cell.arch}_${cell.jdk}"
-            }
+          } finally {
+            cleanAgent(cell.step)
           }
-          dir("build") {
-            copyToNightlies("${command.toCopy}", "${cell.step}/jdk${cell.jdk}/${cell.arch}/")
-          }
-          cleanAgent(cell.step)
         }
       }
     }
@@ -392,63 +411,72 @@ def test(command, cell) {
       nodeExclusion = "&&!${NODE_NAME}"
       withEnv(cell.collect { k, v -> "${k}=${v}" }) {
         ws("workspace/${JOB_NAME}/${BUILD_NUMBER}/${cell.step}/${cell.arch}/jdk-${cell.jdk}/python-${cell.python}") {
-          fetchSource(cell.step, cell.arch, cell.jdk)
-          fetchDockerImages(['ubuntu-test'])
-          def cell_suffix = "_jdk${cell.jdk}_python_${cell.python}_${cell.cython}_${cell.arch}_${cell.split}_${splits}"
-          def logfile = "stage-logs/${JOB_NAME}_${BUILD_NUMBER}_${cell.step}${cell_suffix}_attempt${attempt}.log.xz"
-          def script_vars = "#!/bin/bash \n set -o pipefail ; " // pipe to tee needs pipefail
-          script_vars = "${script_vars} python_version=\'${cell.python}\'"
-          script_vars = "${script_vars} m2_dir=\'${WORKSPACE}/build/m2\'"
-          if ("cqlsh-test" == cell.step) {
-            script_vars = "${script_vars} cython=\'${cell.cython}\'"
-          }
-          script_vars = fetchDTestsSource(command, script_vars)
-          timeout(time: command.timeout_hours, unit: 'HOURS') { // best throughput with each cell at ~10 minutes
-            def timer = System.currentTimeMillis()
-            try {
-              buildJVMDTestJars(cell, script_vars, logfile)
-              script_vars = "${script_vars} docker_timeout_hours=\"${command.timeout_hours}\""
-              def status = sh label: "RUNNING TESTS ${cell.step}...", script: "${script_vars} .build/docker/run-tests.sh -a ${cell.step} -c '${cell.split}/${splits}' -j ${cell.jdk} 2>&1 | tee >( xz -c > build/${logfile} )", returnStatus: true
-              dir("build") {
-                archiveArtifacts artifacts: "${logfile}", fingerprint: true
-              }
-              if (0 != status) { error("Stage ${cell.step}${cell_suffix} failed with exit status ${status}") }
-            } catch (exc) {
-              if (exc.getClass().getName() == "org.jenkinsci.plugins.workflow.steps.FlowInterruptedException") {
-                for (def causeOfInterruption in exc.getCauses()) {
-                  echo "CauseOfInterruption: ${causeOfInterruption.getClass().getName()} - ${causeOfInterruption.getShortDescription()}"
+          try {
+            fetchSource(cell.step, cell.arch, cell.jdk)
+            fetchDockerImages(['ubuntu-test'])
+            def cell_suffix = "_jdk${cell.jdk}_python_${cell.python}_${cell.cython}_${cell.arch}_${cell.split}_${splits}"
+            def logfile = "stage-logs/${JOB_NAME}_${BUILD_NUMBER}_${cell.step}${cell_suffix}_attempt${attempt}.log.xz"
+            def script_vars = "#!/bin/bash \n set -o pipefail ; " // pipe to tee needs pipefail
+            script_vars = "${script_vars} python_version=\'${cell.python}\'"
+            script_vars = "${script_vars} m2_dir=\'${WORKSPACE}/build/m2\'"
+            if ("cqlsh-test" == cell.step) {
+              script_vars = "${script_vars} cython=\'${cell.cython}\'"
+            }
+            script_vars = fetchDTestsSource(command, script_vars)
+            timeout(time: command.timeout_hours, unit: 'HOURS') { // best throughput with each cell at ~10 minutes
+              def timer = System.currentTimeMillis()
+              try {
+                buildJVMDTestJars(cell, script_vars, logfile)
+                script_vars = "${script_vars} docker_timeout_hours=\"${command.timeout_hours}\""
+                def status = sh label: "RUNNING TESTS ${cell.step}...", script: "${script_vars} .build/docker/run-tests.sh -a ${cell.step} -c '${cell.split}/${splits}' -j ${cell.jdk} 2>&1 | tee >( xz -c > build/${logfile} )", returnStatus: true
+                dir("build") {
+                  archiveArtifacts artifacts: "${logfile}", fingerprint: true
                 }
+                if (0 != status) { error("Stage ${cell.step}${cell_suffix} failed with exit status ${status}") }
+              } catch (exc) {
+                if ("org.jenkinsci.plugins.workflow.steps.FlowInterruptedException" == exc.getClass().getName()) {
+                  def descriptions = []
+                  for (def cause in exc.getCauses()) {
+                    echo "CauseOfInterruption: ${cause.getClass().getName()} - ${cause.getShortDescription()}"
+                    if (cause.getClass().getName().contains('CauseOfInterruption$UserInterruption')) {
+                      throw exc // user explicitly aborted — do not retry
+                    }
+                    descriptions.add(cause.getShortDescription())
+                  }
+                  error("Retryable interruption: ${descriptions.join(', ')}")
+                }
+                throw exc
+              } finally {
+                  def duration = System.currentTimeMillis() - timer
+                  def formattedTime = String.format("%tT.%tL", duration, duration)
+                  echo "Time ${cell.step}${cell_suffix}: ${formattedTime}"
               }
-              throw exc
-            } finally {
-                def duration = System.currentTimeMillis() - timer
-                def formattedTime = String.format("%tT.%tL", duration, duration)
-                echo "Time ${cell.step}${cell_suffix}: ${formattedTime}"
             }
-          }
-          dir("build") {
-            sh """
-                mkdir -p test/output/${cell.step}
-                find test/output -type f -name "TEST*.xml" -execdir mkdir -p jdk_${cell.jdk}/${cell.arch} ';' -execdir mv {} jdk_${cell.jdk}/${cell.arch}/{} ';'
-                find test/output -name cqlshlib.xml -execdir mv cqlshlib.xml ${cell.step}/cqlshlib${cell_suffix}.xml ';'
-                find test/output -name nosetests.xml -execdir mv nosetests.xml ${cell.step}/nosetests${cell_suffix}.xml ';'
-              """
-            if (!cell.step.startsWith("microbench")) {
-              junit testResults: "test/**/TEST-*.xml,test/**/cqlshlib*.xml,test/**/nosetests*.xml", testDataPublishers: [[$class: 'StabilityTestDataPublisher']]
+            dir("build") {
+              sh """
+                  mkdir -p test/output/${cell.step}
+                  find test/output -type f -name "TEST*.xml" -execdir mkdir -p jdk_${cell.jdk}/${cell.arch} ';' -execdir mv {} jdk_${cell.jdk}/${cell.arch}/{} ';'
+                  find test/output -name cqlshlib.xml -execdir mv cqlshlib.xml ${cell.step}/cqlshlib${cell_suffix}.xml ';'
+                  find test/output -name nosetests.xml -execdir mv nosetests.xml ${cell.step}/nosetests${cell_suffix}.xml ';'
+                """
+              if (!cell.step.startsWith("microbench")) {
+                junit testResults: "test/**/TEST-*.xml,test/**/cqlshlib*.xml,test/**/nosetests*.xml", testDataPublishers: [[$class: 'StabilityTestDataPublisher']]
+              }
+              // check if we had Linux OOM killer active within the test container which could kill forked JUnit JVM processes
+              sh """
+                  echo "docker memory/oomkiller debug:"
+                  cat /sys/fs/cgroup/docker/memory.events || true
+                """
+              sh """
+                  find test/output -type f -name "*.xml" -print0 | xargs -0 -r -n1 -P"\$(nproc)" xz -f
+                  echo "test result files compressed"; find test/output -type f -name "*.xml.xz" | wc -l
+                """
+              archiveArtifacts artifacts: "test/logs/**,test/**/TEST-*.xml.xz,test/**/cqlshlib*.xml.xz,test/**/nosetests*.xml.xz,test/**/jmh-result.json", fingerprint: true
+              copyToNightlies("${logfile},test/logs/**,test/**/jmh-result.json", "${cell.step}/${cell.arch}/jdk${cell.jdk}/python${cell.python}/cython_${cell.cython}/" + "split_${cell.split}_${splits}".replace("/", "_"))
             }
-            // check if we had Linux OOM killer active within the test container which could kill forked JUnit JVM processes
-             sh """
-                echo "docker memory/oomkiller debug:"
-                cat /sys/fs/cgroup/docker/memory.events || true
-              """
-            sh """
-                find test/output -type f -name "*.xml" -print0 | xargs -0 -r -n1 -P"\$(nproc)" xz -f
-                echo "test result files compressed"; find test/output -type f -name "*.xml.xz" | wc -l
-              """
-            archiveArtifacts artifacts: "test/logs/**,test/**/TEST-*.xml.xz,test/**/cqlshlib*.xml.xz,test/**/nosetests*.xml.xz,test/jmh-result.json", fingerprint: true
-            copyToNightlies("${logfile}, test/logs/**", "${cell.step}/${cell.arch}/jdk${cell.jdk}/python${cell.python}/cython_${cell.cython}/" + "split_${cell.split}_${splits}".replace("/", "_"))
+          } finally {
+            cleanAgent(cell.step)
           }
-          cleanAgent(cell.step)
         }
       }
     }
@@ -542,6 +570,13 @@ def cleanAgent(job_name) {
     logAgentInfo(job_name, agentScriptsUrl)
   }
   cleanWs()
+  if (isCanonical()) {
+    // in the workspace prune any abandoned or uncleaned builds (CASSANDRA-20436)
+    sh """#!/bin/bash
+        set +e
+        find /home/jenkins/jenkins-*/workspace/ -mindepth 2 -maxdepth 2 -type d -regextype posix-extended -regex '.*/[0-9]+' -mtime +31 -print -exec rm -rf {} +
+    """
+  }
 }
 
 def cleanAgentDocker(job_name, agentScriptsUrl) {
@@ -585,9 +620,10 @@ def generateTestReports() {
           unzip -x -d build/test -q output.zip ) ${teeSuffix}
          """
     } else {
-      copyArtifacts filter: 'test/**/TEST-*.xml.xz,test/**/cqlshlib*.xml.xz,test/**/nosetests*.xml.xz,test/jmh-result.json', fingerprintArtifacts: true, projectName: env.JOB_NAME, selector: specific(env.BUILD_NUMBER), target: "build/", optional: true
+      copyArtifacts filter: 'test/**/TEST-*.xml.xz,test/**/cqlshlib*.xml.xz,test/**/nosetests*.xml.xz,test/**/jmh-result.json', fingerprintArtifacts: true, projectName: env.JOB_NAME, selector: specific(env.BUILD_NUMBER), target: "build/", optional: true
     }
-    if (fileExists('build/test/output')) {
+    // merge and summarise test reports
+    if (fileExists('build/test/output') && sh(script: 'test -n "$(find build/test/output -type f -name "*.xml.xz" -print -quit)"', returnStatus: true) == 0) {
       // merge splits for each target's test report, other axes are kept separate
       //   TODO parallelised for loop
       //   TODO results_details.tar.xz needs to include all logs for failed tests
@@ -613,11 +649,31 @@ def generateTestReports() {
 
       dir('build/') {
         archiveArtifacts artifacts: "ci_summary.html,results_details.tar.xz,${logfile}", fingerprint: true
-        copyToNightlies('ci_summary.html,results_details.tar.xz,${logfile},test/jmh-result.json')
+        copyToNightlies('ci_summary.html,results_details.tar.xz,${logfile}')
       }
     }
-    if (fileExists('build/test/jmh-result.json')) {
-      jmhReport('build/test/jmh-result.json')
+    processJmhReports()
+  }
+}
+
+def processJmhReports() {
+  if (fileExists('build/test/output') && sh(script: 'test -n "$(find build/test/output -type f -name jmh-result.json -print -quit)"', returnStatus: true) == 0) {
+    sh ''' python3 -c "
+import glob,json
+m=[]
+for f in glob.glob('build/test/output/**/jmh-result.json',recursive=True):
+  d=json.load(open(f))
+  m.extend(d if isinstance(d,list) else [d])
+o=open('build/test/output/combined-result.json','w')
+json.dump(m,o)
+o.close()
+print(f'combined {len(m)} results')
+"
+  '''
+    jmhReport('build/test/output/combined-result.json')
+    dir('build/') {
+      archiveArtifacts artifacts: "test/output/combined-result.json", fingerprint: true
+      copyToNightlies('test/output/combined-result.json')
     }
   }
 }

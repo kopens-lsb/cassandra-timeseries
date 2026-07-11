@@ -124,8 +124,10 @@ import org.apache.cassandra.security.JREProvider;
 import org.apache.cassandra.security.SSLFactory;
 import org.apache.cassandra.service.CacheService.CacheType;
 import org.apache.cassandra.service.FileSystemOwnershipCheck;
+import org.apache.cassandra.service.RetryStrategy;
 import org.apache.cassandra.service.StartupChecks;
 import org.apache.cassandra.service.StorageService;
+import org.apache.cassandra.service.TimeoutStrategy;
 import org.apache.cassandra.service.accord.AccordService;
 import org.apache.cassandra.service.accord.api.AccordWaitStrategies;
 import org.apache.cassandra.service.consensus.TransactionalMode;
@@ -175,6 +177,7 @@ import static org.apache.cassandra.io.util.FileUtils.ONE_GIB;
 import static org.apache.cassandra.io.util.FileUtils.ONE_MIB;
 import static org.apache.cassandra.journal.Params.FlushMode.PERIODIC;
 import static org.apache.cassandra.utils.Clock.Global.logInitializationOutcome;
+import static org.apache.cassandra.utils.LocalizeString.toLowerCaseLocalized;
 
 public class DatabaseDescriptor
 {
@@ -224,6 +227,8 @@ public class DatabaseDescriptor
 
     private static DiskAccessMode compactionReadDiskAccessMode;
 
+    private static DiskAccessMode backgroundWriteDiskAccessMode;
+
     private static AbstractCryptoProvider cryptoProvider;
     private static IAuthenticator authenticator;
     private static IAuthorizer authorizer;
@@ -266,6 +271,15 @@ public class DatabaseDescriptor
     private static final boolean strictRuntimeChecks = TEST_STRICT_RUNTIME_CHECKS.getBoolean();
 
     public static volatile boolean allowUnlimitedConcurrentValidations = ALLOW_UNLIMITED_CONCURRENT_VALIDATIONS.getBoolean();
+
+    /**
+     * RetryStrategy which provides exponential backoff with full jitter, for use by both CMS and non-CMS members
+     * when submitting a Commit request. The range and increments of the backoff times are defined by
+     * conf.cms_commit_retry_initial_delay and conf.cms_commit_retry_max_delay. Both are hot properties and so
+     * changing either one causes this retry strategy to be reconstructed.
+     */
+    private static volatile RetryStrategy cms_commit_retry_strategy;
+
 
     /**
      * The configuration for guardrails.
@@ -576,6 +590,8 @@ public class DatabaseDescriptor
         applyGuardrails();
 
         applyAccord();
+
+        applyCMS();
 
         applyStartupChecks();
     }
@@ -896,6 +912,8 @@ public class DatabaseDescriptor
 
         if (conf.hints_directory.equals(conf.saved_caches_directory))
             throw new ConfigurationException("saved_caches_directory must not be the same as the hints_directory", false);
+
+        initializeBackgroundWriteDiskAccessMode();
 
         if (conf.memtable_flush_writers == 0)
         {
@@ -1381,6 +1399,25 @@ public class DatabaseDescriptor
             throw new ConfigurationException("Invalid accord progress log configuration: " + e.getMessage(), e);
         }
         AccordService.applyProtocolModifiers(getAccord());
+    }
+
+    private static void applyCMS()
+    {
+        try
+        {
+            long initialDelayMs = conf.cms_commit_retry_initial_delay.to(TimeUnit.MILLISECONDS);
+            long maxDelayMs = conf.cms_commit_retry_max_delay.to(TimeUnit.MILLISECONDS);
+            // range of backoff wait time starts at 0ms backing off exponentially at initialDelayMs * 2^attempts
+            String spec = String.format("0ms ... %dms * 2^attempts <= %dms", initialDelayMs, maxDelayMs);
+            logger.debug("Initializing cms_commit_retry_strategy from spec: " + spec);
+            cms_commit_retry_strategy = RetryStrategy.parse(spec,
+                                                            TimeoutStrategy.LatencySourceFactory.none(),
+                                                            RetryStrategy.randomizers.uniform());
+        }
+        catch (Exception e)
+        {
+            throw new ConfigurationException("Invalid configuration for cms_commit_retry_strategy. " + e.getMessage(), e);
+        }
     }
 
     public static StartupChecksConfiguration getStartupChecksConfiguration()
@@ -3404,6 +3441,71 @@ public class DatabaseDescriptor
         Pair<DiskAccessMode, Boolean> accessModeDirectIoPair = resolveCommitLogWriteDiskAccessMode(conf.commitlog_disk_access_mode);
         validateCommitLogWriteDiskAccessMode(accessModeDirectIoPair);
         commitLogWriteDiskAccessMode = accessModeDirectIoPair.left;
+    }
+
+    public static DiskAccessMode getBackgroundWriteDiskAccessMode()
+    {
+        return backgroundWriteDiskAccessMode;
+    }
+
+    @VisibleForTesting
+    public static void setBackgroundWriteDiskAccessMode(DiskAccessMode diskAccessMode)
+    {
+        backgroundWriteDiskAccessMode = diskAccessMode;
+        conf.background_write_disk_access_mode = diskAccessMode;
+    }
+
+    public static DataStorageSpec.IntKibibytesBound getDirectWriteBufferSize()
+    {
+        return conf.direct_write_buffer_size;
+    }
+
+    /**
+     * The directories opened with O_DIRECT for writing. Startup checks that must reason about O_DIRECT
+     * write targets (e.g. the kernel-bug 1057843 check) derive their path set from here.
+     */
+    public static Set<Path> getDirectIOWritePaths()
+    {
+        Set<Path> paths = new HashSet<>();
+
+        if (getCommitLogWriteDiskAccessMode() == DiskAccessMode.direct)
+            paths.add(new File(getCommitLogLocation()).toPath());
+
+        if (getBackgroundWriteDiskAccessMode() == DiskAccessMode.direct)
+            for (String dataDir : getAllDataFileLocations())
+                paths.add(new File(dataDir).toPath());
+
+        return paths;
+    }
+
+    @VisibleForTesting
+    public static void initializeBackgroundWriteDiskAccessMode()
+    {
+        DiskAccessMode providedMode = conf.background_write_disk_access_mode;
+
+        if (providedMode == DiskAccessMode.direct)
+        {
+            // DataStorageSpec already rejects negatives at parse time; zero is the remaining
+            // nonsense value. The writer's Math.max would silently coerce it to minRequiredSize,
+            // which masks a likely operator mistake — fail fast instead.
+            if (conf.direct_write_buffer_size.toBytes() <= 0)
+                throw new ConfigurationException("direct_write_buffer_size must be > 0 when background_write_disk_access_mode is 'direct'. " +
+                                                 "Got: " + conf.direct_write_buffer_size, false);
+
+            // Create the data directories up front (as we do for the commit log) so the kernel-bug 1057843
+            // startup check can stat each O_DIRECT write target. Direct I/O support is validated separately
+            // by the directio_support startup check.
+            if (!toolInitialized)
+                for (String dataDir : getAllDataFileLocations())
+                    PathUtils.createDirectoriesIfNotExists(new File(dataDir).toPath());
+        }
+        else if (providedMode != DiskAccessMode.standard)
+        {
+            throw new ConfigurationException("Unsupported disk access mode for background_write_disk_access_mode " +
+                                             "(options: standard/direct): " + providedMode, false);
+        }
+
+        backgroundWriteDiskAccessMode = providedMode;
     }
 
     public static String getSavedCachesLocation()
@@ -6090,6 +6192,81 @@ public class DatabaseDescriptor
     public static DurationSpec getCmsAwaitTimeout()
     {
         return conf.cms_await_timeout;
+    }
+
+    public static Config.CMSCommitMemberPreferencePolicy getCmsCommitMemberPreferencePolicy()
+    {
+        return conf.cms_commit_member_preference_policy;
+    }
+
+    public static void setCmsAwaitTimeout(long timeoutInMillis)
+    {
+        if (timeoutInMillis != conf.cms_await_timeout.to(TimeUnit.MILLISECONDS))
+        {
+            logger.info("Setting cms_await_timeout to {}ms", timeoutInMillis);
+            conf.cms_await_timeout = new DurationSpec.LongMillisecondsBound(timeoutInMillis);
+        }
+    }
+
+    public static void setCmsCommitMemberPreferencePolicy(Config.CMSCommitMemberPreferencePolicy policy)
+    {
+        conf.cms_commit_member_preference_policy = policy;
+    }
+
+    public static void setCmsCommitMemberPreferencePolicy(String policy)
+    {
+        setCmsCommitMemberPreferencePolicy(Config.CMSCommitMemberPreferencePolicy.valueOf(toLowerCaseLocalized(policy)));
+    }
+
+    public static DurationSpec getCmsCommitTimeout()
+    {
+        return conf.cms_commit_timeout;
+    }
+
+    public static void setCmsCommitTimeout(long timeoutInMillis)
+    {
+        if (timeoutInMillis != conf.cms_commit_timeout.to(TimeUnit.MILLISECONDS))
+        {
+            logger.info("Setting cms_commit_timeout to {}ms", timeoutInMillis);
+            conf.cms_commit_timeout = new DurationSpec.LongMillisecondsBound(timeoutInMillis);
+        }
+    }
+
+
+
+    public static DurationSpec getCmsCommitRetryInitialDelay()
+    {
+        return conf.cms_commit_retry_initial_delay;
+    }
+
+    public static void setCmsCommitRetryInitialDelay(long delayInMillis)
+    {
+        if (delayInMillis != conf.cms_commit_retry_initial_delay.to(TimeUnit.MILLISECONDS))
+        {
+            logger.info("Setting cms_commit_retry_initial_delay to {}ms", delayInMillis);
+            conf.cms_commit_retry_initial_delay = new DurationSpec.LongMillisecondsBound(delayInMillis);
+            applyCMS();
+        }
+    }
+
+    public static DurationSpec getCmsCommitRetryMaxDelay()
+    {
+        return conf.cms_commit_retry_max_delay;
+    }
+
+    public static void setCmsCommitRetryMaxDelay(long delayInMillis)
+    {
+        if (delayInMillis != conf.cms_commit_retry_max_delay.to(TimeUnit.MILLISECONDS))
+        {
+            logger.info("Setting cms_commit_retry_max_delay to {}ms", delayInMillis);
+            conf.cms_commit_retry_max_delay = new DurationSpec.LongMillisecondsBound(delayInMillis);
+            applyCMS();
+        }
+    }
+
+    public static RetryStrategy getCmsCommitRetryStrategy()
+    {
+        return cms_commit_retry_strategy;
     }
 
     public static int getEpochAwareDebounceInFlightTrackerMaxSize()

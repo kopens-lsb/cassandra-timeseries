@@ -175,6 +175,7 @@ import org.apache.cassandra.service.reads.ReadCoordinator;
 import org.apache.cassandra.service.reads.range.RangeCommands;
 import org.apache.cassandra.service.reads.repair.ReadRepair;
 import org.apache.cassandra.tcm.ClusterMetadata;
+import org.apache.cassandra.tcm.membership.NodeId;
 import org.apache.cassandra.tcm.membership.NodeState;
 import org.apache.cassandra.tcm.ownership.VersionedEndpoints;
 import org.apache.cassandra.tracing.Tracing;
@@ -1441,8 +1442,11 @@ public class StorageProxy implements StorageProxyMBean
         boolean attributeNonAccordLatency = true;
         long nonAccordEndTime = -1;
 
-        if (mutations.stream().anyMatch(mutation -> Keyspace.open(mutation.getKeyspaceName()).getReplicationStrategy().hasTransientReplicas()))
-            throw new AssertionError("Logged batches are unsupported with transient replication");
+        for (IMutation mutation : mutations)
+        {
+            if (Keyspace.open(mutation.getKeyspaceName()).getReplicationStrategy().hasTransientReplicas())
+                throw new AssertionError("Logged batches are unsupported with transient replication");
+        }
 
         try
         {
@@ -2194,7 +2198,7 @@ public class StorageProxy implements StorageProxyMBean
         if (metadata == null)
             return false;
 
-        if (metadata.myNodeId() == null)
+        if (metadata.myNodeId() == NodeId.UNREGISTERED)
             return false;
 
         return metadata.myNodeState() == NodeState.JOINED;
@@ -2736,6 +2740,7 @@ public class StorageProxy implements StorageProxyMBean
 
         protected void runMayThrow()
         {
+            boolean cancelled = false;
             try
             {
                 MessageParams.reset();
@@ -2762,6 +2767,7 @@ public class StorageProxy implements StorageProxyMBean
                 {
                     logger.debug("Query cancelled (timeout)", e);
                     response = null;
+                    cancelled = true;
                     Preconditions.checkState(!command.isCompleted(), "Local read marked as completed despite being aborted by timeout to table %s", command.metadata());
                 }
 
@@ -2773,7 +2779,7 @@ public class StorageProxy implements StorageProxyMBean
                 {
                     // We track latency based on request processing time
                     MessagingService.instance().metrics.recordSelfDroppedMessage(verb, MonotonicClock.Global.preciseTime.now() - requestTime.startedAtNanos(), NANOSECONDS);
-                    handler.onFailure(FBUtilities.getBroadcastAddressAndPort(), RequestFailure.UNKNOWN);
+                    handler.onFailure(FBUtilities.getBroadcastAddressAndPort(), cancelled ? RequestFailure.TIMEOUT : RequestFailure.UNKNOWN);
                 }
 
                 if (!readRejected)

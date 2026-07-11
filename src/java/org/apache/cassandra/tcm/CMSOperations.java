@@ -27,6 +27,8 @@ import java.util.List;
 import java.util.Map;
 import java.util.stream.Collectors;
 
+import com.google.common.base.Preconditions;
+
 import org.slf4j.Logger;
 import org.slf4j.LoggerFactory;
 
@@ -46,9 +48,9 @@ import org.apache.cassandra.tcm.sequences.ReconfigureCMS;
 import org.apache.cassandra.tcm.serialization.Version;
 import org.apache.cassandra.tcm.transformations.Unregister;
 import org.apache.cassandra.tcm.transformations.cms.AdvanceCMSReconfiguration;
-import org.apache.cassandra.utils.FBUtilities;
 import org.apache.cassandra.utils.MBeanWrapper;
 
+import static java.util.concurrent.TimeUnit.MILLISECONDS;
 import static org.apache.cassandra.tcm.transformations.cms.PrepareCMSReconfiguration.needsReconfiguration;
 
 public class CMSOperations implements CMSOperationsMBean
@@ -78,6 +80,65 @@ public class CMSOperations implements CMSOperationsMBean
     private CMSOperations(ClusterMetadataService cms)
     {
         this.cms = cms;
+    }
+
+    // TCM CMS await timeout
+    public long getCmsAwaitTimeoutMillis()
+    {
+        return DatabaseDescriptor.getCmsAwaitTimeout().to(MILLISECONDS);
+    }
+
+    public void setCmsAwaitTimeoutMillis(long timeoutInMillis)
+    {
+        Preconditions.checkState(timeoutInMillis > 0);
+        DatabaseDescriptor.setCmsAwaitTimeout(timeoutInMillis);
+    }
+
+    // CMS commit timeout with exponential backoff
+    public long getCmsCommitTimeoutMillis()
+    {
+        return DatabaseDescriptor.getCmsCommitTimeout().to(MILLISECONDS);
+    }
+
+    public void setCmsCommitTimeoutMillis(long timeoutInMillis)
+    {
+        Preconditions.checkState(timeoutInMillis > 0);
+        DatabaseDescriptor.setCmsCommitTimeout(timeoutInMillis);
+    }
+
+    public long getCmsCommitRetryInitialDelayMillis()
+    {
+        return DatabaseDescriptor.getCmsCommitRetryInitialDelay().to(MILLISECONDS);
+    }
+
+    public void setCmsCommitRetryInitialDelayMillis(long delayInMillis)
+    {
+        Preconditions.checkState(delayInMillis > 0);
+        DatabaseDescriptor.setCmsCommitRetryInitialDelay(delayInMillis);
+    }
+
+    public long getCmsCommitRetryMaxDelayMillis()
+    {
+        return DatabaseDescriptor.getCmsCommitRetryMaxDelay().to(MILLISECONDS);
+    }
+
+    public void setCmsCommitRetryMaxDelayMillis(long delayInMillis)
+    {
+        Preconditions.checkState(delayInMillis > 0);
+        DatabaseDescriptor.setCmsCommitRetryMaxDelay(delayInMillis);
+    }
+
+    @Override
+    public String getCmsCommitMemberPreferencePolicy()
+    {
+        return DatabaseDescriptor.getCmsCommitMemberPreferencePolicy().name();
+    }
+
+    @Override
+    public void setCmsCommitMemberPreferencePolicy(String policy)
+    {
+        DatabaseDescriptor.setCmsCommitMemberPreferencePolicy(policy);
+        logger.info("Set cms_commit_member_preference_policy to {}", policy);
     }
 
     @Override
@@ -154,14 +215,14 @@ public class CMSOperations implements CMSOperationsMBean
         ClusterMetadata metadata = ClusterMetadata.current();
         String members = metadata.fullCMSMembers().stream().sorted().map(Object::toString).collect(Collectors.joining(","));
         info.put(MEMBERS, members);
-        info.put(NEEDS_RECONFIGURATION, Boolean.toString(needsReconfiguration(metadata)));
-        info.put(IS_MEMBER, Boolean.toString(cms.isCurrentMember(FBUtilities.getBroadcastAddressAndPort())));
+        info.put(NEEDS_RECONFIGURATION, Boolean.toString(metadata.epoch.isBefore(Epoch.FIRST) || needsReconfiguration(metadata)));
+        info.put(IS_MEMBER, Boolean.toString(metadata.isCMSMember()));
         info.put(SERVICE_STATE, ClusterMetadataService.state(metadata).toString());
         info.put(IS_MIGRATING, Boolean.toString(cms.isMigrating()));
         info.put(EPOCH, Long.toString(metadata.epoch.getEpoch()));
         info.put(LOCAL_PENDING, Integer.toString(cms.log().pendingBufferSize()));
         info.put(COMMITS_PAUSED, Boolean.toString(cms.commitsPaused()));
-        info.put(REPLICATION_FACTOR, ReplicationParams.meta(metadata).toString());
+        info.put(REPLICATION_FACTOR, metadata.epoch.isBefore(Epoch.FIRST) ? "" : ReplicationParams.meta(metadata).toString());
         info.put(CMS_ID, Integer.toString(metadata.metadataIdentifier));
         return info;
     }

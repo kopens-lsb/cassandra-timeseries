@@ -360,7 +360,7 @@ public class CassandraDaemon
         {
             CommitLog.instance.recoverSegmentsOnDisk();
             NodeId self = ClusterMetadata.current().myNodeId();
-            if (self != null)
+            if (self != NodeId.UNREGISTERED)
                 AccordService.localStartup(self);
         }
         catch (IOException e)
@@ -391,6 +391,11 @@ public class CassandraDaemon
 
         // Prepared statements
         QueryProcessor.instance.preloadPreparedStatements();
+
+        // Apply overrides before re-enabling auto-compaction
+        setCompactionStrategyOverrides(Schema.instance.getKeyspaces());
+        // re-enable auto-compaction after replay, so correct disk boundaries are used
+        enableAutoCompaction(Schema.instance.getKeyspaces());
 
         // start server internals
         StorageService.instance.registerDaemon(this);
@@ -423,11 +428,6 @@ public class CassandraDaemon
 
         ScheduledExecutors.optionalTasks.schedule(viewRebuild, StorageService.RING_DELAY_MILLIS, TimeUnit.MILLISECONDS);
         StorageService.instance.doAuthSetup();
-
-        // Apply overrides before re-enabling auto-compaction
-        setCompactionStrategyOverrides(Schema.instance.getKeyspaces());
-        // re-enable auto-compaction after replay, so correct disk boundaries are used
-        enableAutoCompaction(Schema.instance.getKeyspaces());
 
         AuditLogManager.instance.initialize();
 

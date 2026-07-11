@@ -63,8 +63,12 @@ import org.apache.cassandra.service.StorageService;
 import org.apache.cassandra.tcm.log.LocalLog;
 import org.apache.cassandra.tcm.log.LogStorage;
 import org.apache.cassandra.tcm.log.SystemKeyspaceStorage;
+import org.apache.cassandra.tcm.membership.Location;
+import org.apache.cassandra.tcm.membership.NodeAddresses;
 import org.apache.cassandra.tcm.membership.NodeId;
 import org.apache.cassandra.tcm.membership.NodeState;
+import org.apache.cassandra.tcm.membership.NodeVersion;
+import org.apache.cassandra.tcm.migration.CMSInitializationException;
 import org.apache.cassandra.tcm.migration.CMSInitializationRequest;
 import org.apache.cassandra.tcm.migration.Election;
 import org.apache.cassandra.tcm.ownership.UniformRangePlacement;
@@ -134,23 +138,37 @@ import static org.apache.cassandra.utils.FBUtilities.getBroadcastAddressAndPort;
     }
 
     /**
-     * Make this node a _first_ CMS node.
+     * Make this node the _first_ CMS node.
      * <p>
-     * (1) Append PreInitialize transformation to local in-memory log. When distributed metadata keyspace is initialized, a no-op transformation will
-     * be added to other nodes. This is required since as of now, no node actually owns distributed metadata keyspace.
-     * (2) Commit Initialize transformation, which holds a snapshot of metadata as of now.
+     * (1) Append PreInitialize transformation to local in-memory log.
+     * (1a) Once this enacted and the distributed metadata keyspace is initialized, the PreInitialize transformation
+     * will be inserted into the log table. This is required since as before this point, the keyspace was not availble
+     * or configured with any replication or placements.
+     * (2) Commit Initialize transformation, which holds a complete snapshot of metadata as of now.
+     * Other nodes in the cluster, if there are any, will receive both of these log entries and enact them locally.
      * <p>
      * This process is applicable for gossip upgrades as well as regular vote-and-startup process.
      */
     public static void initializeAsFirstCMSNode()
     {
-        InetAddressAndPort addr = FBUtilities.getBroadcastAddressAndPort();
-        String datacenter = DatabaseDescriptor.getLocator().local().datacenter;
-        ClusterMetadataService.instance().log().bootstrap(addr, datacenter);
-        ClusterMetadata metadata =  ClusterMetadata.current();
-        assert ClusterMetadataService.state() == LOCAL : String.format("Can't initialize as node hasn't transitioned to CMS state. State: %s.\n%s", ClusterMetadataService.state(),  metadata);
-        Initialize initialize = new Initialize(metadata.initializeClusterIdentifier(addr.hashCode()));
-        ClusterMetadataService.instance().commit(initialize);
+        NodeAddresses addresses = NodeAddresses.current();
+        Location location = DatabaseDescriptor.getLocator().local();
+        ClusterMetadataService cms = ClusterMetadataService.instance();
+        cms.log().bootstrap(addresses.broadcastAddress, location.datacenter, cms.logBootstrapCallback());
+        ClusterMetadata metadata =  ClusterMetadata.current().forceInitializedState(addresses.broadcastAddress.hashCode(),
+                                                                                    addresses,
+                                                                                    NodeVersion.CURRENT,
+                                                                                    location);
+        assert ClusterMetadataService.state(metadata) == LOCAL : String.format("Can't initialize as node hasn't transitioned to CMS state. State: %s.\n%s", ClusterMetadataService.state(),  metadata);
+        Initialize initialize = new Initialize(metadata);
+        ClusterMetadata initialized = ClusterMetadataService.instance().commit(initialize,
+                                                                               m -> { logger.info("INITIALIZE_CMS committed successfully"); return m;},
+                                                                               (code, message) -> {
+                                                                                   logger.info("INITIALIZE_CMS commit failure: ({}) {}", code, message);
+                                                                                   throw new CMSInitializationException();
+                                                                               });
+        NodeId id = initialized.myNodeId();
+        SystemKeyspace.setLocalHostId(id.toUUID());
     }
 
     public static void initializeAsNonCmsNode(Function<Processor, Processor> wrapProcessor) throws StartupException
@@ -168,7 +186,7 @@ import static org.apache.cassandra.utils.FBUtilities.getBroadcastAddressAndPort;
 
         NodeId nodeId = ClusterMetadata.current().myNodeId();
         UUID currentHostId = SystemKeyspace.getLocalHostId();
-        if (nodeId != null && !Objects.equals(nodeId.toUUID(), currentHostId))
+        if (nodeId != NodeId.UNREGISTERED && !Objects.equals(nodeId.toUUID(), currentHostId))
         {
             if (currentHostId == null)
             {
@@ -262,9 +280,9 @@ import static org.apache.cassandra.utils.FBUtilities.getBroadcastAddressAndPort;
         Election.instance.migrated();
     }
 
-    private static void updateSystemSchemaTables(Set<String> knownDatacenters)
+    private static void updateSystemSchemaTables()
     {
-        List<Pair<KeyspaceMetadata, Long>> kss = DistributedSchema.distributedKeyspacesWithGeneration(knownDatacenters);
+        List<Pair<KeyspaceMetadata, Long>> kss = DistributedSchema.distributedKeyspacesWithGeneration();
         List<Mutation> mutations = new ArrayList<>();
         for (Pair<KeyspaceMetadata, Long> ksm : kss)
         {
@@ -279,9 +297,8 @@ import static org.apache.cassandra.utils.FBUtilities.getBroadcastAddressAndPort;
      */
     public static void initializeFromGossip(Function<Processor, Processor> wrapProcessor, Runnable initMessaging) throws StartupException
     {
-        Set<String> knownDcs = SystemKeyspace.allKnownDatacenters();
-        updateSystemSchemaTables(knownDcs);
-        ClusterMetadata emptyFromSystemTables = emptyWithSchemaFromSystemTables(knownDcs);
+        updateSystemSchemaTables();
+        ClusterMetadata emptyFromSystemTables = emptyWithSchemaFromSystemTables();
         LocalLog.LogSpec logSpec = LocalLog.logSpec()
                                            .withInitialState(emptyFromSystemTables)
                                            .afterReplay(Startup::scrubDataDirectories,
@@ -332,7 +349,7 @@ import static org.apache.cassandra.utils.FBUtilities.getBroadcastAddressAndPort;
 
         logger.debug("Got epStates {}", epStates);
         ClusterMetadata initial = fromEndpointStates(emptyFromSystemTables.schema, epStates);
-        logger.debug("Created initial ClusterMetadata {}", initial);
+        logger.info("Created initial ClusterMetadata {}", initial.conciseToString());
         ClusterMetadataService.instance().setFromGossip(initial);
         Gossiper.instance.clearUnsafe();
 
@@ -385,7 +402,7 @@ import static org.apache.cassandra.utils.FBUtilities.getBroadcastAddressAndPort;
                                                           DatabaseDescriptor.getPartitioner().getClass().getCanonicalName(),
                                                           metadata.partitioner.getClass().getCanonicalName()));
 
-        if (!metadata.isCMSMember(FBUtilities.getBroadcastAddressAndPort()))
+        if (!metadata.isCMSMember())
             throw new IllegalStateException("When reinitializing with cluster metadata, we must be in the CMS");
 
         metadata = metadata.forceEpoch(metadata.epoch.nextEpoch());
@@ -449,6 +466,8 @@ import static org.apache.cassandra.utils.FBUtilities.getBroadcastAddressAndPort;
                 if (isReplacing)
                     ReconfigureCMS.maybeReconfigureCMS(metadata, DatabaseDescriptor.getReplaceAddress());
 
+                // if this throws startup is aborted and operator needs to restart, in that case the IPS is resumed if
+                // it was successfully committed
                 ClusterMetadataService.instance().commit(initialTransformation.get());
                 // When Accord starts up it needs to check for any historic epochs that it needs to know about (in order
                 // to handle pending transactions), in order to know what nodes to check with it needs to know what the

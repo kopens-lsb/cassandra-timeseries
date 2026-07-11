@@ -140,6 +140,7 @@ import org.apache.cassandra.service.accord.topology.SimpleFastPathStrategy;
 import org.apache.cassandra.service.accord.topology.UpFastPathStrategy;
 import org.apache.cassandra.service.consensus.TransactionalMode;
 import org.apache.cassandra.service.consensus.migration.ConsensusMigrationState;
+import org.apache.cassandra.tcm.CMSMembership;
 import org.apache.cassandra.tcm.ClusterMetadata;
 import org.apache.cassandra.tcm.Epoch;
 import org.apache.cassandra.tcm.extensions.ExtensionKey;
@@ -1946,7 +1947,7 @@ public final class CassandraGenerators
                 Epoch epoch = epochGen.generate(rnd);
                 IPartitioner partitioner = partitionerGen.generate(rnd);
                 Directory directory = Directory.EMPTY;
-                DistributedSchema schema = DistributedSchema.first(directory.knownDatacenters());
+                DistributedSchema schema = DistributedSchema.empty();
                 TokenMap tokenMap = new TokenMap(partitioner);
                 DataPlacements placements = DataPlacements.EMPTY;
                 AccordFastPath accordFastPath = accordFastPathGen.generate(rnd);
@@ -1955,7 +1956,8 @@ public final class CassandraGenerators
                 ConsensusMigrationState consensusMigrationState = ConsensusMigrationState.EMPTY;
                 Map<ExtensionKey<?, ?>, ExtensionValue<?>> extensions = ImmutableMap.of();
                 AccordStaleReplicas accordStaleReplicas = accordStaleReplicasGen.generate(rnd);
-                return new ClusterMetadata(epoch, partitioner, schema, directory, tokenMap, placements, accordFastPath, lockedRanges, inProgressSequences, consensusMigrationState, extensions, accordStaleReplicas);
+                CMSMembership cms = CMSMembership.EMPTY;
+                return new ClusterMetadata(epoch, partitioner, schema, directory, tokenMap, placements, accordFastPath, lockedRanges, inProgressSequences, consensusMigrationState, extensions, accordStaleReplicas, cms);
             };
         }
     }

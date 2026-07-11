@@ -58,6 +58,7 @@ import org.apache.cassandra.service.StorageService;
 import org.apache.cassandra.service.accord.topology.AccordFastPath;
 import org.apache.cassandra.service.accord.topology.AccordStaleReplicas;
 import org.apache.cassandra.service.consensus.migration.ConsensusMigrationState;
+import org.apache.cassandra.tcm.CMSMembership;
 import org.apache.cassandra.tcm.ClusterMetadata;
 import org.apache.cassandra.tcm.Epoch;
 import org.apache.cassandra.tcm.MultiStepOperation;
@@ -287,7 +288,7 @@ public class GossipHelper
         return NodeVersion.fromCassandraVersion(cassandraVersion);
     }
 
-    public static ClusterMetadata emptyWithSchemaFromSystemTables(Set<String> allKnownDatacenters)
+    public static ClusterMetadata emptyWithSchemaFromSystemTables()
     {
         // If this instance was previously upgraded then subsequently downgraded, the metadata keyspace may have been
         // added to system_schema tables. If so, don't include it in the initial schema as this will cause it to be
@@ -297,7 +298,7 @@ public class GossipHelper
                                             .filter(k -> !k.name.equals(SchemaConstants.METADATA_KEYSPACE_NAME));
         return new ClusterMetadata(Epoch.UPGRADE_STARTUP,
                                    DatabaseDescriptor.getPartitioner(),
-                                   DistributedSchema.fromSystemTables(keyspaces, allKnownDatacenters),
+                                   DistributedSchema.fromSystemTables(keyspaces),
                                    Directory.EMPTY,
                                    new TokenMap(DatabaseDescriptor.getPartitioner()),
                                    DataPlacements.empty(),
@@ -306,7 +307,8 @@ public class GossipHelper
                                    InProgressSequences.EMPTY,
                                    ConsensusMigrationState.EMPTY,
                                    Collections.emptyMap(),
-                                   AccordStaleReplicas.EMPTY);
+                                   AccordStaleReplicas.EMPTY,
+                                   CMSMembership.EMPTY);
     }
 
     public static ClusterMetadata fromEndpointStates(DistributedSchema schema, Map<InetAddressAndPort, EndpointState> epStates)
@@ -396,7 +398,8 @@ public class GossipHelper
                                                                       InProgressSequences.EMPTY,
                                                                       ConsensusMigrationState.EMPTY,
                                                                       extensions,
-                                                                      AccordStaleReplicas.EMPTY);
+                                                                      AccordStaleReplicas.EMPTY,
+                                                                      CMSMembership.EMPTY);
         DataPlacements placements = new UniformRangePlacement().calculatePlacements(Epoch.UPGRADE_GOSSIP,
                                                                                     forPlacementCalculation,
                                                                                     schema.getKeyspaces());
@@ -411,7 +414,8 @@ public class GossipHelper
                                    InProgressSequences.EMPTY,
                                    ConsensusMigrationState.EMPTY,
                                    extensions,
-                                   AccordStaleReplicas.EMPTY);
+                                   AccordStaleReplicas.EMPTY,
+                                   CMSMembership.EMPTY);
     }
 
     public static boolean isValidForClusterMetadata(Map<InetAddressAndPort, EndpointState> epstates)

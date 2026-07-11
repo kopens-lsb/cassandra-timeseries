@@ -183,6 +183,18 @@ public class Config
 
     public volatile DurationSpec.LongMillisecondsBound stream_transfer_task_timeout = new DurationSpec.LongMillisecondsBound("12h");
 
+    /**
+     * Timeout for the per-message window when a non-CMS node sends a TCM_COMMIT_REQ to a CMS node.
+     * The CMS will attempt Paxos retries for (cms_await_timeout - write_request_timeout) before
+     * returning an explicit failure, giving the sender time to reschedule before its message callback fires.
+     *
+     * WARNING: cms_await_timeout should be substantially larger than write_request_timeout.
+     * A single Paxos CAS attempt can take up to (cas_contention_timeout + write_request_timeout) to
+     * complete. If cms_await_timeout is set close to write_request_timeout the deadline reduction has
+     * no effect and many concurrent CMS operations timing out at the same time may create a thundering herd,
+     * all retrying against the CMS.
+     * Default 2 minutes to match "nodetool cms initialize".
+     */
     public volatile DurationSpec.LongMillisecondsBound cms_await_timeout = new DurationSpec.LongMillisecondsBound("120000ms");
     public volatile int cms_default_max_retries = 10;
     @Deprecated(since="6.0")
@@ -190,6 +202,40 @@ public class Config
     @Deprecated(since="6.0")
     public volatile DurationSpec.IntMillisecondsBound cms_default_max_retry_backoff = null;
     public String cms_retry_delay = "50ms*attempts <= 500ms ... 100ms*attempts <= 1s,retries=10";
+
+    public volatile CMSCommitMemberPreferencePolicy cms_commit_member_preference_policy = CMSCommitMemberPreferencePolicy.random;
+    /**
+     * Controls the sender-side retry behavior for CMS commits (topology changes,
+     * CMS reconfiguration, node registration — everything except STARTUP and schema DDL
+     * with an explicit client deadline).
+     *
+     * cms_commit_timeout: Overall deadline for the commit to succeed. The sender retries
+     *   with exponential backoff until this deadline expires. Each retry sends a fresh
+     *   TCM_COMMIT_REQ to a (possibly different) CMS node. Set this longer than the
+     *   expected total time for all concurrent operations to drain through the Paxos log.
+     *
+     * cms_commit_retry_initial_delay: Base delay for Full Jitter exponential backoff.
+     *   Actual delay per retry = uniform_random(0, min(max_delay, initial_delay * 2^attempt)).
+     *   Higher values reduce Paxos contention at the cost of slower progress when the log
+     *   is lightly loaded. 5s is a good default — it spaces retries enough to avoid
+     *   thundering herd while still making progress within minutes.
+     *
+     * cms_commit_retry_max_delay: Cap on the exponential backoff. Once 2^attempt growth
+     *   exceeds this, all subsequent retries draw from uniform_random(0, max_delay).
+     *   60s keeps retries frequent enough that a freed Paxos slot is filled within
+     *   ~30s on average, while avoiding retry storms.
+     *
+     * When to change:
+     *   - If bulk topology ops complete but take too long: reduce max_delay (e.g. 30s)
+     *     to retry more aggressively. Monitor CommitRetries rate for contention impact.
+     *   - If bulk topology ops fail (timeout): increase cms_commit_timeout.
+     *   - If Paxos contention is extremely high (>100 concurrent commits): increase
+     *     initial_delay to 10-15s to spread the retry wavefront.
+     *   - All three are hot-settable via JMX without restart.
+     */
+    public volatile DurationSpec.LongMillisecondsBound cms_commit_timeout = new DurationSpec.LongMillisecondsBound("1h");
+    public volatile DurationSpec.LongMillisecondsBound cms_commit_retry_initial_delay = new DurationSpec.LongMillisecondsBound("5s");
+    public volatile DurationSpec.LongMillisecondsBound cms_commit_retry_max_delay = new DurationSpec.LongMillisecondsBound("60s");
 
     public volatile int epoch_aware_debounce_inflight_tracker_max_size = 100;
 
@@ -361,6 +407,18 @@ public class Config
     public DataStorageSpec.IntMebibytesBound min_free_space_per_drive = new DataStorageSpec.IntMebibytesBound("50MiB");
 
     public DataStorageSpec.IntKibibytesBound compressed_read_ahead_buffer_size = new DataStorageSpec.IntKibibytesBound("256KiB");
+
+    // Direct IO for background SSTable writes (compaction, streaming, cleanup, etc.)
+    // When 'direct' is set, background writes bypass the OS page cache using O_DIRECT.
+    // Memtable flushes always use buffered I/O regardless of this setting.
+    // Default is 'standard' (buffered I/O) - users must opt-in to Direct IO
+    public DiskAccessMode background_write_disk_access_mode = DiskAccessMode.standard;
+
+    // Size of the in-memory staging buffer for Direct IO background writes. Trades off syscall
+    // frequency against per-flush blocking latency on the compaction thread.
+    // Aligned up to filesystem block size; auto-expands to fit a single compressed chunk + CRC
+    // + one block when chunk_length exceeds this value.
+    public DataStorageSpec.IntKibibytesBound direct_write_buffer_size = new DataStorageSpec.IntKibibytesBound("1MiB");
 
     // fraction of free disk space available for compaction after min free space is subtracted
     public volatile Double max_space_usable_for_compactions_in_percentage = .95;
@@ -1256,6 +1314,31 @@ public class Config
         group
     }
 
+    /**
+     * Strategy for selecting which CMS member to contact for TCM commits.
+     */
+    public enum CMSCommitMemberPreferencePolicy
+    {
+        /** Shuffle candidates randomly (original behavior) */
+        random,
+
+        /** Shuffle local DC candidates randomly, followed by shuffled non-local */
+        local_random,
+
+        /** Sort by address - all nodes converge on same member with the goal
+         *  of reducing Paxos contention, but will increase hot-spotting on the
+         *  determined member
+         */
+        deterministic,
+
+        /** Sort local members first by name, then non-local. Nodes in each DC
+         *  will converge on same member with the goal of reducing Paxos contention d
+         *  below the random but with lower latency, though higher contention than
+         *  globally deterministic.
+         */
+        local_deterministic
+    }
+
     public enum FlushCompression
     {
         none,
@@ -1277,8 +1360,7 @@ public class Config
         legacy,
 
         /**
-         * Direct-I/O is enabled for commitlog disk only.
-         * When adding support for direct IO, update {@link org.apache.cassandra.service.StartupChecks#checkKernelBug1057843}
+         * When adding support for Direct I/O, update {@link org.apache.cassandra.service.StartupChecks#checkKernelBug1057843}
          */
         direct
     }

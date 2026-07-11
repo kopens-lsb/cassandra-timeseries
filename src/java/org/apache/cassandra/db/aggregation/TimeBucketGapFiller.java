@@ -17,11 +17,11 @@
  */
 package org.apache.cassandra.db.aggregation;
 
-import java.nio.ByteBuffer;
 import java.util.ArrayList;
+import java.util.Arrays;
 import java.util.List;
 
-import org.apache.cassandra.utils.ByteBufferUtil;
+import org.apache.cassandra.utils.ByteArrayUtil;
 
 /**
  * Densifies the rows of a {@code GROUP BY ... time_bucket_gapfill(...)} result: for every time bucket in the requested
@@ -46,7 +46,7 @@ public final class TimeBucketGapFiller
      * @param stepMillis the bucket width in milliseconds (must be &gt; 0)
      * @return a new list of rows with missing in-range buckets filled
      */
-    public static List<List<ByteBuffer>> densify(List<List<ByteBuffer>> rows,
+    public static List<List<byte[]>> densify(List<List<byte[]>> rows,
                                                   int bucketIndex,
                                                   int[] partitionKeyIndices,
                                                   int[] locfColumnIndices,
@@ -59,14 +59,14 @@ public final class TimeBucketGapFiller
         if (stepMillis <= 0 || finishMillis <= startMillis)
             return rows;
 
-        List<List<ByteBuffer>> out = new ArrayList<>(rows.size());
+        List<List<byte[]>> out = new ArrayList<>(rows.size());
 
         int i = 0;
         int n = rows.size();
         while (i < n)
         {
             // Collect the next partition group (consecutive rows sharing the partition-key columns).
-            List<ByteBuffer> first = rows.get(i);
+            List<byte[]> first = rows.get(i);
             int groupEnd = i + 1;
             while (groupEnd < n && samePartition(first, rows.get(groupEnd), partitionKeyIndices))
                 groupEnd++;
@@ -89,31 +89,31 @@ public final class TimeBucketGapFiller
      * {@code [from, to)} of a single partition. Cells before the first non-null or after the last stay null. The column
      * is assumed to be a {@code double} (the {@code interpolate()} function returns double).
      */
-    private static void interpolateColumn(List<List<ByteBuffer>> out, int from, int to, int col)
+    private static void interpolateColumn(List<List<byte[]>> out, int from, int to, int col)
     {
         int prev = -1;
         for (int i = from; i < to; i++)
         {
-            ByteBuffer cell = out.get(i).get(col);
+            byte[] cell = out.get(i).get(col);
             if (cell == null)
                 continue;
 
             if (prev >= 0 && i - prev > 1)
             {
-                double prevVal = ByteBufferUtil.toDouble(out.get(prev).get(col));
-                double nextVal = ByteBufferUtil.toDouble(cell);
+                double prevVal = ByteArrayUtil.getDouble(out.get(prev).get(col), 0);
+                double nextVal = ByteArrayUtil.getDouble(cell, 0);
                 int gap = i - prev;
                 for (int j = prev + 1; j < i; j++)
                 {
                     double interpolated = prevVal + (nextVal - prevVal) * (j - prev) / gap;
-                    out.get(j).set(col, ByteBufferUtil.bytes(interpolated));
+                    out.get(j).set(col, ByteArrayUtil.bytes(interpolated));
                 }
             }
             prev = i;
         }
     }
 
-    private static void fillGroup(List<List<ByteBuffer>> rows,
+    private static void fillGroup(List<List<byte[]>> rows,
                                   int from,
                                   int to,
                                   int bucketIndex,
@@ -123,11 +123,11 @@ public final class TimeBucketGapFiller
                                   long startMillis,
                                   long finishMillis,
                                   long stepMillis,
-                                  List<List<ByteBuffer>> out)
+                                  List<List<byte[]>> out)
     {
-        List<ByteBuffer> template = rows.get(from);
+        List<byte[]> template = rows.get(from);
         // Last seen value per locf column within this partition, carried forward into synthesized empty buckets.
-        ByteBuffer[] lastLocf = new ByteBuffer[columnCount];
+        byte[][] lastLocf = new byte[columnCount][];
         // Walk the expected bucket axis and the existing rows together; emit existing rows in place and synthesize the
         // missing ones. Existing rows outside [start, finish) are passed through unchanged.
         long bucket = startMillis;
@@ -135,8 +135,8 @@ public final class TimeBucketGapFiller
 
         while (r < to)
         {
-            List<ByteBuffer> row = rows.get(r);
-            long rowBucket = ByteBufferUtil.toLong(row.get(bucketIndex));
+            List<byte[]> row = rows.get(r);
+            long rowBucket = ByteArrayUtil.getLong(row.get(bucketIndex));
 
             // Pass through any existing rows that precede the current expected bucket (e.g. before start).
             if (rowBucket < bucket || bucket >= finishMillis)
@@ -172,21 +172,21 @@ public final class TimeBucketGapFiller
         }
     }
 
-    private static void rememberLocf(List<ByteBuffer> row, int[] locfColumnIndices, ByteBuffer[] lastLocf)
+    private static void rememberLocf(List<byte[]> row, int[] locfColumnIndices, byte[][] lastLocf)
     {
         for (int idx : locfColumnIndices)
             lastLocf[idx] = row.get(idx);
     }
 
-    private static List<ByteBuffer> syntheticRow(List<ByteBuffer> template,
+    private static List<byte[]> syntheticRow(List<byte[]> template,
                                                  int bucketIndex,
                                                  int[] partitionKeyIndices,
                                                  int[] locfColumnIndices,
-                                                 ByteBuffer[] lastLocf,
+                                                 byte[][] lastLocf,
                                                  int columnCount,
                                                  long bucketMillis)
     {
-        List<ByteBuffer> row = new ArrayList<>(columnCount);
+        List<byte[]> row = new ArrayList<>(columnCount);
         for (int c = 0; c < columnCount; c++)
             row.add(null);
         // Carry the series identity (partition columns) and set the bucket; other columns stay null unless they are
@@ -195,17 +195,15 @@ public final class TimeBucketGapFiller
             row.set(idx, template.get(idx));
         for (int idx : locfColumnIndices)
             row.set(idx, lastLocf[idx]);
-        row.set(bucketIndex, ByteBufferUtil.bytes(bucketMillis));
+        row.set(bucketIndex, ByteArrayUtil.bytes(bucketMillis));
         return row;
     }
 
-    private static boolean samePartition(List<ByteBuffer> a, List<ByteBuffer> b, int[] partitionKeyIndices)
+    private static boolean samePartition(List<byte[]> a, List<byte[]> b, int[] partitionKeyIndices)
     {
         for (int idx : partitionKeyIndices)
         {
-            ByteBuffer x = a.get(idx);
-            ByteBuffer y = b.get(idx);
-            if (x == null ? y != null : !x.equals(y))
+            if (!Arrays.equals(a.get(idx), b.get(idx)))
                 return false;
         }
         return true;
