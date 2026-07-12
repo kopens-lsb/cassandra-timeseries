@@ -43,11 +43,17 @@ timeseries-tests:
     - ant testsome -Dtest.name=org.apache.cassandra.db.aggregation.TimeBucketGapFillerTest
     - ant testsome -Dtest.name=org.apache.cassandra.cql3.functions.TimeSeriesFctsTest
 
-# Publish the Testcontainers-compatible Docker image (see docker/) to the GitLab container registry.
-# Runs on tag pushes automatically and on-demand (manual) on master. The image is consumed by the
-# plantpulse-jdbc-cassandra-driver integration tests via -Pcassandra.image=$CI_REGISTRY_IMAGE:6.0.0.
-# kaniko builds the multi-stage docker/Dockerfile without a Docker daemon; the full Cassandra build
-# happens inside the image build, so this job does not depend on build-jar artifacts.
+# Build the Testcontainers-compatible Docker image (see docker/) and publish it as a loadable tarball to
+# the GitLab GENERIC PACKAGE registry — this instance has no container registry configured (no
+# registry_external_url, /jwt/auth 404), so $CI_REGISTRY_IMAGE is empty and a kaniko push cannot work.
+# Switch --no-push/--tar-path back to --destination "$CI_REGISTRY_IMAGE:6.0.0" if a container registry
+# is configured later.
+#
+# Consumption (e.g. before the plantpulse-jdbc-cassandra-driver integration tests):
+#   curl -sH "PRIVATE-TOKEN: <token>" \
+#     "$CI_API_V4_URL/projects/<id>/packages/generic/cassandra-timeseries-docker/<version>/cassandra-timeseries-6.0.0-docker.tar" \
+#     | podman load   # or: docker load
+#   ./gradlew integrationTest -Pcassandra.image=cassandra-timeseries:6.0.0
 docker-image:
   stage: release
   timeout: 90m
@@ -55,19 +61,45 @@ docker-image:
   image:
     name: gcr.io/kaniko-project/executor:v1.23.2-debug
     entrypoint: [""]
+  # The kaniko image is busybox-based: the global before_script (apt-get) must not run here.
+  before_script: []
   rules:
     - if: $CI_COMMIT_TAG
     - if: $CI_COMMIT_BRANCH == $CI_DEFAULT_BRANCH
       when: manual
       allow_failure: true
   script:
-    - mkdir -p /kaniko/.docker
-    - printf '{"auths":{"%s":{"auth":"%s"}}}' "$CI_REGISTRY" "$(printf '%s:%s' "$CI_REGISTRY_USER" "$CI_REGISTRY_PASSWORD" | base64 -w0)" > /kaniko/.docker/config.json
     - /kaniko/executor
       --context "$CI_PROJECT_DIR"
       --dockerfile "$CI_PROJECT_DIR/docker/Dockerfile"
-      --destination "$CI_REGISTRY_IMAGE:6.0.0"
-      --destination "$CI_REGISTRY_IMAGE:${CI_COMMIT_TAG:-latest}"
+      --no-push
+      --tar-path "$CI_PROJECT_DIR/cassandra-timeseries-6.0.0-docker.tar"
+      --destination "cassandra-timeseries:6.0.0"
+  artifacts:
+    name: "cassandra-timeseries-6.0.0-docker"
+    paths:
+      - cassandra-timeseries-6.0.0-docker.tar
+    expire_in: 3 days
+
+# Upload the image tarball to the generic package registry so it has a stable, tokened download URL
+# (job artifacts expire; packages do not).
+docker-image-publish:
+  stage: release
+  timeout: 30m
+  needs:
+    - job: docker-image
+      artifacts: true
+  image:
+    name: curlimages/curl:8.10.1
+    entrypoint: [""]
+  before_script: []
+  rules:
+    - if: $CI_COMMIT_TAG
+    - if: $CI_COMMIT_BRANCH == $CI_DEFAULT_BRANCH
+  script:
+    - curl --fail --silent --show-error -H "JOB-TOKEN: $CI_JOB_TOKEN"
+      --upload-file cassandra-timeseries-6.0.0-docker.tar
+      "$CI_API_V4_URL/projects/$CI_PROJECT_ID/packages/generic/cassandra-timeseries-docker/${CI_COMMIT_TAG:-6.0.0}/cassandra-timeseries-6.0.0-docker.tar"
 
 # On tag pushes (e.g. 6.0.0-r1), publish a GitLab Release pointing at the built jar.
 release:
