@@ -102,11 +102,15 @@ $RUNTIME exec "$CONTAINER" nodetool tablestats scale.metrics 2>/dev/null | grep 
 # ---------------------------------------------------------------- query + report
 echo "-- timing time-series queries"
 $RUNTIME exec "$CONTAINER" python3 /tmp/scale-workload.py query \
-    --rows "$ROWS" --series "$SERIES" --load-secs "$LOAD_SECS" --image "$IMAGE" > "$REPORT"
+    --rows "$ROWS" --series "$SERIES" --load-secs "$LOAD_SECS" --image "$IMAGE" \
+    --md-out /tmp/scale-report.md > "$REPORT"
 rc=$?
 
 if [ $rc -ne 0 ]; then
     echo "FATAL: query phase failed"; exit 1
 fi
-echo "   HTML report: $REPORT"
+# The Markdown twin is the copy that gets committed (GitLab renders .md, not .html blobs).
+$RUNTIME cp "$CONTAINER:/tmp/scale-report.md" "${REPORT%.html}.md"
+echo "   report: $REPORT"
+echo "   report: ${REPORT%.html}.md"
 echo "-- container '$CONTAINER' left running; remove with: $RUNTIME rm -f $CONTAINER"

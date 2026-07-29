@@ -240,6 +240,10 @@ def cmd_query(a):
             results.append(('row', desc, cql, ms, (out, err)))
     cluster.shutdown()
     emit_html(a, results, rows_per_series)
+    if a.md_out:
+        with open(a.md_out, 'w') as fh:
+            emit_md(a, results, rows_per_series, fh)
+        sys.stderr.write('   markdown report written to %s\n' % a.md_out)
 
 
 def emit_html(a, results, rows_per_series):
@@ -299,6 +303,40 @@ def emit_html(a, results, rows_per_series):
     w('</table>\n')
 
 
+def emit_md(a, results, rows_per_series, out):
+    total = a.series * rows_per_series
+    thr = total / a.load_secs if a.load_secs else 0
+    w = out.write
+    w('# time-series CQL scale test\n\n')
+    w('image `%s` · single node in a container · %s\n\n'
+      % (a.image, time.strftime('%Y-%m-%d %H:%M UTC', time.gmtime())))
+    w('- **%s** rows loaded\n' % f'{total:,}')
+    w('- **%s** partitions (%s rows each)\n' % (f'{a.series:,}', f'{rows_per_series:,}'))
+    w('- **%s s** load time (%s rows/s)\n' % (f'{a.load_secs:,}', f'{int(thr):,}'))
+    w('\n## Query times\n\n| section | query | first result row | CQL time |\n|---|---|---|---|\n')
+    section = ''
+    for kind, desc, cql, ms, payload in results:
+        if kind == 'section':
+            section = desc
+            continue
+        out_text, err = payload
+        lines = (err or out_text).splitlines()
+        value = lines[2] if len(lines) > 2 else (lines[0] if lines else '')
+        w('| %s | %s | `%s` | **%s ms** |\n'
+          % (section, desc, value.replace('|', '\\|')[:60], f'{ms:,.0f}'))
+    w('\n## Details\n')
+    section = ''
+    for kind, desc, cql, ms, payload in results:
+        if kind == 'section':
+            section = desc
+            w('\n### %s\n' % section)
+            continue
+        out_text, err = payload
+        w('\n**%s** — `%s ms`\n' % (desc, f'{ms:,.0f}'))
+        w('\n```sql\n%s\n```\n' % cql)
+        w('\n```\n%s\n```\n' % (err or out_text))
+
+
 def main():
     p = argparse.ArgumentParser()
     sub = p.add_subparsers(dest='cmd', required=True)
@@ -309,6 +347,7 @@ def main():
         s.add_argument('--loaders', type=int, default=12)
         s.add_argument('--load-secs', type=int, default=0)
         s.add_argument('--image', default='cassandra-timeseries:6.0.0')
+        s.add_argument('--md-out', default='', help='also write a Markdown report to this path')
     a = p.parse_args()
     (cmd_load if a.cmd == 'load' else cmd_query)(a)
 

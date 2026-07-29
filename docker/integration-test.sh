@@ -65,13 +65,15 @@ BASELINE=$(baseline_ms)
 
 # HTML report (CI artifact): every assertion with the CQL it ran and the rows it got back.
 REPORT="${IT_REPORT:-build/timeseries-it-report.html}"
-ROWS=$(mktemp)
-trap 'cleanup; rm -f "$ROWS"' EXIT
+REPORT_MD="${IT_REPORT_MD:-${REPORT%.html}.md}"
+ROWS=$(mktemp); MDROWS=$(mktemp)
+trap 'cleanup; rm -f "$ROWS" "$MDROWS"' EXIT
 esc() { sed -e 's/&/\&amp;/g' -e 's/</\&lt;/g' -e 's/>/\&gt;/g'; }
 
 section() {
     printf '%s\n' "-- $1"
     printf '<tr class="section"><td colspan="5">%s</td></tr>\n' "$(printf '%s' "$1" | esc)" >> "$ROWS"
+    printf '\n## %s\n' "$1" >> "$MDROWS"
 }
 
 PASS=0; FAIL=0
@@ -103,6 +105,11 @@ check() {
             "$(printf '%s' "$out" | grep -vE '^[[:space:]]*$' | esc)" \
             "$ms"
     } >> "$ROWS"
+    {
+        printf '\n### %s %s — `%s ms`\n\n```sql\n%s\n```\n\n```\n%s\n```\n' \
+            "$([ "$status" = FAIL ] && echo '❌' || echo '✅')" "$desc" "$ms" "$flat" \
+            "$(printf '%s\n' "$out" | grep -vE '^[[:space:]]*$')"
+    } >> "$MDROWS"
     return 0
 }
 
@@ -161,7 +168,21 @@ HTML
         cat "$ROWS"
         printf '</table>\n'
     } > "$REPORT"
-    echo "   HTML report: $REPORT"
+
+    # Markdown twin of the same report — this is the copy that gets committed and linked
+    # from the README, since GitLab renders Markdown but not HTML blobs.
+    {
+        printf '# time-series CQL integration test\n\n'
+        printf 'image `%s` · runtime `%s` · %s\n\n' "$IMAGE" "$RUNTIME" "$(date -u '+%Y-%m-%d %H:%M UTC')"
+        printf '**%s passed, %s failed** — assertions run against a live node booted from the image.\n\n' \
+            "$PASS" "$FAIL"
+        printf '> Times are the full cqlsh round trip for one query; a trivial query on this host costs\n'
+        printf '> %s ms of that (process startup + connect), so subtract roughly that much to read the CQL\n' "$BASELINE"
+        printf '> execution time. Server-side timings on a 100M-row data set are in the scale-test report.\n'
+        cat "$MDROWS"
+    } > "$REPORT_MD"
+    echo "   report: $REPORT"
+    echo "   report: $REPORT_MD"
 }
 
 section "schema & fixture data"

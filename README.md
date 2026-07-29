@@ -12,6 +12,8 @@
 | [시계열 함수 설계 (timeseries-functions-design.md)](doc/timeseries/timeseries-functions-design.md) | 각 함수의 시그니처·의미론(semantics), 분산 환경에서의 정확성, 코드 위치 |
 | [Gap-Fill 설계 (gapfill-design.md)](doc/timeseries/gapfill-design.md) | `time_bucket_gapfill`의 CQL 문법, 보간 규칙, 가드레일 |
 | [Continuous Aggregates 설계 (continuous-aggregates-design.md)](doc/timeseries/continuous-aggregates-design.md) | 시간 버킷 롤업(연속 집계) 설계안 — 진행 중 |
+| [통합 테스트 보고서](doc/timeseries/integration-test-report.md) | 실제 컨테이너에서 실행한 32개 검증의 CQL·결과·소요 시간 |
+| [스케일 테스트 보고서 (1억 건)](doc/timeseries/scale-test-report.md) | 1억 행 적재 후 측정한 쿼리별 CQL 실행 시간 |
 
 전체 문서 디렉터리: [doc/timeseries/](doc/timeseries/)
 
@@ -362,7 +364,7 @@ docker build -t cassandra-timeseries:6.0.0 -f docker/Dockerfile .
 ./docker/integration-test.sh cassandra-timeseries:6.0.0     # CONTAINER_RUNTIME=podman 도 지원
 ```
 
-실행하면 항목·CQL·결과가 그대로 출력되고, `build/timeseries-it-report.html`에 HTML 보고서가 생성됩니다(예시: [doc/timeseries/integration-test-report.html](doc/timeseries/integration-test-report.html)).
+실행하면 항목·CQL·결과가 그대로 출력되고, `build/timeseries-it-report.html`(+ 같은 내용의 `.md`)에 보고서가 생성됩니다. **실행 결과 예시: [통합 테스트 보고서](doc/timeseries/integration-test-report.md)** — 32개 검증의 CQL·응답·소요 시간이 그대로 들어 있습니다.
 
 CI에서는 태그를 밀면 `docker-image → docker-integration-test → docker-image-publish + release` 순서로 자동 실행되며, **이 테스트가 통과해야만** 이미지 배포와 릴리스가 진행됩니다. 기본 브랜치에서는 이미지 빌드 비용 때문에 수동(manual) 실행입니다.
 
@@ -376,7 +378,7 @@ SCALE_ROWS=100000000 SCALE_SERIES=1000 SCALE_LOADERS=16 SCALE_HEAP=16G \
 # 적재된 데이터를 재사용해 쿼리만 다시 재기: SCALE_SKIP_LOAD=1
 ```
 
-결과는 `build/timeseries-scale-report.html` (예시: [doc/timeseries/scale-test-report.html](doc/timeseries/scale-test-report.html)).
+결과는 `build/timeseries-scale-report.html`(+ 같은 내용의 `.md`)에 생성됩니다. **실행 결과 예시: [스케일 테스트 보고서 (1억 건)](doc/timeseries/scale-test-report.md)** — 쿼리별 CQL 실행 시간이 요약표로 정리돼 있습니다.
 
 주의: 수백만 행 이상을 집계하려면 서버 타임아웃을 올려야 합니다. `read/range_request_timeout`뿐 아니라 **`native_transport_timeout`(기본 12초)** 이 요청 전체를 자르므로 이 값도 함께 올려야 하며, 이 키는 기본 `cassandra.yaml`에 없어서 추가해야 합니다. 스크립트가 이 설정을 대신 해 줍니다.
 
