@@ -1,9 +1,17 @@
 # CI for cassandra-timeseries: Apache Cassandra 6.0.0 + time-series functions.
-# Builds apache-cassandra-6.0.0.jar with Ant and runs the time-series unit tests.
+# Builds apache-cassandra-6.0.0.jar with Ant, runs the time-series unit tests, then boots the
+# Docker image and runs the time-series CQL integration test before anything is released.
+#
+# Release path (tag push) is fully automatic and gated:
+#   build-jar -> timeseries-tests -> docker-image -> docker-integration-test -> docker-image-publish + release
+# On the default branch the docker chain is manual (a full image build is expensive); play
+# docker-image to run it.
 
 stages:
   - build
   - test
+  - image
+  - integration
   - release
 
 workflow:
@@ -55,7 +63,7 @@ timeseries-tests:
 #     | podman load   # or: docker load
 #   ./gradlew integrationTest -Pcassandra.image=cassandra-timeseries:6.0.0
 docker-image:
-  stage: release
+  stage: image
   timeout: 90m
   needs: []
   image:
@@ -81,6 +89,41 @@ docker-image:
       - cassandra-timeseries-6.0.0-docker.tar
     expire_in: 3 days
 
+# Release gate: boot the image that is about to be published and run the time-series CQL
+# integration test against it (docker/integration-test.sh). Nothing is published or released
+# unless this passes. Needs a Docker daemon, hence the dind service.
+docker-integration-test:
+  stage: integration
+  timeout: 60m
+  needs:
+    - job: docker-image
+      artifacts: true
+  image: docker:27-cli
+  services:
+    - name: docker:27-dind
+      alias: docker
+  variables:
+    DOCKER_HOST: tcp://docker:2376
+    DOCKER_TLS_CERTDIR: "/certs"
+    DOCKER_CERT_PATH: "/certs/client"
+    DOCKER_TLS_VERIFY: 1
+  before_script: []
+  # Mirrors docker-image's rules — see the comment on docker-image-publish.
+  rules:
+    - if: $CI_COMMIT_TAG
+    - if: $CI_COMMIT_BRANCH == $CI_DEFAULT_BRANCH
+      when: manual
+      allow_failure: true
+  script:
+    - docker load -i cassandra-timeseries-6.0.0-docker.tar
+    - ./docker/integration-test.sh cassandra-timeseries:6.0.0
+  artifacts:
+    name: "timeseries-integration-test-report"
+    when: always
+    paths:
+      - build/timeseries-it-report.html
+    expire_in: 1 month
+
 # Upload the image tarball to the generic package registry so it has a stable, tokened download URL
 # (job artifacts expire; packages do not).
 docker-image-publish:
@@ -89,13 +132,20 @@ docker-image-publish:
   needs:
     - job: docker-image
       artifacts: true
+    - job: docker-integration-test
+      artifacts: false
   image:
     name: curlimages/curl:8.10.1
     entrypoint: [""]
   before_script: []
+  # Must mirror docker-image's rules: it needs docker-image's artifact, and a job that needs an
+  # optional manual job is created as "skipped" if that manual job has not run — so with plain
+  # on_success rules here this job could never run on the default branch, only on tags.
   rules:
     - if: $CI_COMMIT_TAG
     - if: $CI_COMMIT_BRANCH == $CI_DEFAULT_BRANCH
+      when: manual
+      allow_failure: true
   script:
     # Folded block scalar: a plain scalar cannot contain ": " (the JOB-TOKEN header), which broke the pipeline.
     - >-
@@ -111,6 +161,8 @@ release:
     - if: $CI_COMMIT_TAG
   needs:
     - job: build-jar
+      artifacts: false
+    - job: docker-integration-test
       artifacts: false
   script:
     - echo "Releasing $CI_COMMIT_TAG"

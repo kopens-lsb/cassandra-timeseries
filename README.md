@@ -353,6 +353,19 @@ GROUP  BY series, time_bucket(1h, ts);
 
 빌드 산출물은 항상 `apache-cassandra-6.0.0.jar`입니다(`base.version`이 6.0.0으로 고정되어 있습니다).
 
+## 통합 테스트 (릴리스 게이트)
+
+유닛 테스트는 함수를 프로세스 안에서 검증하지만, [docker/integration-test.sh](docker/integration-test.sh)는 **실제 이미지를 띄워** 스키마 생성부터 읽기 경로·집계·네이티브 프로토콜까지 통과하는 시계열 CQL 결과를 손으로 계산한 값과 대조합니다(32개 검증).
+
+```bash
+docker build -t cassandra-timeseries:6.0.0 -f docker/Dockerfile .
+./docker/integration-test.sh cassandra-timeseries:6.0.0     # CONTAINER_RUNTIME=podman 도 지원
+```
+
+실행하면 항목·CQL·결과가 그대로 출력되고, `build/timeseries-it-report.html`에 HTML 보고서가 생성됩니다(예시: [doc/timeseries/integration-test-report.html](doc/timeseries/integration-test-report.html)).
+
+CI에서는 태그를 밀면 `docker-image → docker-integration-test → docker-image-publish + release` 순서로 자동 실행되며, **이 테스트가 통과해야만** 이미지 배포와 릴리스가 진행됩니다. 기본 브랜치에서는 이미지 빌드 비용 때문에 수동(manual) 실행입니다.
+
 ## CI 및 릴리스
 
 - 푸시할 때마다 jar를 빌드하고 시계열 테스트 스위트를 실행합니다(`.gitlab-ci.yml`).

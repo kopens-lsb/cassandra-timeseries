@@ -15,6 +15,11 @@ COPY . .
 RUN ANT_OPTS=-Xmx4g ant _artifacts-init -Dno-checkstyle=true
 
 FROM eclipse-temurin:21-jre-jammy
+# python3 is required by the bundled cqlsh — used by the integration test, by Testcontainers
+# wait strategies and by anyone shelling into the container.
+RUN apt-get update -qq \
+    && apt-get install -y -qq --no-install-recommends python3 \
+    && rm -rf /var/lib/apt/lists/*
 ENV CASSANDRA_HOME=/opt/cassandra \
     CASSANDRA_CONF=/opt/cassandra/conf \
     PATH=/opt/cassandra/bin:$PATH
