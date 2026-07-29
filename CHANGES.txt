@@ -5,6 +5,13 @@
  * Allow nodetool garbagecollect to take a user defined list of SSTables (CASSANDRA-16767)
  * Add a guardrail for misprepared statements (CASSANDRA-21139)
 Merged from 6.0:
+ * Avoid megamorphic calls for Cell.timestamp/ttl/path/localDeletionTimeAsUnsignedInt methods (CASSANDRA-21526)
+ * Allow unreserved keywords as user and identity names in USER and IDENTITY statements (CASSANDRA-21510)
+ * Reduce allocations in DefaultQueryOptions (CASSANDRA-21467)
+ * Coordinator load-shedding returns OverloadedException without setting streamId, misrouting query responses (CASSANDRA-21508)
+ * Reduce number of scheduledTasks on metric id release in ThreadLocalMetrics (CASSANDRA-21475)
+ * Cache various Enum.values() used in deserialization to avoid per-read array allocation (CASSANDRA-21528)
+ * Fix Accord transaction error message when altering a table (CASSANDRA-20580)
  * Depend only on platform-specific Zstd JNI native libraries (CASSANDRA-21483)
  * Expose immediately-executed tasks in the queries virtual table (CASSANDRA-21471)
  * Avoid potential deadlock between GlobalLogFollower and GossipStage (CASSANDRA-21384)
@@ -75,6 +82,7 @@ Merged from 5.0:
  * Fix a removed TTLed row re-appearance in a materialized view after a cursor compaction (CASSANDRA-21152)
  * Rework ZSTD dictionary compression logic to create a trainer per training (CASSANDRA-21209)
 Merged from 5.0:
+ * SAI Component Checksum Validation Should be Segment-Aware (CASSANDRA-21516)
  * Support Python 3.12 and 3.13 in cqlsh (CASSANDRA-20997)
  * Make synchronization on VectorMemoryIndex inserts more granular (CASSANDRA-21160)
  * putShortVolatile is not volatile in InMemoryTrie (CASSANDRA-21353)
@@ -87,6 +95,8 @@ Merged from 4.1:
  * Add Paxos v2 option and informatin in cassandra.yaml (CASSANDRA-21316)
  * Harden data resurrection startup check with atomic heartbeat file write with fallback (CASSANDRA-21290)
 Merged from 4.0:
+ * Bound declared value length against readable bytes in CBUtil (CASSANDRA-21521)
+ * Verify extension type before initializing reflectively-loaded classes (CASSANDRA-21525)
  * Rename conflicting nodetool import --copy-data short option from -p to -cd (CASSANDRA-20214)
  * Fix PasswordObfuscator failing to obfuscate certain passwords (CASSANDRA-21113)
  * Fix negative memtable allocator ownership when an update is shadowed by an existing row deletion (CASSANDRA-21469)
