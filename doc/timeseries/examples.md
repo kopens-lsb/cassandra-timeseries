@@ -48,8 +48,9 @@ All examples are runnable in `cqlsh`. Function reference (argument order matters
 
 ## 1. Schema and sample data
 
-A canonical time-series table: one partition per series, clustered by time. `TimeWindowCompactionStrategy`
-groups SSTables by time window so old windows can be dropped whole when they expire.
+A canonical time-series table: one partition per series, clustered by time. Compaction uses Cassandra 6.0's
+`UnifiedCompactionStrategy` (UCS): tiered scaling parameters suit append-only ingest, and fully expired
+SSTables are dropped whole on the expiry check interval.
 
 ```sql
 CREATE KEYSPACE IF NOT EXISTS ts
@@ -63,9 +64,10 @@ CREATE TABLE metrics (
     value  double,
     PRIMARY KEY (series, ts)
 ) WITH CLUSTERING ORDER BY (ts ASC)
-   AND compaction = {'class': 'TimeWindowCompactionStrategy',
-                     'compaction_window_unit': 'HOURS',
-                     'compaction_window_size': 1}
+   AND compaction = {'class': 'UnifiedCompactionStrategy',
+                     'scaling_parameters': 'T4',                        -- 4-way tiered (write-optimised)
+                     'target_sstable_size': '1GiB',
+                     'expired_sstable_check_frequency_seconds': 600}
    AND default_time_to_live = 2592000;   -- 30 days
 
 INSERT INTO metrics (series, ts, value) VALUES ('cpu', '2024-01-01 09:05:00+0000', 10);
@@ -221,7 +223,7 @@ GROUP  BY series, time_bucket(1h, ts);
 CREATE TABLE counters (
     series text, ts timestamp, total counter,
     PRIMARY KEY (series, ts)
-);                                     -- counters cannot use TWCS/TTL; shown for the query shape
+);                                     -- counters cannot use TTL; shown for the query shape
 
 -- Requests per second over each minute. counter_rate compensates for counter resets (use it, not rate(),
 -- for monotonic counters); rate() would treat a reset as a large negative step.
@@ -319,6 +321,7 @@ GROUP  BY series, time_bucket(1h, ts);
   cheapest within a single partition ordered by `ts`.
 - Keep partitions bounded: for high-rate series, include a coarse time bucket in the partition key,
   e.g. `PRIMARY KEY ((series, day), ts)`, to avoid unbounded partitions.
-- Use `default_time_to_live` aligned with the TWCS window so expired windows are dropped efficiently.
+- Use UCS with tiered scaling parameters (e.g. `'T4'`) plus `default_time_to_live`; fully expired SSTables
+  are then reclaimed whole on the `expired_sstable_check_frequency_seconds` interval.
 - `time_bucket(interval, ts)` must appear as the trailing `GROUP BY` element (after the partition key
   columns) for the grouping to be pushed into the read path.

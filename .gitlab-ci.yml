@@ -97,7 +97,9 @@ docker-image-publish:
     - if: $CI_COMMIT_TAG
     - if: $CI_COMMIT_BRANCH == $CI_DEFAULT_BRANCH
   script:
-    - curl --fail --silent --show-error -H "JOB-TOKEN: $CI_JOB_TOKEN"
+    # Folded block scalar: a plain scalar cannot contain ": " (the JOB-TOKEN header), which broke the pipeline.
+    - >-
+      curl --fail --silent --show-error -H "JOB-TOKEN: $CI_JOB_TOKEN"
       --upload-file cassandra-timeseries-6.0.0-docker.tar
       "$CI_API_V4_URL/projects/$CI_PROJECT_ID/packages/generic/cassandra-timeseries-docker/${CI_COMMIT_TAG:-6.0.0}/cassandra-timeseries-6.0.0-docker.tar"
 

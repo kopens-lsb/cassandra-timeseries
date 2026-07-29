@@ -47,7 +47,7 @@
 
 ## 1. 스키마와 샘플 데이터
 
-시계열의 정석 스키마입니다. 시리즈당 파티션 하나, 시간으로 클러스터링. `TimeWindowCompactionStrategy`(TWCS)는 SSTable을 시간 창 단위로 묶어서, 만료된 창을 통째로 삭제할 수 있게 해줍니다.
+시계열의 정석 스키마입니다. 시리즈당 파티션 하나, 시간으로 클러스터링. 컴팩션은 Cassandra 6.0의 통합 전략인 `UnifiedCompactionStrategy`(UCS)를 씁니다 — 쓰기 위주(append-only) 시계열에는 tiered 쪽 스케일링 파라미터가 맞고, TTL로 만료된 SSTable은 주기적으로 통째 삭제됩니다.
 
 ```sql
 CREATE KEYSPACE IF NOT EXISTS ts
@@ -61,9 +61,10 @@ CREATE TABLE metrics (
     value  double,
     PRIMARY KEY (series, ts)
 ) WITH CLUSTERING ORDER BY (ts ASC)
-   AND compaction = {'class': 'TimeWindowCompactionStrategy',
-                     'compaction_window_unit': 'HOURS',
-                     'compaction_window_size': 1}
+   AND compaction = {'class': 'UnifiedCompactionStrategy',
+                     'scaling_parameters': 'T4',                        -- tiered(쓰기 최적) 4-way
+                     'target_sstable_size': '1GiB',
+                     'expired_sstable_check_frequency_seconds': 600}
    AND default_time_to_live = 2592000;   -- 30일
 
 INSERT INTO metrics (series, ts, value) VALUES ('cpu', '2024-01-01 09:05:00+0000', 10);
@@ -71,6 +72,19 @@ INSERT INTO metrics (series, ts, value) VALUES ('cpu', '2024-01-01 09:35:00+0000
 INSERT INTO metrics (series, ts, value) VALUES ('cpu', '2024-01-01 10:15:00+0000', 50);
 INSERT INTO metrics (series, ts, value) VALUES ('cpu', '2024-01-01 10:45:00+0000', 70);
 ```
+
+### 1.1 UCS 컴팩션 옵션 요약
+
+Cassandra 6.0의 UCS는 STCS/LCS/TWCS를 하나의 전략으로 통합했습니다. 시계열에서 중요한 옵션은 다음과 같습니다.
+
+| 옵션 | 설명 |
+| --- | --- |
+| `scaling_parameters` | `T4` = 4-way tiered(쓰기 최적, 시계열 수집에 적합), `L10` = 10-way leveled(읽기 최적), `N` = 중간. 레벨별로 `'T4, T4, L10'`처럼 콤마로 나열 가능 |
+| `target_sstable_size` | 샤딩된 SSTable의 목표 크기(예: `1GiB`). 컴팩션 단위를 잘게 유지해 만료 데이터 회수를 빠르게 함 |
+| `base_shard_count` | 최하위 레벨의 샤드 수. 병렬 컴팩션 정도를 결정 |
+| `expired_sstable_check_frequency_seconds` | 전부 만료된 SSTable을 찾아 통째로 버리는 주기(기본 600초) |
+
+TTL로 오래된 데이터를 버리는 시계열이라면 `default_time_to_live`를 지정하고 위 검사 주기를 짧게 유지하면, 만료된 SSTable이 컴팩션 없이 바로 회수됩니다.
 
 ## 2. 버킷팅 · 다운샘플링 — `time_bucket`
 
@@ -218,7 +232,7 @@ GROUP  BY series, time_bucket(1h, ts);
 CREATE TABLE counters (
     series text, ts timestamp, total counter,
     PRIMARY KEY (series, ts)
-);                                     -- counter 테이블은 TWCS/TTL 불가. 쿼리 형태만 참고.
+);                                     -- counter 테이블은 TTL 불가. 쿼리 형태만 참고.
 
 -- 분당 초당 요청 수
 SELECT time_bucket(1m, ts) AS minute, counter_rate(total, ts) AS req_per_sec
@@ -324,7 +338,7 @@ GROUP  BY series, time_bucket(1h, ts);
 
 - **항상 파티션을 지정하세요**(`WHERE series = ...`) 그리고 시간 범위도 함께. 시계열 스캔은 `ts`로 정렬된 단일 파티션 안에서 가장 저렴합니다.
 - **파티션 크기를 제한하세요.** 고빈도 시리즈라면 파티션 키에 굵은 시간 버킷을 넣어 무한정 커지는 파티션을 막습니다. 예: `PRIMARY KEY ((series, day), ts)`.
-- `default_time_to_live`를 TWCS 창 크기에 맞추면 만료된 창이 효율적으로 통째 삭제됩니다.
+- **UCS 컴팩션**을 쓰고(`scaling_parameters: 'T4'` 같은 tiered 설정), `default_time_to_live`로 보존 기간을 지정하세요. 만료된 SSTable은 `expired_sstable_check_frequency_seconds` 주기로 통째 회수됩니다.
 - `time_bucket(interval, ts)`는 `GROUP BY`의 마지막 요소(파티션 키 컬럼들 뒤)여야 그룹핑이 읽기 경로로 푸시다운됩니다.
 
 ---
