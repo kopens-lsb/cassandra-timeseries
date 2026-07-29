@@ -54,6 +54,15 @@ fi
 
 cql() { $RUNTIME exec "$CONTAINER" cqlsh --no-color -e "$1" 2>&1; }
 
+# Each check runs its own cqlsh, so a fixed startup cost sits in every measurement. Measure it
+# once on a trivial query and report it, so the per-check numbers can be read honestly.
+baseline_ms() {
+    local t0 t1
+    t0=$(date +%s%3N); cql "SELECT key FROM system.local;" > /dev/null 2>&1; t1=$(date +%s%3N)
+    echo $((t1 - t0))
+}
+BASELINE=$(baseline_ms)
+
 # HTML report (CI artifact): every assertion with the CQL it ran and the rows it got back.
 REPORT="${IT_REPORT:-build/timeseries-it-report.html}"
 ROWS=$(mktemp)
@@ -62,7 +71,7 @@ esc() { sed -e 's/&/\&amp;/g' -e 's/</\&lt;/g' -e 's/>/\&gt;/g'; }
 
 section() {
     printf '%s\n' "-- $1"
-    printf '<tr class="section"><td colspan="4">%s</td></tr>\n' "$(printf '%s' "$1" | esc)" >> "$ROWS"
+    printf '<tr class="section"><td colspan="5">%s</td></tr>\n' "$(printf '%s' "$1" | esc)" >> "$ROWS"
 }
 
 PASS=0; FAIL=0
@@ -70,26 +79,29 @@ PASS=0; FAIL=0
 # Prints the assertion, the CQL it ran and the rows it got back, so a CI log (or a reviewer)
 # can see exactly what was executed and what the node answered.
 check() {
-    local desc="$1" query="$2" expect="$3" out status
+    local desc="$1" query="$2" expect="$3" out status t0 t1 ms
+    t0=$(date +%s%3N)
     out=$(cql "$query")
+    t1=$(date +%s%3N); ms=$((t1 - t0))
     if printf '%s' "$out" | grep -qE -- "$expect"; then
         PASS=$((PASS + 1)); status="ok  "
     else
         FAIL=$((FAIL + 1)); status="FAIL"
     fi
     local flat; flat=$(printf '%s' "$query" | tr '\n' ' ' | tr -s ' ')
-    printf '\n   [%s] %s\n' "$status" "$desc"
+    printf '\n   [%s] %-56s %6s ms\n' "$status" "$desc" "$ms"
     printf '        cql> %s\n' "$flat"
     printf '%s\n' "$out" | grep -vE '^[[:space:]]*$' | sed 's/^/        /'
     [ "$status" = FAIL ] && printf '        !! expected to match: /%s/\n' "$expect"
 
     {
-        printf '<tr class="%s"><td class="st">%s</td><td>%s</td><td><pre>%s</pre></td><td><pre>%s</pre></td></tr>\n' \
+        printf '<tr class="%s"><td class="st">%s</td><td>%s</td><td><pre>%s</pre></td><td><pre>%s</pre></td><td class="ms">%s ms</td></tr>\n' \
             "$([ "$status" = FAIL ] && echo fail || echo pass)" \
             "$([ "$status" = FAIL ] && echo '✗ FAIL' || echo '✓ pass')" \
             "$(printf '%s' "$desc" | esc)" \
             "$(printf '%s' "$flat" | esc)" \
-            "$(printf '%s' "$out" | grep -vE '^[[:space:]]*$' | esc)"
+            "$(printf '%s' "$out" | grep -vE '^[[:space:]]*$' | esc)" \
+            "$ms"
     } >> "$ROWS"
     return 0
 }
@@ -125,7 +137,10 @@ write_report() {
   tr.fail { background:color-mix(in srgb, var(--fail) 8%, transparent); }
   pre { margin:0; background:var(--code); padding:.5rem .6rem; border-radius:6px; overflow-x:auto;
         font:12px/1.45 ui-monospace,SFMono-Regular,Menlo,monospace; white-space:pre; }
-  td:nth-child(3) { width:34%; } td:nth-child(4) { width:38%; }
+  td.ms { white-space:nowrap; text-align:right; font-variant-numeric:tabular-nums; color:var(--muted); }
+  th { color:var(--muted); font-weight:600; font-size:.78rem; text-transform:uppercase; letter-spacing:.04em;
+       text-align:left; padding:.4rem .6rem; }
+  td:nth-child(3) { width:32%; } td:nth-child(4) { width:34%; }
 </style>
 <h1>time-series CQL integration test</h1>
 <div class="meta">
@@ -136,7 +151,12 @@ write_report() {
   <span><b class="fail-n">$FAIL</b> failed</span>
   <span style="color:var(--muted)">assertions run against a live node booted from the image</span>
 </div>
+<p class="meta">Times are the full cqlsh round trip for one query; a trivial query on this host
+costs <b>${BASELINE} ms</b> of that (process startup + connect), so subtract roughly that much
+to read the CQL execution time. Server-side timings on a 100M-row data set are in the
+scale-test report.</p>
 <table>
+<tr><th></th><th>assertion</th><th>cql</th><th>result</th><th>elapsed</th></tr>
 HTML
         cat "$ROWS"
         printf '</table>\n'
