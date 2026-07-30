@@ -74,3 +74,21 @@ Compression for Time Series Databases." PVLDB 15(11), 2022. **클린룸 구현**
   패턴: 양자화 워크(0.1), 양자화 주기(sin 0.1 반올림), 상수, 풀정밀 워크, 임의 비트.
   JUnit 측정 테스트가 수치를 출력하고, 문서는 그 출력으로 작성.
 - ALP는 범위 외(v3 후보로만 기록).
+
+## 5. 구현 완료 노트 (2026-07-31) 및 SP2 인계
+
+커밋 `55c058d..eca361dca8` 완료 (최종 리뷰 APPROVED + 수정 웨이브). 테스트: Chimp128CodecTest 20,
+ChunkCodecsTest 4, Gorilla 회귀 18 — CI 배선됨. bake-off 결과(`doc/timeseries/codec-bakeoff.md`):
+양자화 워크 -68.9%, 양자화 주기 -61.3% (기준 30% 상회), 상수 5배 손해(링 인덱스 고유 비용) →
+**기본 승격 보류, 명시 옵션**. SP2 권고 정책: `chunk_codec: auto` — 창마다 양쪽 인코딩 후 작은 쪽
+저장(버전 바이트가 구분자, encode 비용 창당 ms 단위).
+
+SP2가 인수할 것 (최종 리뷰 지시):
+- **태스크 0: `SampleCursor` 최상위 추출** (`db/timeseries/SampleCursor.java`) — 현재
+  `GorillaCodec.SampleCursor`에 묶여 있어 SP2 전 파일이 GorillaCodec를 임포트하게 됨.
+  Gorilla의 중첩 인터페이스는 이를 extends 해 소스 호환 유지.
+- `ChunkCodecs`에 `HEADER_SIZE`/`MAX_SAMPLES` 상수 통합 + `Codec codecOf(ByteBuffer)` 추가.
+- 인코더 고정비용: encode()마다 64KB(int[2^14]) 할당+fill — 작은 창 다수 재인코딩 시 지배적.
+  재사용 인코더 객체 또는 thread-local 스크래치 검토.
+- `encode`는 배치 전용(스트리밍 어펜드 없음) — seal-on-flush 설계면 무영향.
+- auto 정책 확정 후 `encodeSmallest` 헬퍼 추가(조기 헬퍼로 이중 인코딩을 강제하지 말 것).
