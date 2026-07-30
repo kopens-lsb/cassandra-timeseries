@@ -74,6 +74,76 @@ public class GorillaCodecTest
         assertRoundtrip(timestamps, values, n);
     }
 
+    @Test
+    public void specialValuesRoundtripBitExactly()
+    {
+        long[] timestamps = { 1L, 2L, 3L, 4L, 5L, 6L, 7L };
+        double[] values = { Double.NaN, Double.POSITIVE_INFINITY, Double.NEGATIVE_INFINITY,
+                            -0.0, 0.0, Double.MIN_VALUE, Double.MAX_VALUE };
+        assertRoundtrip(timestamps, values, values.length);
+    }
+
+    @Test
+    public void singleSampleRoundtrip()
+    {
+        assertRoundtrip(new long[]{ 1_700_000_000_000L }, new double[]{ 3.14 }, 1);
+    }
+
+    @Test
+    public void irregularGapsIncludingLargeOnesRoundtrip()
+    {
+        // 밀리초·초·시간·여러 날 갭이 섞인 불규칙 시계열 (dod 전 버킷 + 64비트 escape 경유)
+        long[] timestamps = { 0L, 1L, 1001L, 1002L, 3_600_000L, 3_600_050L, 90_000_000_000L };
+        double[] values = { 1, 2, 3, 4, 5, 6, 7 };
+        assertRoundtrip(timestamps, values, timestamps.length);
+    }
+
+    @Test(expected = IllegalArgumentException.class)
+    public void rejectsOutOfOrderTimestamps()
+    {
+        GorillaCodec.encode(new long[]{ 1000L, 999L }, new double[]{ 1, 2 }, 2);
+    }
+
+    @Test(expected = IllegalArgumentException.class)
+    public void rejectsDuplicateTimestamps()
+    {
+        GorillaCodec.encode(new long[]{ 1000L, 1000L }, new double[]{ 1, 2 }, 2);
+    }
+
+    @Test(expected = IllegalArgumentException.class)
+    public void rejectsZeroCount()
+    {
+        GorillaCodec.encode(new long[0], new double[0], 0);
+    }
+
+    @Test(expected = IllegalArgumentException.class)
+    public void rejectsUnknownVersion()
+    {
+        ByteBuffer payload = GorillaCodec.encode(new long[]{ 1L }, new double[]{ 1.0 }, 1);
+        payload.put(payload.position(), (byte) 99);
+        GorillaCodec.cursor(payload);
+    }
+
+    @Test(expected = RuntimeException.class)
+    public void truncatedPayloadFailsInsteadOfReturningGarbage()
+    {
+        long[] timestamps = new long[100];
+        double[] values = new double[100];
+        for (int i = 0; i < 100; i++)
+        {
+            timestamps[i] = i * 1000L;
+            values[i] = i * 0.1;
+        }
+        ByteBuffer payload = GorillaCodec.encode(timestamps, values, 100);
+        payload.limit(payload.limit() - 10);   // 뒤 10바이트 절단
+
+        GorillaCodec.SampleCursor cursor = GorillaCodec.cursor(payload);
+        while (cursor.advance())
+        {
+            // 절단 지점에서 IndexOutOfBoundsException(RuntimeException) 이 나야 한다
+        }
+    }
+
     static void assertRoundtrip(long[] timestamps, double[] values, int count)
     {
         ByteBuffer payload = GorillaCodec.encode(timestamps, values, count);
