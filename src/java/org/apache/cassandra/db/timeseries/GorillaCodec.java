@@ -237,7 +237,7 @@ public final class GorillaCodec
         };
     }
 
-    private static void writeDod(BitWriter bits, long dod)
+    static void writeDod(BitWriter bits, long dod)
     {
         if (dod == 0)
         {
@@ -265,7 +265,7 @@ public final class GorillaCodec
         }
     }
 
-    private static long readDod(BitReader bits)
+    static long readDod(BitReader bits)
     {
         if (!bits.readBit())
             return 0;
