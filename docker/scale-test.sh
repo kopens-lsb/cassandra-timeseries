@@ -24,11 +24,20 @@ LOADERS="${SCALE_LOADERS:-12}"
 DATA="${SCALE_DATA:-/home/common/cassandra-ts-scale-data}"
 HEAP="${SCALE_HEAP:-16G}"
 REPORT="${SCALE_REPORT:-build/timeseries-scale-report.html}"
+GC="${SCALE_GC:-zgc}"                  # zgc (generational, as shipped) | g1
+PASSES="${SCALE_PASSES:-1}"            # query passes; the last one is the reported (warm) run
+WBENCH_ROWS="${SCALE_WBENCH_ROWS:-0}"  # if >0, also time a write of this many rows
 CONTAINER="cassandra-ts-scale"
 RUNTIME="${CONTAINER_RUNTIME:-docker}"
+# A reused data directory pins the node's address in cluster metadata, so the container needs a
+# stable IP: on the default bridge docker hands out whatever is free and the node then tries to
+# gossip with its former self and never reaches NORMAL. Hence a dedicated network + static IP.
+NET="${SCALE_NET:-ts-scale-net}"
+NET_SUBNET="${SCALE_NET_SUBNET:-172.30.0.0/16}"
+NODE_IP="${SCALE_NODE_IP:-172.30.0.10}"
 
 echo "== cassandra-timeseries scale test =="
-echo "   image=$IMAGE rows=$ROWS series=$SERIES loaders=$LOADERS heap=$HEAP"
+echo "   image=$IMAGE rows=$ROWS series=$SERIES loaders=$LOADERS heap=$HEAP gc=$GC passes=$PASSES"
 echo "   data=$DATA report=$REPORT"
 
 SKIP_LOAD="${SCALE_SKIP_LOAD:-0}"      # reuse an already-loaded data directory
@@ -39,8 +48,12 @@ mkdir -p "$(dirname "$REPORT")"
 
 # Aggregating over millions of rows takes longer than the stock request timeouts allow, so raise
 # them before the node starts. Everything else is the shipped configuration.
+$RUNTIME network inspect "$NET" > /dev/null 2>&1 \
+    || $RUNTIME network create --subnet "$NET_SUBNET" "$NET" > /dev/null
+
 $RUNTIME run -d --name "$CONTAINER" \
-    -e MAX_HEAP_SIZE="$HEAP" -e HEAP_NEWSIZE=4G \
+    --network "$NET" --ip "$NODE_IP" \
+    -e MAX_HEAP_SIZE="$HEAP" -e HEAP_NEWSIZE=4G -e GC_CHOICE="$GC" \
     -v "$DATA:/opt/cassandra/data" \
     --entrypoint bash "$IMAGE" -c '
         CFG="$CASSANDRA_CONF/cassandra.yaml"
@@ -53,6 +66,17 @@ $RUNTIME run -d --name "$CONTAINER" \
         grep -q "^native_transport_timeout:" "$CFG" \
             && sed -ri "s/^native_transport_timeout:.*/native_transport_timeout: 600s/" "$CFG" \
             || printf "\nnative_transport_timeout: 600s\n" >> "$CFG"
+        OPTS="$CASSANDRA_CONF/jvm21-server.options"
+        if [ "$GC_CHOICE" = g1 ]; then
+            # Turn the shipped generational-ZGC block off and the G1 block on, and restore
+            # compressed oops (the -UseCompressedOops line is a ZGC-only workaround).
+            sed -ri "s/^-XX:\+UseZGC/#-XX:+UseZGC/; s/^-XX:\+ZGenerational/#-XX:+ZGenerational/" "$OPTS"
+            sed -ri "s/^-XX:-UseCompressedOops/#-XX:-UseCompressedOops/" "$OPTS"
+            sed -ri "s/^#(-XX:\+UseG1GC|-XX:\+ParallelRefProcEnabled|-XX:MaxTenuringThreshold=2|-XX:G1HeapRegionSize=16m|-XX:\+UnlockExperimentalVMOptions|-XX:G1NewSizePercent=50|-XX:G1RSetUpdatingPauseTimePercent=5|-XX:MaxGCPauseMillis=300)$/\1/" "$OPTS"
+        fi
+        # safepoint logging is what makes the two collectors comparable: it records the actual
+        # stop-the-world time, which for ZGC is not visible in the plain gc lines.
+        printf "\n-Xlog:gc*,safepoint:file=%s/logs/gc.log:time,uptime:filecount=0\n" "$CASSANDRA_HOME" >> "$OPTS"
         exec docker-entrypoint.sh
     ' > /dev/null || { echo "FATAL: container did not start"; exit 2; }
 
@@ -100,17 +124,40 @@ $RUNTIME exec "$CONTAINER" nodetool flush scale metrics
 $RUNTIME exec "$CONTAINER" nodetool tablestats scale.metrics 2>/dev/null | grep -E "Space used \(live\)|Number of partitions" | head -2
 
 # ---------------------------------------------------------------- query + report
-echo "-- timing time-series queries"
-$RUNTIME exec "$CONTAINER" python3 /tmp/scale-workload.py query \
-    --rows "$ROWS" --series "$SERIES" --load-secs "$LOAD_SECS" --image "$IMAGE" \
-    --md-out /tmp/scale-report.md > "$REPORT"
-rc=$?
+echo "-- timing time-series queries ($PASSES pass(es), gc=$GC)"
+pass=1
+while [ "$pass" -le "$PASSES" ]; do
+    [ "$pass" -lt "$PASSES" ] && echo "   warm-up pass $pass/$PASSES"
+    $RUNTIME exec "$CONTAINER" python3 /tmp/scale-workload.py query \
+        --rows "$ROWS" --series "$SERIES" --load-secs "$LOAD_SECS" --image "$IMAGE" \
+        --md-out /tmp/scale-report.md --json-out /tmp/scale-results.json > "$REPORT"
+    rc=$?
+    [ $rc -eq 0 ] || break
+    pass=$((pass + 1))
+done
 
 if [ $rc -ne 0 ]; then
     echo "FATAL: query phase failed"; exit 1
 fi
 # The Markdown twin is the copy that gets committed (GitLab renders .md, not .html blobs).
 $RUNTIME cp "$CONTAINER:/tmp/scale-report.md" "${REPORT%.html}.md"
+$RUNTIME cp "$CONTAINER:/tmp/scale-results.json" "${REPORT%.html}.json"
+
+if [ "$WBENCH_ROWS" -gt 0 ]; then
+    echo "-- write benchmark: $WBENCH_ROWS rows into scale.wbench (gc=$GC)"
+    $RUNTIME exec "$CONTAINER" cqlsh -e "
+        DROP TABLE IF EXISTS scale.wbench;
+        CREATE TABLE scale.wbench (series text, ts timestamp, value double, PRIMARY KEY (series, ts))
+          WITH compaction = {'class':'UnifiedCompactionStrategy','scaling_parameters':'T4'};"
+    $RUNTIME exec "$CONTAINER" python3 /tmp/scale-workload.py load \
+        --rows "$WBENCH_ROWS" --series 200 --loaders "$LOADERS" --table wbench \
+        --json-out /tmp/wbench.json
+    $RUNTIME cp "$CONTAINER:/tmp/wbench.json" "${REPORT%.html}-write.json"
+fi
+
+# GC pause summary straight from the JVM log
+$RUNTIME exec "$CONTAINER" sh -c 'cat $CASSANDRA_HOME/logs/gc.log' > "${REPORT%.html}-gc.log" 2>/dev/null
+echo "   gc log: ${REPORT%.html}-gc.log"
 echo "   report: $REPORT"
 echo "   report: ${REPORT%.html}.md"
 echo "-- container '$CONTAINER' left running; remove with: $RUNTIME rm -f $CONTAINER"

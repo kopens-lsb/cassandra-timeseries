@@ -10,6 +10,7 @@ without any cqlsh/docker-exec startup in the way.
 """
 import argparse
 import datetime
+import json
 import glob
 import html
 import math
@@ -31,7 +32,7 @@ from cassandra.cluster import Cluster                      # noqa: E402
 from cassandra.query import BatchStatement, BatchType      # noqa: E402
 
 KEYSPACE = 'scale'
-TABLE = 'metrics'
+TABLE = 'metrics'          # overridden by --table
 EPOCH = datetime.datetime(2024, 1, 1, tzinfo=datetime.timezone.utc)
 BATCH_ROWS = 100          # rows per unlogged batch (stays under batch_size_warn_threshold)
 IN_FLIGHT = 96            # async batches in flight per loader process
@@ -54,11 +55,11 @@ def sample_value(i):
 
 
 def load_slice(args):
-    worker, total_series, rows_per_series = args
+    worker, total_series, rows_per_series, table = args
     loaders = LOADERS
     cluster, session = connect()
     insert = session.prepare(
-        "INSERT INTO %s.%s (series, ts, value) VALUES (?, ?, ?)" % (KEYSPACE, TABLE))
+        "INSERT INTO %s.%s (series, ts, value) VALUES (?, ?, ?)" % (KEYSPACE, table))
     written = 0
     started = time.time()
     pending = []
@@ -103,10 +104,13 @@ def cmd_load(a):
                                                     a.series * rows_per_series))
     started = time.time()
     with multiprocessing.Pool(a.loaders, initializer=_init_loaders, initargs=(a.loaders,)) as pool:
-        pool.map(load_slice, [(w, a.series, rows_per_series) for w in range(a.loaders)])
+        pool.map(load_slice, [(w, a.series, rows_per_series, a.table) for w in range(a.loaders)])
     elapsed = time.time() - started
     total = a.series * rows_per_series
     print('   loaded %d rows in %.0fs (%.0f rows/s)' % (total, elapsed, total / elapsed))
+    if a.json_out:
+        with open(a.json_out, 'w') as fh:
+            json.dump({'rows': total, 'seconds': elapsed, 'rows_per_sec': total / elapsed}, fh)
 
 
 def _init_loaders(n):
@@ -240,6 +244,15 @@ def cmd_query(a):
             results.append(('row', desc, cql, ms, (out, err)))
     cluster.shutdown()
     emit_html(a, results, rows_per_series)
+    if a.json_out:
+        with open(a.json_out, 'w') as fh:
+            json.dump({'image': a.image, 'rows': a.rows, 'series': a.series,
+                       'load_secs': a.load_secs,
+                       'queries': [{'section': None if k == 'row' else d,
+                                    'desc': d, 'cql': c, 'ms': ms,
+                                    'result': (p[0] if p else ''), 'error': (p[1] if p else None),
+                                    'kind': k}
+                                   for k, d, c, ms, p in results]}, fh, indent=1)
     if a.md_out:
         with open(a.md_out, 'w') as fh:
             emit_md(a, results, rows_per_series, fh)
@@ -348,6 +361,8 @@ def main():
         s.add_argument('--load-secs', type=int, default=0)
         s.add_argument('--image', default='cassandra-timeseries:6.0.0')
         s.add_argument('--md-out', default='', help='also write a Markdown report to this path')
+        s.add_argument('--json-out', default='', help='also write machine-readable results here')
+        s.add_argument('--table', default=TABLE, help='table to load into (write benchmark)')
     a = p.parse_args()
     (cmd_load if a.cmd == 'load' else cmd_query)(a)
 

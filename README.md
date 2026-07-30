@@ -14,6 +14,7 @@
 | [Continuous Aggregates 설계 (continuous-aggregates-design.md)](doc/timeseries/continuous-aggregates-design.md) | 시간 버킷 롤업(연속 집계) 설계안 — 진행 중 |
 | [통합 테스트 보고서](doc/timeseries/integration-test-report.md) | 실제 컨테이너에서 실행한 32개 검증의 CQL·결과·소요 시간 |
 | [스케일 테스트 보고서 (1억 건)](doc/timeseries/scale-test-report.md) | 1억 행 적재 후 측정한 쿼리별 CQL 실행 시간 |
+| [GC 비교: ZGC generational vs G1](doc/timeseries/gc-comparison.md) | 같은 1억 건 데이터로 두 GC의 쿼리 시간·쓰기 처리량 비교 |
 
 전체 문서 디렉터리: [doc/timeseries/](doc/timeseries/)
 
@@ -377,6 +378,8 @@ SCALE_ROWS=100000000 SCALE_SERIES=1000 SCALE_LOADERS=16 SCALE_HEAP=16G \
   ./docker/scale-test.sh cassandra-timeseries:6.0.0
 # 적재된 데이터를 재사용해 쿼리만 다시 재기: SCALE_SKIP_LOAD=1
 ```
+
+GC를 바꿔 비교할 수도 있습니다 — `SCALE_GC=g1`(기본은 `zgc`, `conf/jvm21-server.options`에 이미 generational ZGC가 켜져 있음), `SCALE_PASSES=2`(웜업 후 측정), `SCALE_WBENCH_ROWS=10000000`(쓰기 벤치). 두 실행 결과를 `docker/gc-compare.py <prefix-a> <prefix-b>`에 넣으면 비교표가 나옵니다 → **[GC 비교 결과](doc/timeseries/gc-comparison.md)**.
 
 결과는 `build/timeseries-scale-report.html`(+ 같은 내용의 `.md`)에 생성됩니다. **실행 결과 예시: [스케일 테스트 보고서 (1억 건)](doc/timeseries/scale-test-report.md)** — 쿼리별 CQL 실행 시간이 요약표로 정리돼 있습니다.
 
