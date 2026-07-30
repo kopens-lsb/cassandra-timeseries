@@ -27,6 +27,11 @@ import java.nio.ByteOrder;
  * to consume -- callers should not invoke {@code GorillaCodec}/{@code Chimp128Codec} directly.
  * Unrecognised version bytes throw {@link IllegalArgumentException}, matching the per-codec
  * behaviour these methods delegate to.
+ * <p>
+ * Payloads must span exactly one chunk (position..limit); corruption surfaces as
+ * {@link IllegalArgumentException}, {@link IndexOutOfBoundsException} or
+ * {@link java.nio.BufferUnderflowException} — callers must treat all three as a corrupt chunk.
+ * Buffers are read big-endian and never mutated.
  */
 public final class ChunkCodecs
 {

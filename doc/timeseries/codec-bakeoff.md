@@ -35,7 +35,7 @@ Spec §1 requires **both** of the following to promote chimp128 to the default c
 1. **>=30% bytes/sample reduction vs gorilla on quantized patterns** (quantized-walk-0.1,
    quantized-sine).
 2. **No more than +-10% regression (+ small fixed slack) on the constant pattern**, relative to
-   gorilla's measured 0.253 B/sample baseline.
+   the spec's cited 0.253 B/sample (measured 0.250 in this run).
 
 Measured: criterion 1 **passes decisively** -- quantized-walk-0.1 is 68.9% smaller and
 quantized-sine is 61.3% smaller, both more than double the 30% bar. Criterion 2 **fails badly** --

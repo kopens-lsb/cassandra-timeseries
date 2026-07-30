@@ -160,17 +160,20 @@ public final class Chimp128Codec
 
     public static int sampleCount(ByteBuffer payload)
     {
-        return checkedHeader(payload).getInt(payload.position() + 1);
+        ByteBuffer buffer = checkedHeader(payload);
+        return buffer.getInt(buffer.position() + 1);
     }
 
     public static long firstTimestamp(ByteBuffer payload)
     {
-        return checkedHeader(payload).getLong(payload.position() + 5);
+        ByteBuffer buffer = checkedHeader(payload);
+        return buffer.getLong(buffer.position() + 5);
     }
 
     public static long lastTimestamp(ByteBuffer payload)
     {
-        return checkedHeader(payload).getLong(payload.position() + 13);
+        ByteBuffer buffer = checkedHeader(payload);
+        return buffer.getLong(buffer.position() + 13);
     }
 
     private static ByteBuffer checkedHeader(ByteBuffer payload)
