@@ -144,6 +144,79 @@ public class GorillaCodecTest
         }
     }
 
+    @Test
+    public void propertyRoundtripAcrossSeedsAndPatterns()
+    {
+        for (long seed = 0; seed < 30; seed++)
+        {
+            java.util.Random random = new java.util.Random(seed);
+            int n = 1 + random.nextInt(5000);
+            long[] timestamps = new long[n];
+            double[] values = new double[n];
+
+            long timestamp = Math.abs(random.nextLong() % 4_000_000_000_000L);
+            int pattern = (int) (seed % 4);
+            double walk = random.nextDouble() * 100;
+            for (int i = 0; i < n; i++)
+            {
+                // 타임스탬프: 규칙(1s) / 지터 / 불규칙 갭을 시드별로 섞는다
+                long step;
+                switch (pattern)
+                {
+                    case 0:  step = 1000; break;                                   // 규칙
+                    case 1:  step = 995 + random.nextInt(11); break;               // ±5ms 지터
+                    case 2:  step = 1 + random.nextInt(10_000_000); break;         // 불규칙
+                    default: step = random.nextInt(100) == 0
+                                    ? 86_400_000L + random.nextInt(1_000_000)      // 드문 하루+ 갭
+                                    : 100; break;
+                }
+                timestamp += step;
+                timestamps[i] = timestamp;
+
+                switch (pattern)
+                {
+                    case 0:  values[i] = 42.0; break;                              // 상수
+                    case 1:  walk += random.nextGaussian(); values[i] = walk; break;
+                    case 2:  values[i] = Double.longBitsToDouble(random.nextLong()); break;  // 임의 비트(NaN 포함)
+                    default: values[i] = 20 + Math.sin(i / 300.0) * 5; break;
+                }
+            }
+
+            assertRoundtrip(timestamps, values, n);
+        }
+    }
+
+    @Test
+    public void sizeRegressionBaselines()
+    {
+        // 회귀 기준: 이 수치를 넘기는 인코딩 변경은 명시적 결정 없이는 금지
+        assertTrue("constant: " + bytesPerSample(0), bytesPerSample(0) <= 0.5);   // 설정값 패턴
+        // 풀정밀도 가우시안 워크는 매 샘플 가수부가 거의 전부 바뀌는 XOR 압축의 준최악 케이스(실측 ~7.1).
+        // 실제 산업 센서(양자화된 값)는 훨씬 잘 압축된다 — 실측 비교는 tiering 벤치마크(스펙 §7)에서.
+        assertTrue("walk: " + bytesPerSample(1),     bytesPerSample(1) <= 8.0);   // 풀정밀도 랜덤워크
+        assertTrue("random: " + bytesPerSample(2),   bytesPerSample(2) <= 11.0);  // 최악(원본 16B 대비)
+    }
+
+    private static double bytesPerSample(int pattern)
+    {
+        int n = 10_000;
+        java.util.Random random = new java.util.Random(7);
+        long[] timestamps = new long[n];
+        double[] values = new double[n];
+        double walk = 50;
+        for (int i = 0; i < n; i++)
+        {
+            timestamps[i] = i * 1000L;
+            switch (pattern)
+            {
+                case 0:  values[i] = 42.0; break;
+                case 1:  walk += random.nextGaussian(); values[i] = walk; break;
+                default: values[i] = Double.longBitsToDouble(random.nextLong()); break;
+            }
+        }
+        return GorillaCodec.encode(timestamps, values, n).remaining() / (double) n;
+    }
+
     static void assertRoundtrip(long[] timestamps, double[] values, int count)
     {
         ByteBuffer payload = GorillaCodec.encode(timestamps, values, count);
