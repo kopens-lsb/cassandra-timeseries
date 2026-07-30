@@ -145,3 +145,15 @@ public interface WindowFrozenListener
 | T3 | 지각 격리(flush/스트리밍 스플릿, 국소 재동결) | 백필 현실 대응 완성 |
 
 각 단계는 자체 plan→구현 사이클. T1만으로도 배포 가치가 있다.
+
+## 11. T1 구현 완료 노트 (2026-07-31) 및 T2/T3 인계
+
+T1은 커밋 `c6bb636..3cd922e8b9`로 완료(최종 리뷰 + 수정 웨이브 포함). 테스트: Options 11, Strategy 9(Mockito), E2E 2(SchemaLoader), 회귀 TWCS 6·UCS 27 — 전부 CI 배선됨.
+
+T2가 반드시 인수할 것:
+- **far-future 가드(§8) 미구현** — 극단 미래 타임스탬프 SSTable은 활성도 만료도 아니어서 컴팩션에 영원히 안 보임. FROZEN 판정 전에 반드시 구현(쓰레기 타임스탬프가 창을 동결로 오판하지 않게).
+- **닫힌 창 TTL 회수 공백(I2)** — T1은 문서 경고로 처리(retention 필요). T2 동결 컴팩션이 구조적으로 해결하고 경고 문구를 제거할 것.
+- FROZEN 판정에는 min·max 타임스탬프가 둘 다 필요 — 현재 max만 배관됨.
+- `getMaximalTasks`/`getUserDefinedTask`의 목 수준 커버리지 부재(E2E만 존재) — T2에서 상태기계 재작성 시 보강.
+
+T3 훅: `createSSTableMultiWriter` 미오버라이드(M3) — flush가 UCS 샤드 분할을 잃는 지점이자 창 경계 스플릿(§4 불변식)이 들어갈 자리.
