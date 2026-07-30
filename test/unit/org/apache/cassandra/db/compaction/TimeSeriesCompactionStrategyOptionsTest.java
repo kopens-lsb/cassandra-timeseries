@@ -24,6 +24,7 @@ import java.util.Map;
 import org.junit.Test;
 
 import org.apache.cassandra.exceptions.ConfigurationException;
+import org.apache.cassandra.schema.CompactionParams;
 
 import static org.junit.Assert.assertEquals;
 import static org.junit.Assert.assertFalse;
@@ -136,5 +137,29 @@ public class TimeSeriesCompactionStrategyOptionsTest
         Map<String, String> delegate =
             opts.delegateOptions(options("window_size", "1h", "retention", "30d", "scaling_parameters", "T4"));
         assertEquals(options("scaling_parameters", "T4"), delegate);
+    }
+
+    @Test
+    public void cqlSurfaceAcceptsAndValidates()
+    {
+        // 짧은 이름 해석 + 옵션 수용
+        Map<String, String> valid = new HashMap<>();
+        valid.put("class", "TimeSeriesCompactionStrategy");
+        valid.put("window_size", "1h");
+        valid.put("retention", "30d");
+        // CompactionParams 경유 검증 (CREATE TABLE과 동일 경로)
+        CompactionParams params = CompactionParams.fromMap(valid);
+        params.validate();
+        assertEquals(TimeSeriesCompactionStrategy.class, params.klass());
+
+        Map<String, String> bad = new HashMap<>(valid);
+        bad.put("retention", "1h");                       // window+freeze 미만
+        assertThatThrownBy(() -> CompactionParams.fromMap(bad).validate())
+            .isInstanceOf(ConfigurationException.class);
+
+        Map<String, String> unknown = new HashMap<>(valid);
+        unknown.put("no_such_option", "x");
+        assertThatThrownBy(() -> CompactionParams.fromMap(unknown).validate())
+            .isInstanceOf(ConfigurationException.class);
     }
 }

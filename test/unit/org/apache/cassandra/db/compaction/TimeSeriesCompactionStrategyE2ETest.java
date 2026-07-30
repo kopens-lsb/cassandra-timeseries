@@ -74,7 +74,7 @@ public class TimeSeriesCompactionStrategyE2ETest extends SchemaLoader
     }
 
     @Test
-    public void testDropExpiredWindowWhole() throws InterruptedException
+    public void testDropExpiredWindowWhole()
     {
         Keyspace keyspace = Keyspace.open(KEYSPACE1);
         ColumnFamilyStore cfs = keyspace.getColumnFamilyStore(CF_STANDARD1);
@@ -101,11 +101,6 @@ public class TimeSeriesCompactionStrategyE2ETest extends SchemaLoader
             .add("val", value).build().applyUnsafe();
         Util.flush(cfs);
         assertEquals(2, cfs.getLiveSSTables().size());
-
-        // Wait for the expiring row's TTL to elapse, mirroring TimeWindowCompactionStrategyTest -
-        // not required by the retention check itself (which only looks at write timestamps), but it
-        // confirms the whole-window drop and ordinary TTL/tombstone expiry coexist without interference.
-        Thread.sleep(TimeUnit.SECONDS.toMillis(TTL_SECONDS + 1));
 
         // window_size=1m, freeze_after=1m, retention=2m (the configuration minimum, since retention must
         // be >= window_size + freeze_after): the expired-window sstable is an hour past that cutoff, the
