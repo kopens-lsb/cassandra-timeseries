@@ -11,7 +11,7 @@
 | **시계열 CQL 함수 21종** | `time_bucket`, `first`/`last`, `delta`/`rate`/`derivative`, 리셋 보정 `counter_delta`/`counter_rate`, `percentile`, `time_weighted_average`, `integral`, `variance`/`stddev`, `histogram`, `approx_count_distinct`, 이변량 `corr`/`covar_*`/`regr_*` | [사용법 §2~9](#시계열-cql-사용법) |
 | **Gap-fill** | `GROUP BY time_bucket_gapfill(width, ts, start, finish)` — 빈 버킷 실체화 + `locf()`/`interpolate()` 채움 정책 | [사용법 §3](#3-빈-구간-채우기--time_bucket_gapfill) |
 | **풀텍스트 검색** | SAI `LIKE` + `index_analyzer`(ngram/standard/cjk/keyword + JSON) — 단어 중간 조각·공백 걸침·한글까지 진짜 부분문자열 매치, ALLOW FILTERING 불필요 | [fulltext-search.md](doc/timeseries/fulltext-search.md) |
-| **UCS 시계열 프리셋** | Cassandra 6.0 통합 컴팩션(UCS) 기반 시계열 스키마 패턴 (`T4` tiered + TTL 만료 SSTable 통째 회수) | [사용법 §1.1](#11-ucs-컴팩션-옵션-요약) |
+| **시계열 컴팩션 (TSCS)** | `TimeSeriesCompactionStrategy` — 창 정렬 + 창 내부 UCS 위임 + retention 창 통삭제 (T2 동결·이벤트, T3 지각격리 예정) | [설계 스펙](docs/superpowers/specs/2026-07-31-timeseries-compaction-design.md) |
 | **Gorilla 코덱** *(계층형 저장 1단계)* | `(timestamp, double)` 무손실 압축 — delta-of-delta + XOR 비트패킹. 상수 계열 0.25 B/샘플(64배). 청크 스토어·투명 읽기는 후속 단계 | [설계 스펙](docs/superpowers/specs/2026-07-31-industrial-tiered-storage-design.md) |
 | **테스트 인프라** | 도커 통합 테스트 41건(릴리스 게이트), 1억 건 스케일 하네스, 3노드 jvm-dtest, GC 비교(ZGC vs G1) | [보고서들](doc/timeseries/) |
 | **배포/CI** | Testcontainers 호환 도커 이미지, GitLab CI(빌드→테스트→이미지→통합 게이트→릴리스), 태그 릴리스 자동화 | [.gitlab-ci.yml](.gitlab-ci.yml) |

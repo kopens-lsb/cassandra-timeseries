@@ -13,7 +13,7 @@ A fork of **Apache Cassandra 6.0.0** that adds native time-series CQL functions 
 
 **Versioning rule:** the build must produce `build/apache-cassandra-6.0.0.jar` — keep `base.version` in [build.xml](build.xml) at `6.0.0` (do not let upstream merges reset it to alpha/beta/snapshot versions). Build with **Java 21** (CI image `eclipse-temurin:21-jdk`; despite AGENTS.md's upstream text naming Java 11 as default). Releases: pushing a tag (e.g. `v6.0.0`) publishes a GitLab Release with the jar; branch `6.0.0` mirrors `master`.
 
-**Upstream tracking rule:** `master` must be kept merged with the latest `cassandra-6.0` branch of GitHub `apache/cassandra` (remote `upstream`). Recurring conflict spots: `CHANGES.txt`, `debian/changelog`, the `modules/accord` submodule pointer, and `SelectStatement.java` (gap-fill wiring). Resolve by keeping both upstream fixes and the time-series features, then build.
+**Upstream tracking rule:** `master` must be kept merged with the latest `cassandra-6.0` branch of GitHub `apache/cassandra` (remote `upstream`). Recurring conflict spots: `CHANGES.txt`, `debian/changelog`, the `modules/accord` submodule pointer, `SelectStatement.java` (gap-fill wiring), and `db/compaction/TimeSeriesCompactionStrategy*.java` (UCS delegation). Resolve by keeping both upstream fixes and the time-series features, then build.
 
 ## Workflow, build, test, and style
 

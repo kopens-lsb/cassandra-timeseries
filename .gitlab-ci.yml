@@ -60,6 +60,9 @@ timeseries-tests:
     # tiered storage: gorilla codec
     - ant testsome -Dtest.name=org.apache.cassandra.db.timeseries.BitStreamTest
     - ant testsome -Dtest.name=org.apache.cassandra.db.timeseries.GorillaCodecTest
+    # time-series compaction strategy (TSCS T1)
+    - ant testsome -Dtest.name=org.apache.cassandra.db.compaction.TimeSeriesCompactionStrategyOptionsTest
+    - ant testsome -Dtest.name=org.apache.cassandra.db.compaction.TimeSeriesCompactionStrategyTest
 
 # Build the Testcontainers-compatible Docker image (see docker/) and publish it as a loadable tarball to
 # the GitLab GENERIC PACKAGE registry — this instance has no container registry configured (no
