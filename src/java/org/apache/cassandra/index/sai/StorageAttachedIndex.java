@@ -82,6 +82,7 @@ import org.apache.cassandra.index.Index;
 import org.apache.cassandra.index.IndexRegistry;
 import org.apache.cassandra.index.TargetParser;
 import org.apache.cassandra.index.sai.analyzer.AbstractAnalyzer;
+import org.apache.cassandra.index.sai.analyzer.AnalyzerOptions;
 import org.apache.cassandra.index.sai.analyzer.NonTokenizingOptions;
 import org.apache.cassandra.index.sai.disk.SSTableIndex;
 import org.apache.cassandra.index.sai.disk.format.IndexDescriptor;
@@ -159,7 +160,8 @@ public class StorageAttachedIndex implements Index
                                                                      IndexWriterConfig.OPTIMIZE_FOR,
                                                                      NonTokenizingOptions.CASE_SENSITIVE,
                                                                      NonTokenizingOptions.NORMALIZE,
-                                                                     NonTokenizingOptions.ASCII);
+                                                                     NonTokenizingOptions.ASCII,
+                                                                     AnalyzerOptions.INDEX_ANALYZER);
 
     public static final Set<CQL3Type> SUPPORTED_TYPES = ImmutableSet.of(CQL3Type.Native.ASCII, CQL3Type.Native.BIGINT, CQL3Type.Native.DATE,
                                                                         CQL3Type.Native.DOUBLE, CQL3Type.Native.FLOAT, CQL3Type.Native.INT,
@@ -450,7 +452,21 @@ public class StorageAttachedIndex implements Index
     @Override
     public boolean supportsExpression(ColumnMetadata column, Operator operator)
     {
+        // LIKE is only serveable when a substring-capable (n-gram) analyzer provides the recall guarantee;
+        // this gate is asked both with the generic LIKE at prepare time and with the resolved variant later
+        if (isLikeOperator(operator))
+            return dependsOn(column) && hasSubstringAnalyzer() && indexTermType.supports(operator);
+
         return dependsOn(column) && indexTermType.supports(operator);
+    }
+
+    public static boolean isLikeOperator(Operator operator)
+    {
+        return operator == Operator.LIKE ||
+               operator == Operator.LIKE_CONTAINS ||
+               operator == Operator.LIKE_PREFIX ||
+               operator == Operator.LIKE_SUFFIX ||
+               operator == Operator.LIKE_MATCHES;
     }
 
     @Override
@@ -526,6 +542,25 @@ public class StorageAttachedIndex implements Index
     @Override
     public void validate(ReadCommand command) throws InvalidRequestException
     {
+        // A LIKE fragment shorter than the analyzer's minimum gram size would produce query terms that are
+        // not guaranteed to be indexed - a silent false-negative generator. Reject it loudly on the
+        // coordinator instead.
+        if (hasSubstringAnalyzer())
+        {
+            for (RowFilter.Expression expression : command.rowFilter())
+            {
+                if (!isLikeOperator(expression.operator()) || !dependsOn(expression.column()))
+                    continue;
+
+                String fragment = indexTermType.asString(expression.getIndexValue());
+                String normalized = analyzerFactory.normalize(fragment);
+                if (normalized == null || normalized.length() < minimumQueryLength())
+                    throw new InvalidRequestException(String.format("LIKE pattern '%s' on column %s is shorter than the " +
+                                                                    "minimum fragment length (%d) supported by its index_analyzer",
+                                                                    fragment, expression.column().name, minimumQueryLength()));
+            }
+        }
+
         if (!indexTermType.isVector())
             return;
 
@@ -703,6 +738,18 @@ public class StorageAttachedIndex implements Index
         return analyzerFactory != null;
     }
 
+    /** @return true if the analyzer emits multiple terms per value (a tokenizing index_analyzer). */
+    public boolean hasTokenizingAnalyzer()
+    {
+        return analyzerFactory != null && analyzerFactory.isTokenizing();
+    }
+
+    /** @return true if LIKE can be served from this index (n-gram analyzer recall guarantee). */
+    public boolean hasSubstringAnalyzer()
+    {
+        return analyzerFactory != null && analyzerFactory.isSubstringCapable();
+    }
+
     /**
      * Returns an {@link AbstractAnalyzer} for use by write and query paths to transform
      * literal values.
@@ -711,6 +758,25 @@ public class StorageAttachedIndex implements Index
     {
         assert analyzerFactory != null : "Index does not support string analysis";
         return analyzerFactory.create();
+    }
+
+    /** Returns the analyzer to apply to query values (single-size grams for n-gram configurations). */
+    public AbstractAnalyzer queryAnalyzer()
+    {
+        assert analyzerFactory != null : "Index does not support string analysis";
+        return analyzerFactory.createQueryAnalyzer();
+    }
+
+    /** Applies the analyzer's char-level transforms to a whole value; identity when there is no analyzer. */
+    public String normalizeValue(String value)
+    {
+        return analyzerFactory == null ? value : analyzerFactory.normalize(value);
+    }
+
+    /** The shortest LIKE fragment this index can serve without false negatives. */
+    public int minimumQueryLength()
+    {
+        return analyzerFactory == null ? 1 : analyzerFactory.minimumQueryLength();
     }
 
     public IndexMetrics indexMetrics()
@@ -834,8 +900,15 @@ public class StorageAttachedIndex implements Index
         if (analyzer != null)
         {
             analyzer.reset(cellBuffer.duplicate());
-            while (analyzer.hasNext())
-                validateTermSize(key, analyzer.next(), isClientMutation, state);
+            try
+            {
+                while (analyzer.hasNext())
+                    validateTermSize(key, analyzer.next(), isClientMutation, state);
+            }
+            finally
+            {
+                analyzer.end();
+            }
         }
         else
         {

@@ -326,6 +326,54 @@ check "combined OHLC + change + p95 query runs" \
      GROUP BY series, time_bucket(1h, ts);" \
     '\(2 rows\)'
 
+section "full-text search - SAI LIKE with index_analyzer"
+cql "
+CREATE TABLE IF NOT EXISTS it.logs (
+    device text, ts timestamp, msg text,
+    PRIMARY KEY (device, ts)
+) WITH CLUSTERING ORDER BY (ts ASC);
+CREATE INDEX IF NOT EXISTS logs_msg_idx ON it.logs(msg) USING 'sai' WITH OPTIONS = { 'index_analyzer' : 'ngram' };
+
+INSERT INTO it.logs (device, ts, msg) VALUES ('pump-01', '2024-01-01 09:00:00+0000', 'connection timeout on port 9042');
+INSERT INTO it.logs (device, ts, msg) VALUES ('pump-01', '2024-01-01 09:05:00+0000', '펌프 정지 알림');
+INSERT INTO it.logs (device, ts, msg) VALUES ('pump-01', '2024-01-01 09:10:00+0000', 'connection refused');
+INSERT INTO it.logs (device, ts, msg) VALUES ('pump-02', '2024-01-01 09:00:00+0000', 'timeout waiting for pump-02');
+" > /dev/null
+sleep 3   # wait for the index to become queryable
+
+check "LIKE '%timeout%' within partition + time range" \
+    "SELECT ts, msg FROM it.logs WHERE device='pump-01'
+       AND ts >= '2024-01-01 09:00:00+0000' AND ts < '2024-01-01 10:00:00+0000'
+       AND msg LIKE '%timeout%';" \
+    'connection timeout on port 9042'
+check "LIKE mid-word fragment '%imeou%' (true substring)" \
+    "SELECT msg FROM it.logs WHERE device='pump-01' AND msg LIKE '%imeou%';" \
+    'connection timeout on port 9042'
+check "LIKE korean fragment '%정지%'" \
+    "SELECT msg FROM it.logs WHERE device='pump-01' AND msg LIKE '%정지%';" \
+    '펌프 정지 알림'
+check "LIKE korean fragment crossing a space '%프 정%'" \
+    "SELECT msg FROM it.logs WHERE device='pump-01' AND msg LIKE '%프 정%';" \
+    '펌프 정지 알림'
+check "LIKE excludes non-matching rows (1 row only)" \
+    "SELECT msg FROM it.logs WHERE device='pump-01' AND msg LIKE '%refused%';" \
+    '\(1 rows\)'
+check "LIKE prefix 'connection%'" \
+    "SELECT count(*) FROM it.logs WHERE device='pump-01' AND msg LIKE 'connection%';" \
+    '^ *2'
+check "LIKE suffix '%9042'" \
+    "SELECT msg FROM it.logs WHERE device='pump-01' AND msg LIKE '%9042';" \
+    'connection timeout on port 9042'
+check "'=' keeps exact whole-value semantics on the analyzed column" \
+    "SELECT count(*) FROM it.logs WHERE device='pump-01' AND msg = 'connection refused';" \
+    '^ *1'
+check "LIKE combines with time_bucket aggregation" \
+    "SELECT time_bucket(1h, ts), count(*) FROM it.logs
+      WHERE device='pump-01' AND ts >= '2024-01-01 00:00:00+0000' AND ts < '2024-01-02 00:00:00+0000'
+        AND msg LIKE '%connection%'
+      GROUP BY device, time_bucket(1h, ts);" \
+    '^ *2024-01-01 09:00:00.* 2'
+
 echo
 echo "== $PASS passed, $FAIL failed =="
 write_report

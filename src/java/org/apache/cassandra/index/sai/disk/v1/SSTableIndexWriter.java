@@ -219,7 +219,12 @@ public class SSTableIndexWriter implements PerColumnIndexWriter
 
     private void addTerm(ByteBuffer term, PrimaryKey key, long sstableRowId) throws IOException
     {
-        if (!index.validateTermSize(key.partitionKey(), term, false, null))
+        boolean analyzed = analyzer != null && index.termType().isLiteral();
+
+        // For analyzed columns the guardrail applies to each emitted term below, not to the raw value:
+        // rejecting on the raw value here would silently drop every term of an oversized-but-tokenizable
+        // value at flush while the memtable index (which validates per term) had accepted it.
+        if (!analyzed && !index.validateTermSize(key.partitionKey(), term, false, null))
             return;
 
         if (currentBuilder == null)
@@ -235,7 +240,7 @@ public class SSTableIndexWriter implements PerColumnIndexWriter
         // Some types support empty byte buffers:
         if (term.remaining() == 0 && index.termType().skipsEmptyValue()) return;
 
-        if (analyzer == null || !index.termType().isLiteral())
+        if (!analyzed)
         {
             limiter.increment(currentBuilder.add(term, key, sstableRowId));
         }
@@ -247,6 +252,8 @@ public class SSTableIndexWriter implements PerColumnIndexWriter
                 while (analyzer.hasNext())
                 {
                     ByteBuffer tokenTerm = analyzer.next();
+                    if (!index.validateTermSize(key.partitionKey(), tokenTerm, false, null))
+                        continue;
                     limiter.increment(currentBuilder.add(tokenTerm, key, sstableRowId));
                 }
             }

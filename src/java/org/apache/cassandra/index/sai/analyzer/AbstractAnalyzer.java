@@ -77,6 +77,43 @@ public abstract class AbstractAnalyzer implements Iterator<ByteBuffer>
     {
         AbstractAnalyzer create();
 
+        /**
+         * @return the analyzer to apply to query values. For substring-capable (n-gram) configurations this
+         * emits a single gram size so every emitted term is guaranteed indexed; by default it is the same
+         * analyzer as the write side.
+         */
+        default AbstractAnalyzer createQueryAnalyzer()
+        {
+            return create();
+        }
+
+        /** @return true if this factory's analyzer emits multiple terms per value (tokenizes). */
+        default boolean isTokenizing()
+        {
+            return false;
+        }
+
+        /**
+         * @return true if the index terms of any value are a superset of the query terms of any of its
+         * substrings — the recall property required to serve {@code LIKE} from the index.
+         */
+        default boolean isSubstringCapable()
+        {
+            return false;
+        }
+
+        /** Applies the char-level transforms of this configuration to a whole value (identity by default). */
+        default String normalize(String value)
+        {
+            return value;
+        }
+
+        /** @return the shortest query fragment the index can serve without false negatives. */
+        default int minimumQueryLength()
+        {
+            return 1;
+        }
+
         default void close()
         {
         }
@@ -84,6 +121,26 @@ public abstract class AbstractAnalyzer implements Iterator<ByteBuffer>
 
     public static AnalyzerFactory fromOptions(IndexTermType indexTermType, Map<String, String> options)
     {
+        if (AnalyzerOptions.hasOption(options))
+        {
+            if (!indexTermType.isString())
+                throw new InvalidRequestException("CQL type " + indexTermType.asCQL3Type() + " cannot be analyzed.");
+
+            if (indexTermType.isNonFrozenCollection() || indexTermType.isFrozenCollection() || indexTermType.isComposite())
+                throw new InvalidRequestException(AnalyzerOptions.INDEX_ANALYZER + " is not supported on collection columns.");
+
+            if (hasNonTokenizingOptions(options))
+                throw new InvalidRequestException(String.format("Options [%s, %s, %s] cannot be combined with %s; " +
+                                                                "express them as filters in the analyzer definition instead.",
+                                                                NonTokenizingOptions.CASE_SENSITIVE,
+                                                                NonTokenizingOptions.NORMALIZE,
+                                                                NonTokenizingOptions.ASCII,
+                                                                AnalyzerOptions.INDEX_ANALYZER));
+
+            AnalyzerOptions analyzerOptions = AnalyzerOptions.fromOptionValue(options.get(AnalyzerOptions.INDEX_ANALYZER));
+            return new LuceneAnalyzerFactory(indexTermType, analyzerOptions);
+        }
+
         if (hasNonTokenizingOptions(options))
         {
             if (indexTermType.isString())
@@ -109,7 +166,7 @@ public abstract class AbstractAnalyzer implements Iterator<ByteBuffer>
     public static Map<String, String> getAnalyzerOptions(Map<String, String> options)
     {
         return options.entrySet().stream()
-                      .filter(e -> NonTokenizingOptions.hasOption(e.getKey()))
+                      .filter(e -> NonTokenizingOptions.hasOption(e.getKey()) || AnalyzerOptions.INDEX_ANALYZER.equals(e.getKey()))
                       .collect(Collectors.toMap(Map.Entry::getKey, Map.Entry::getValue));
     }
 

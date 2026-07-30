@@ -186,6 +186,37 @@ public class Operation
 
     private static void buildIndexedExpression(StorageAttachedIndex index, RowFilter.Expression expression, List<Expression> perColumn)
     {
+        // Tokenizing (index_analyzer) indexes: LIKE and EQ fan the query value out into analyzed grams, one
+        // Expression per gram (a fresh Expression each - Expression.add would overwrite bounds), each carrying
+        // the complete original pattern for the precision recheck in post-filtering. The index intersection
+        // over the grams yields a candidate superset; the recheck restores exact semantics.
+        if (index.hasTokenizingAnalyzer() &&
+            (expression.operator() == Operator.EQ || StorageAttachedIndex.isLikeOperator(expression.operator())))
+        {
+            ByteBuffer pattern = expression.getIndexValue().duplicate();
+            AbstractAnalyzer queryAnalyzer = index.queryAnalyzer();
+            int grams = 0;
+            try
+            {
+                queryAnalyzer.reset(pattern.duplicate());
+                while (queryAnalyzer.hasNext())
+                {
+                    perColumn.add(Expression.create(index)
+                                            .addAnalyzed(expression.operator(), queryAnalyzer.next().duplicate(), pattern));
+                    grams++;
+                }
+            }
+            finally
+            {
+                queryAnalyzer.end();
+            }
+
+            if (grams == 0)
+                throw new InvalidRequestException(String.format("%s value is not analyzable by the index_analyzer on column %s",
+                                                                expression.operator(), expression.column().name));
+            return;
+        }
+
         if (index.hasAnalyzer())
         {
             AbstractAnalyzer analyzer = index.analyzer();

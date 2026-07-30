@@ -490,6 +490,9 @@ public enum CassandraRelevantProperties
     /** Latest version to be used for SAI index writing */
     SAI_LATEST_VERSION("cassandra.sai.latest_version", "aa"),
 
+    /** Cap on the number of terms a tokenizing index_analyzer may emit for a single indexed value */
+    SAI_MAX_ANALYZED_TERMS_PER_CELL("cassandra.sai.max_analyzed_terms_per_cell", "8192"),
+
     /** Minimum number of reachable leaves for a given node to be eligible for an auxiliary posting list */
     SAI_MINIMUM_POSTINGS_LEAVES("cassandra.sai.minimum_postings_leaves", "64"),
 

@@ -46,10 +46,17 @@ build-jar:
 # Targeted tests only — the full Cassandra suite takes hours (see AGENTS.md).
 timeseries-tests:
   stage: test
-  timeout: 60m
+  timeout: 90m
   script:
     - ant testsome -Dtest.name=org.apache.cassandra.db.aggregation.TimeBucketGapFillerTest
     - ant testsome -Dtest.name=org.apache.cassandra.cql3.functions.TimeSeriesFctsTest
+    # full-text search (SAI LIKE + index_analyzer)
+    - ant testsome -Dtest.name=org.apache.cassandra.index.sai.analyzer.LuceneTokenizingAnalyzerTest
+    - ant testsome -Dtest.name=org.apache.cassandra.index.sai.cql.AnalyzedLikeQueryTest
+    # regression guard: LIKE on non-analyzed indexes must keep demanding ALLOW FILTERING
+    - ant testsome -Dtest.name=org.apache.cassandra.index.sai.cql.AllowFilteringTest
+    # 3-node cluster semantics (consistency levels, paging, unrepaired rows)
+    - ant test-jvm-dtest-some -Dtest.name=org.apache.cassandra.distributed.test.sai.AnalyzedLikeDistributedTest
 
 # Build the Testcontainers-compatible Docker image (see docker/) and publish it as a loadable tarball to
 # the GitLab GENERIC PACKAGE registry — this instance has no container registry configured (no

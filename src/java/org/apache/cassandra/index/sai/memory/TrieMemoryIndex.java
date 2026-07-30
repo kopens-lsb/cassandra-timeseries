@@ -149,6 +149,11 @@ public class TrieMemoryIndex extends MemoryIndex
             case EQ:
             case CONTAINS_KEY:
             case CONTAINS_VALUE:
+            // LIKE variants carry a single analyzed gram as their bound; a gram is an exact term
+            case LIKE_PREFIX:
+            case LIKE_SUFFIX:
+            case LIKE_CONTAINS:
+            case LIKE_MATCHES:
                 return exactMatch(expression, keyRange);
             case RANGE:
                 KeyRangeIterator keyIterator = rangeMatch(expression, keyRange);

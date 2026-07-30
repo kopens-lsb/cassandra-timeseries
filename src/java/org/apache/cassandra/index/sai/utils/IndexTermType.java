@@ -669,12 +669,19 @@ public class IndexTermType
 
     public boolean supports(Operator operator)
     {
+        // LIKE is only meaningful on plain literal (text) columns; whether the index can actually serve it
+        // additionally requires a substring-capable analyzer, which StorageAttachedIndex.supportsExpression
+        // checks (this type-level gate alone must not open the operator)
+        // note: TargetParser implicitly assigns Type.VALUES to plain column targets, so the plain-text case
+        // is excluded via the collection/composite predicates rather than by target type
         if (operator == Operator.LIKE ||
             operator == Operator.LIKE_CONTAINS ||
             operator == Operator.LIKE_PREFIX ||
             operator == Operator.LIKE_MATCHES ||
-            operator == Operator.LIKE_SUFFIX ||
-            operator == Operator.IN) return false;
+            operator == Operator.LIKE_SUFFIX)
+            return isLiteral() && !isNonFrozenCollection() && !isFrozenCollection() && !isComposite();
+
+        if (operator == Operator.IN) return false;
 
         // ANN is only supported against vectors, and vector indexes only support ANN
         if (operator == Operator.ANN)

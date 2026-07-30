@@ -12,6 +12,7 @@
 | [시계열 함수 설계 (timeseries-functions-design.md)](doc/timeseries/timeseries-functions-design.md) | 각 함수의 시그니처·의미론(semantics), 분산 환경에서의 정확성, 코드 위치 |
 | [Gap-Fill 설계 (gapfill-design.md)](doc/timeseries/gapfill-design.md) | `time_bucket_gapfill`의 CQL 문법, 보간 규칙, 가드레일 |
 | [Continuous Aggregates 설계 (continuous-aggregates-design.md)](doc/timeseries/continuous-aggregates-design.md) | 시간 버킷 롤업(연속 집계) 설계안 — 진행 중 |
+| **[풀텍스트 검색 (fulltext-search.md)](doc/timeseries/fulltext-search.md)** | SAI `LIKE` + `index_analyzer` — 로그/메시지 본문 부분문자열 검색 (한글 포함) |
 | [통합 테스트 보고서](doc/timeseries/integration-test-report.md) | 실제 컨테이너에서 실행한 32개 검증의 CQL·결과·소요 시간 |
 | [스케일 테스트 보고서 (1억 건)](doc/timeseries/scale-test-report.md) | 1억 행 적재 후 측정한 쿼리별 CQL 실행 시간 |
 | [GC 비교: ZGC generational vs G1](doc/timeseries/gc-comparison.md) | 같은 1억 건 데이터로 두 GC의 쿼리 시간·쓰기 처리량 비교 (원자료) |
@@ -338,7 +339,38 @@ WHERE  series = 'cpu'
 GROUP  BY series, time_bucket(1h, ts);
 ```
 
-## 10. 운영 팁
+## 10. 풀텍스트 검색 — SAI `LIKE` + `index_analyzer`
+
+로그·이벤트 메시지 본문을 시계열 조회 패턴 안에서 검색합니다. `ngram` 분석기가 진짜 부분문자열 매치를 제공합니다(단어 중간 조각, 공백 걸침, 한글 전부 지원). 자세한 내용: [fulltext-search.md](doc/timeseries/fulltext-search.md)
+
+```sql
+CREATE TABLE logs (
+    device text, ts timestamp, msg text,
+    PRIMARY KEY (device, ts)
+) WITH CLUSTERING ORDER BY (ts ASC);
+
+CREATE INDEX logs_msg_idx ON logs(msg) USING 'sai'
+  WITH OPTIONS = { 'index_analyzer': 'ngram' };
+
+-- 장비 1대 · 1시간 구간에서 본문 검색 (ALLOW FILTERING 불필요)
+SELECT ts, msg FROM logs
+ WHERE device = 'pump-01'
+   AND ts >= '2026-07-31 00:00' AND ts < '2026-07-31 01:00'
+   AND msg LIKE '%타임아웃%';
+
+-- 단어 중간 조각도 매치: '%imeou%' 가 "timeout" 을 찾음
+-- 접두/접미/완전일치: 'connection%', '%9042', LIKE 'connection refused'
+-- 다중 조각 AND: msg LIKE '%connection%' AND msg LIKE '%refused%'
+
+-- 시계열 함수와 조합: 5분 버킷별 에러 건수
+SELECT time_bucket(5m, ts), count(*) FROM logs
+ WHERE device='pump-01' AND ts >= ? AND ts < ? AND msg LIKE '%timeout%'
+ GROUP BY device, time_bucket(5m, ts);
+```
+
+동작 원리: 값 전체를 2~3글자 n-gram으로 색인(재현율) → 그램 교집합으로 후보 추출 → **원문에 LIKE 패턴 재적용**(정밀도). 색인은 원본 컬럼의 수 배 크기가 되므로 로그성 테이블에 선별 적용하세요. 2글자 미만 조각은 명시적 에러로 거부됩니다. `=`는 완전일치 의미를 유지합니다.
+
+## 11. 운영 팁
 
 - **항상 파티션을 지정하세요**(`WHERE series = ...`) 그리고 시간 범위도 함께. 시계열 스캔은 `ts`로 정렬된 단일 파티션 안에서 가장 저렴합니다.
 - **파티션 크기를 제한하세요.** 고빈도 시리즈라면 파티션 키에 굵은 시간 버킷을 넣어 무한정 커지는 파티션을 막습니다. 예: `PRIMARY KEY ((series, day), ts)`.

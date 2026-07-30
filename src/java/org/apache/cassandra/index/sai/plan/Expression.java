@@ -51,6 +51,14 @@ public abstract class Expression
     private final IndexTermType indexTermType;
     protected IndexOperator operator;
 
+    /**
+     * For expressions produced by a tokenizing analyzer: the complete original query value (LIKE fragment or
+     * EQ value). The bounds then hold a single analyzed gram used for the index lookup (recall), while
+     * post-filtering re-applies this full pattern to the raw column value (precision). Each gram-expression
+     * carries the whole pattern so the recheck is complete even when the index intersection is truncated.
+     */
+    private ByteBuffer analyzedPattern;
+
     public Bound lower, upper;
     // The upperInclusive and lowerInclusive flags are maintained separately to the inclusive flags
     // in the upper and lower bounds because the upper and lower bounds have their inclusivity relaxed
@@ -267,6 +275,18 @@ public abstract class Expression
     }
 
     /**
+     * Adds an operation backed by a tokenizing analyzer: {@code term} (a single analyzed gram) becomes the
+     * index lookup bound, while {@code pattern} (the complete original query value) is what post-filtering
+     * re-applies to the raw column value. See {@link #analyzedPattern}.
+     */
+    public Expression addAnalyzed(Operator op, ByteBuffer term, ByteBuffer pattern)
+    {
+        add(op, term);
+        this.analyzedPattern = pattern;
+        return this;
+    }
+
+    /**
      * Used in post-filtering to determine is an indexed value matches the expression
      */
     public boolean isSatisfiedBy(ByteBuffer columnValue)
@@ -281,6 +301,12 @@ public abstract class Expression
             logger.error("Value is not valid for indexed column {} with {}", indexTermType.columnName(), indexTermType.indexType());
             return false;
         }
+
+        // Tokenized (n-gram) expressions: the index matched grams (recall); precision comes from re-applying
+        // the complete original pattern to the raw value. Deliberately does not use getAnalyzer() — that
+        // would tokenize the column value per row; the char-level normalizer is enough and stateless.
+        if (analyzedPattern != null)
+            return analyzedPatternSatisfiedBy(columnValue);
 
         Value value = new Value(columnValue, indexTermType);
 
@@ -320,6 +346,42 @@ public abstract class Expression
         }
 
         return true;
+    }
+
+    /**
+     * Precision recheck for tokenized expressions: applies the complete original pattern to the raw column
+     * value. LIKE variants compare normalized strings (the analyzer's char-level transforms applied to both
+     * sides identically); EQ compares raw bytes so {@code =} keeps exact whole-value semantics regardless of
+     * how the index folded its grams.
+     */
+    private boolean analyzedPatternSatisfiedBy(ByteBuffer columnValue)
+    {
+        if (operator == IndexOperator.EQ)
+            return indexTermType.compare(columnValue, analyzedPattern) == 0;
+
+        String value = normalize(indexTermType.asString(columnValue));
+        String pattern = normalize(indexTermType.asString(analyzedPattern));
+        if (value == null || pattern == null)
+            return false;
+
+        switch (operator)
+        {
+            case LIKE_CONTAINS:
+                return value.contains(pattern);
+            case LIKE_PREFIX:
+                return value.startsWith(pattern);
+            case LIKE_SUFFIX:
+                return value.endsWith(pattern);
+            case LIKE_MATCHES:
+                return value.equals(pattern);
+            default:
+                throw new IllegalStateException("Unexpected analyzed operator: " + operator);
+        }
+    }
+
+    String normalize(String value)
+    {
+        return value;
     }
 
     private boolean validateStringValue(ByteBuffer columnValue, ByteBuffer requestedValue)
@@ -441,6 +503,7 @@ public abstract class Expression
     {
         return new HashCodeBuilder().append(indexTermType)
                                     .append(operator)
+                                    .append(analyzedPattern)
                                     .append(lower).append(upper).build();
     }
 
@@ -457,6 +520,7 @@ public abstract class Expression
 
         return Objects.equals(indexTermType, o.indexTermType)
                && operator == o.operator
+               && Objects.equals(analyzedPattern, o.analyzedPattern)
                && Objects.equals(lower, o.lower)
                && Objects.equals(upper, o.upper);
     }
@@ -493,6 +557,12 @@ public abstract class Expression
         AbstractAnalyzer getAnalyzer()
         {
             return index.analyzer();
+        }
+
+        @Override
+        String normalize(String value)
+        {
+            return index.normalizeValue(value);
         }
     }
 
