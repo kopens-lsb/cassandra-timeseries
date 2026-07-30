@@ -18,6 +18,7 @@
 package org.apache.cassandra.db.timeseries;
 
 import java.nio.ByteBuffer;
+import java.nio.ByteOrder;
 
 import org.junit.Test;
 
@@ -202,6 +203,19 @@ public class Chimp128CodecTest
         assertThrowsIllegalArgument(() -> Chimp128Codec.sampleCount(payload));
         assertThrowsIllegalArgument(() -> Chimp128Codec.firstTimestamp(payload));
         assertThrowsIllegalArgument(() -> Chimp128Codec.lastTimestamp(payload));
+    }
+
+    @Test
+    public void peeksAreByteOrderIndependent()
+    {
+        long[] timestamps = { 1000L, 2000L, 3500L };
+        double[] values = { 1.5, 1.5, -2.25 };
+        ByteBuffer payload = Chimp128Codec.encode(timestamps, values, 3);
+        payload.order(ByteOrder.LITTLE_ENDIAN);   // peeks must ignore the caller's buffer order
+
+        assertEquals(3, Chimp128Codec.sampleCount(payload));
+        assertEquals(1000L, Chimp128Codec.firstTimestamp(payload));
+        assertEquals(3500L, Chimp128Codec.lastTimestamp(payload));
     }
 
     @Test
