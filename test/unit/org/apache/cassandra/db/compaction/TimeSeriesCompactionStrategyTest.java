@@ -167,4 +167,33 @@ public class TimeSeriesCompactionStrategyTest
         TimeSeriesCompactionStrategy tscs = strategy(delegate);
         assertEquals(3, tscs.getEstimatedRemainingTasks());
     }
+
+    @Test
+    public void expiredWindowsAreSelectedForWholeDrop()
+    {
+        UnifiedCompactionStrategy delegate = mock(UnifiedCompactionStrategy.class);
+        when(delegate.getNextBackgroundTasks(anyLong())).thenReturn(List.of());
+        ColumnFamilyStore cfs = mock(ColumnFamilyStore.class, Mockito.RETURNS_DEEP_STUBS);
+        Map<String, String> opts = options();
+        opts.put(TimeSeriesCompactionStrategyOptions.RETENTION, "30d");
+        TimeSeriesCompactionStrategy tscs = new TimeSeriesCompactionStrategy(cfs, opts, delegate);
+
+        SSTableReader live = sstableAt(NOW - HOUR);
+        SSTableReader expired1 = sstableAt(NOW - 31L * 24 * HOUR);
+        SSTableReader expired2 = sstableAt(NOW - 31L * 24 * HOUR + 60_000);   // same expired window
+        tscs.addSSTable(live);
+        tscs.addSSTable(expired1);
+        tscs.addSSTable(expired2);
+
+        Set<SSTableReader> selected = tscs.expiredSSTables(NOW);
+        assertEquals(Set.of(expired1, expired2), selected);
+    }
+
+    @Test
+    public void nothingExpiresWithoutRetention()
+    {
+        TimeSeriesCompactionStrategy tscs = strategy(mock(UnifiedCompactionStrategy.class));
+        tscs.addSSTable(sstableAt(NOW - 400L * 24 * HOUR));
+        assertEquals(Set.of(), tscs.expiredSSTables(NOW));
+    }
 }

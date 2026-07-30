@@ -44,7 +44,8 @@ import org.apache.cassandra.utils.Clock;
  * Time-series compaction: SSTables are classified into fixed time windows by max timestamp.
  * Active windows (current, or closed less than freeze_after ago) delegate their compaction to an
  * internal {@link UnifiedCompactionStrategy}; windows past the configured retention are dropped
- * whole (see {@link TimeSeriesCompactionStrategyOptions#isExpiredWindow}). Freezing closed windows
+ * whole via {@link TimeSeriesCompactionTask}/{@link TimeSeriesCompactionController}
+ * (see {@link TimeSeriesCompactionStrategyOptions#isExpiredWindow}). Freezing closed windows
  * to a single sstable and late-data isolation arrive in later increments (design spec section 10).
  * <p>
  * Instances only ever see the sstable slice the CompactionStrategyManager assigns them (per
@@ -57,6 +58,9 @@ public class TimeSeriesCompactionStrategy extends AbstractCompactionStrategy
     private final TimeSeriesCompactionStrategyOptions tsOptions;
     private final UnifiedCompactionStrategy delegate;
     private final Set<SSTableReader> sstables = new HashSet<>();
+    // the set of expired-window sstables selected on the most recent background round, so
+    // getEstimatedRemainingTasks() can report the pending whole-window drop without recomputing it.
+    private volatile Set<SSTableReader> lastExpiredSelection = Set.of();
 
     public TimeSeriesCompactionStrategy(ColumnFamilyStore cfs, Map<String, String> options)
     {
@@ -81,8 +85,35 @@ public class TimeSeriesCompactionStrategy extends AbstractCompactionStrategy
     Collection<AbstractCompactionTask> getNextBackgroundTasksAt(long nowMillis, long gcBefore)
     {
         syncDelegate(nowMillis);
-        // (a later increment inserts an attempt to drop expired windows here)
+
+        Set<SSTableReader> expired = expiredSSTables(nowMillis);
+        lastExpiredSelection = expired;
+        if (!expired.isEmpty())
+        {
+            LifecycleTransaction txn = cfs.getTracker().tryModify(expired, OperationType.COMPACTION);
+            if (txn != null)
+            {
+                long cutoff = nowMillis - tsOptions.retentionMillis;
+                logger.info("Dropping {} expired-window sstables from {} (retention cutoff {})",
+                            expired.size(), cfs.getTableName(), cutoff);
+                return List.of(new TimeSeriesCompactionTask(cfs, txn, gcBefore, cutoff, tsOptions.timestampResolution));
+            }
+        }
+
         return delegate.getNextBackgroundTasks(gcBefore);
+    }
+
+    /** Sstables whose whole window has closed before the configured retention cutoff, if any. */
+    @VisibleForTesting
+    synchronized Set<SSTableReader> expiredSSTables(long nowMillis)
+    {
+        Set<SSTableReader> expired = new HashSet<>();
+        if (tsOptions.retentionMillis < 0)
+            return expired;
+        for (SSTableReader sstable : sstables)
+            if (tsOptions.isExpiredWindow(tsOptions.windowStartFor(maxTimestampMillis(sstable)), nowMillis))
+                expired.add(sstable);
+        return expired;
     }
 
     private synchronized void syncDelegate(long nowMillis)
@@ -172,7 +203,7 @@ public class TimeSeriesCompactionStrategy extends AbstractCompactionStrategy
     @Override
     public int getEstimatedRemainingTasks()
     {
-        return delegate.getEstimatedRemainingTasks();      // a later increment adds the count of expired windows awaiting drop
+        return delegate.getEstimatedRemainingTasks() + (lastExpiredSelection.isEmpty() ? 0 : 1);
     }
 
     @Override
