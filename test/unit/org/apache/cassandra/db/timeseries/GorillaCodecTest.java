@@ -18,12 +18,14 @@
 package org.apache.cassandra.db.timeseries;
 
 import java.nio.ByteBuffer;
+import java.nio.ByteOrder;
 
 import org.junit.Test;
 
 import static org.junit.Assert.assertEquals;
 import static org.junit.Assert.assertFalse;
 import static org.junit.Assert.assertTrue;
+import static org.junit.Assert.fail;
 
 public class GorillaCodecTest
 {
@@ -98,6 +100,29 @@ public class GorillaCodecTest
         assertRoundtrip(timestamps, values, timestamps.length);
     }
 
+    @Test
+    public void dodBucketBoundariesRoundtrip()
+    {
+        // exact bucket edges and their just-outside neighbours: a silent off-by-one in the
+        // dod buckets would corrupt data without failing any other test
+        long[] dods = { -65537, -65536, -65535, -2049, -2048, -2047, -65, -64, -63, -1, 0, 1,
+                        63, 64, 65, 2047, 2048, 2049, 65535, 65536, 65537 };
+        long[] timestamps = new long[dods.length + 2];
+        double[] values = new double[dods.length + 2];
+        timestamps[0] = 10_000_000_000L; values[0] = 1.0;
+        // base delta raised from the naively-obvious 200_000 to 300_000: the cumulative sum of
+        // the dods above dips to -202945 (around the -1/0 entries), so 200_000 would drive the
+        // running delta negative and violate strictly-increasing timestamps.
+        long delta = 300_000L;
+        timestamps[1] = timestamps[0] + delta; values[1] = 2.0;
+        for (int i = 0; i < dods.length; i++)
+        {
+            delta += dods[i];
+            timestamps[i + 2] = timestamps[i + 1] + delta; values[i + 2] = i;
+        }
+        assertRoundtrip(timestamps, values, timestamps.length);
+    }
+
     @Test(expected = IllegalArgumentException.class)
     public void rejectsOutOfOrderTimestamps()
     {
@@ -117,11 +142,53 @@ public class GorillaCodecTest
     }
 
     @Test(expected = IllegalArgumentException.class)
+    public void rejectsCountAboveMaximum()
+    {
+        // the MAX_SAMPLES check runs before the array-length check in encode(), so tiny arrays
+        // are enough to hit it without allocating a 128MB+ array just for this test
+        GorillaCodec.encode(new long[]{ 1L }, new double[]{ 1.0 }, GorillaCodec.MAX_SAMPLES + 1);
+    }
+
+    @Test(expected = IllegalArgumentException.class)
     public void rejectsUnknownVersion()
     {
         ByteBuffer payload = GorillaCodec.encode(new long[]{ 1L }, new double[]{ 1.0 }, 1);
         payload.put(payload.position(), (byte) 99);
         GorillaCodec.cursor(payload);
+    }
+
+    @Test
+    public void peeksRejectForeignVersion()
+    {
+        ByteBuffer payload = GorillaCodec.encode(new long[]{ 1L }, new double[]{ 1.0 }, 1);
+        payload.put(payload.position(), (byte) 99);
+
+        assertThrowsIllegalArgument(() -> GorillaCodec.sampleCount(payload));
+        assertThrowsIllegalArgument(() -> GorillaCodec.firstTimestamp(payload));
+        assertThrowsIllegalArgument(() -> GorillaCodec.lastTimestamp(payload));
+    }
+
+    @Test
+    public void peeksAreByteOrderIndependent()
+    {
+        long[] timestamps = { 1000L, 2000L, 3500L };
+        double[] values = { 1.5, 1.5, -2.25 };
+        ByteBuffer payload = GorillaCodec.encode(timestamps, values, 3);
+        payload.order(ByteOrder.LITTLE_ENDIAN);   // peeks must ignore the caller's buffer order
+
+        assertEquals(3, GorillaCodec.sampleCount(payload));
+        assertEquals(1000L, GorillaCodec.firstTimestamp(payload));
+        assertEquals(3500L, GorillaCodec.lastTimestamp(payload));
+    }
+
+    @Test
+    public void cursorAccessBeforeAdvanceThrows()
+    {
+        ByteBuffer payload = GorillaCodec.encode(new long[]{ 1L }, new double[]{ 1.0 }, 1);
+        GorillaCodec.SampleCursor cursor = GorillaCodec.cursor(payload);
+
+        assertThrowsIllegalState(cursor::timestamp);
+        assertThrowsIllegalState(cursor::value);
     }
 
     @Test(expected = RuntimeException.class)
@@ -231,5 +298,31 @@ public class GorillaCodecTest
                          Double.doubleToRawLongBits(cursor.value()));
         }
         assertFalse(cursor.advance());
+    }
+
+    private static void assertThrowsIllegalArgument(Runnable action)
+    {
+        try
+        {
+            action.run();
+            fail("expected IllegalArgumentException");
+        }
+        catch (IllegalArgumentException expected)
+        {
+            // expected
+        }
+    }
+
+    private static void assertThrowsIllegalState(Runnable action)
+    {
+        try
+        {
+            action.run();
+            fail("expected IllegalStateException");
+        }
+        catch (IllegalStateException expected)
+        {
+            // expected
+        }
     }
 }

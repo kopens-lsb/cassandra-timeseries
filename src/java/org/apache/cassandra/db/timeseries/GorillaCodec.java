@@ -18,17 +18,28 @@
 package org.apache.cassandra.db.timeseries;
 
 import java.nio.ByteBuffer;
+import java.nio.ByteOrder;
 
 /**
  * Lossless gorilla-style codec for (timestampMillis, double) series: delta-of-delta timestamps
  * and XOR-bitpacked values behind a fixed 21-byte header (version, count, first/last timestamp).
  * See docs/superpowers/plans/2026-07-31-gorilla-codec.md for the normative bit format.
  * Timestamps must be strictly increasing; values roundtrip bit-exactly (NaN payloads, -0.0).
+ *
+ * <p>Contract: {@code payload.position()..payload.limit()} must span EXACTLY one encoded chunk --
+ * the sample count is trusted, so an over-long buffer will decode bytes belonging to whatever
+ * follows in memory. The input buffer is never mutated (all access goes through a duplicate), so
+ * independent cursors/peeks over the same payload are safe to use concurrently. Corruption
+ * surfaces as {@link IllegalArgumentException}, {@link IndexOutOfBoundsException}, or
+ * {@link java.nio.BufferUnderflowException} -- callers must treat all three as "corrupt chunk".
+ * Buffers are read big-endian regardless of the caller's configured byte order.
  */
 public final class GorillaCodec
 {
     public static final byte VERSION = 1;
-    static final int HEADER_SIZE = 21;
+    public static final int HEADER_SIZE = 21;
+    /** 2^24: keeps {@link BitWriter}'s int bit counter far from overflow (a 1h/1s window is 3600). */
+    public static final int MAX_SAMPLES = 16_777_216;
 
     private GorillaCodec()
     {
@@ -45,6 +56,8 @@ public final class GorillaCodec
     {
         if (count < 1)
             throw new IllegalArgumentException("count must be >= 1, got " + count);
+        if (count > MAX_SAMPLES)
+            throw new IllegalArgumentException("count " + count + " exceeds MAX_SAMPLES " + MAX_SAMPLES);
         if (timestamps.length < count || values.length < count)
             throw new IllegalArgumentException("arrays shorter than count " + count);
 
@@ -99,6 +112,7 @@ public final class GorillaCodec
         }
 
         ByteBuffer out = ByteBuffer.allocate(HEADER_SIZE + bits.sizeInBytes());
+        out.order(ByteOrder.BIG_ENDIAN);   // allocate() already defaults to this; make the contract explicit
         out.put(VERSION);
         out.putInt(count);
         out.putLong(timestamps[0]);
@@ -110,22 +124,45 @@ public final class GorillaCodec
 
     public static int sampleCount(ByteBuffer payload)
     {
-        return payload.getInt(payload.position() + 1);
+        ByteBuffer buffer = checkedHeader(payload);
+        return buffer.getInt(buffer.position() + 1);
     }
 
     public static long firstTimestamp(ByteBuffer payload)
     {
-        return payload.getLong(payload.position() + 5);
+        ByteBuffer buffer = checkedHeader(payload);
+        return buffer.getLong(buffer.position() + 5);
     }
 
     public static long lastTimestamp(ByteBuffer payload)
     {
-        return payload.getLong(payload.position() + 13);
+        ByteBuffer buffer = checkedHeader(payload);
+        return buffer.getLong(buffer.position() + 13);
     }
 
+    /**
+     * Duplicates {@code payload}, pins the duplicate's byte order to big-endian, and verifies the
+     * version byte at {@code position()} is {@link #VERSION}. Used by the header peeks so they are
+     * independent of the caller's buffer byte order and reject foreign versions like {@link #cursor}.
+     */
+    private static ByteBuffer checkedHeader(ByteBuffer payload)
+    {
+        ByteBuffer buffer = payload.duplicate();
+        buffer.order(ByteOrder.BIG_ENDIAN);
+        byte version = buffer.get(buffer.position());
+        if (version != VERSION)
+            throw new IllegalArgumentException("Unsupported gorilla chunk version: " + version);
+        return buffer;
+    }
+
+    /**
+     * Returns a cursor over the samples encoded in {@code payload}. See the class-level contract
+     * for buffer bounds, mutation, corruption-signalling, and byte-order guarantees.
+     */
     public static SampleCursor cursor(ByteBuffer payload)
     {
         ByteBuffer buffer = payload.duplicate();
+        buffer.order(ByteOrder.BIG_ENDIAN);
         byte version = buffer.get();
         if (version != VERSION)
             throw new IllegalArgumentException("Unsupported gorilla chunk version: " + version);
@@ -167,6 +204,9 @@ public final class GorillaCodec
                     {
                         windowLeading = (int) bits.readBits(5);
                         int meaningful = (int) bits.readBits(6) + 1;
+                        if (windowLeading + meaningful > 64)
+                            throw new IllegalArgumentException("Corrupt gorilla chunk: window " +
+                                                               windowLeading + '+' + meaningful + " exceeds 64 bits");
                         windowTrailing = 64 - windowLeading - meaningful;
                         valueBits ^= bits.readBits(meaningful) << windowTrailing;
                     }
@@ -182,12 +222,16 @@ public final class GorillaCodec
             @Override
             public long timestamp()
             {
+                if (index < 0)
+                    throw new IllegalStateException("advance() not called");
                 return timestamp;
             }
 
             @Override
             public double value()
             {
+                if (index < 0)
+                    throw new IllegalStateException("advance() not called");
                 return Double.longBitsToDouble(valueBits);
             }
         };
