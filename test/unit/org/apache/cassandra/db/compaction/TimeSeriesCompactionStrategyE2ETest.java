@@ -20,6 +20,7 @@ package org.apache.cassandra.db.compaction;
 
 import java.nio.ByteBuffer;
 import java.util.Collection;
+import java.util.List;
 import java.util.concurrent.TimeUnit;
 
 import com.google.common.collect.ImmutableMap;
@@ -126,5 +127,68 @@ public class TimeSeriesCompactionStrategyE2ETest extends SchemaLoader
 
         assertFalse(cfs.getLiveSSTables().contains(expiredSSTable));
         assertEquals(1, cfs.getLiveSSTables().size());
+    }
+
+    /**
+     * getMaximalTasks builds one task per window directly (bypassing the delegate), so it needs its own
+     * routing: a window that is itself expired must still go through {@link TimeSeriesCompactionTask} (so its
+     * retention cutoff is honoured), while a live window must go through a plain {@link CompactionTask}.
+     */
+    @Test
+    public void testGetMaximalTasksRoutesExpiredWindowThroughTimeSeriesCompactionTask()
+    {
+        Keyspace keyspace = Keyspace.open(KEYSPACE1);
+        ColumnFamilyStore cfs = keyspace.getColumnFamilyStore(CF_STANDARD1);
+        cfs.truncateBlocking();
+        cfs.disableAutoCompaction();
+
+        ByteBuffer value = ByteBuffer.wrap(new byte[100]);
+
+        // Expired window: closed roughly an hour ago, well past the 2-minute retention cutoff configured below.
+        long expiredWriteMillis = System.currentTimeMillis() - TimeUnit.HOURS.toMillis(1);
+        DecoratedKey expiredKey = Util.dk("expired-window-maximal");
+        new RowUpdateBuilder(cfs.metadata(), expiredWriteMillis, expiredKey.getKey())
+            .clustering("column")
+            .add("val", value).build().applyUnsafe();
+        Util.flush(cfs);
+        SSTableReader expiredSSTable = cfs.getLiveSSTables().iterator().next();
+
+        // Current window: must never be routed through the retention-drop task.
+        DecoratedKey liveKey = Util.dk("live-window-maximal");
+        new RowUpdateBuilder(cfs.metadata(), System.currentTimeMillis(), liveKey.getKey())
+            .clustering("column")
+            .add("val", value).build().applyUnsafe();
+        Util.flush(cfs);
+        assertEquals(2, cfs.getLiveSSTables().size());
+
+        cfs.setCompactionParameters(ImmutableMap.of("class", "TimeSeriesCompactionStrategy",
+                                                    "timestamp_resolution", "MILLISECONDS",
+                                                    "window_size", "1m",
+                                                    "freeze_after", "1m",
+                                                    "retention", "2m"));
+
+        TimeSeriesCompactionStrategy tscs =
+            (TimeSeriesCompactionStrategy) cfs.getCompactionStrategyManager().getCompactionStrategyFor(expiredSSTable);
+
+        long gcBefore = nowInSeconds();
+        List<AbstractCompactionTask> tasks = tscs.getMaximalTasks(gcBefore, false);
+        assertEquals(2, tasks.size());   // one task per window, never merged across windows
+
+        try
+        {
+            for (AbstractCompactionTask task : tasks)
+            {
+                boolean coversExpired = Iterables.contains(task.transaction.originals(), expiredSSTable);
+                if (coversExpired)
+                    assertTrue("expired window must route through TimeSeriesCompactionTask", task instanceof TimeSeriesCompactionTask);
+                else
+                    assertFalse("live window must not route through TimeSeriesCompactionTask", task instanceof TimeSeriesCompactionTask);
+            }
+        }
+        finally
+        {
+            for (AbstractCompactionTask task : tasks)
+                task.transaction.abort();
+        }
     }
 }

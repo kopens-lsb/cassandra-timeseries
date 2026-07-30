@@ -94,6 +94,21 @@ public class TimeSeriesCompactionStrategyOptionsTest
     }
 
     @Test
+    public void overflowSafeNearMaxWindowStartIsActiveNotExpired()
+    {
+        // A garbage/adversarial max-timestamp near Long.MAX_VALUE, floored to its window's grid start. With
+        // the addition form (windowStart + windowSize + freezeAfter > now, and windowStart + windowSize <=
+        // now - retention) this wraps negative and would misclassify the window as expired instead of active;
+        // the subtraction form (see isActiveWindow/isExpiredWindow) must not.
+        TimeSeriesCompactionStrategyOptions opts =
+            new TimeSeriesCompactionStrategyOptions(options("window_size", "1h", "freeze_after", "2h", "retention", "30d"));
+        long now = 1_700_000_000_000L;
+        long windowStart = opts.windowStartFor(Long.MAX_VALUE - 775_000L);
+        assertTrue(opts.isActiveWindow(windowStart, now));
+        assertFalse(opts.isExpiredWindow(windowStart, now));
+    }
+
+    @Test
     public void retentionUnsetNeverExpires()
     {
         TimeSeriesCompactionStrategyOptions opts = new TimeSeriesCompactionStrategyOptions(options("window_size", "1h"));

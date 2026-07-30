@@ -18,6 +18,7 @@
 
 package org.apache.cassandra.db.compaction;
 
+import java.util.Collection;
 import java.util.HashMap;
 import java.util.List;
 import java.util.Map;
@@ -85,7 +86,7 @@ public class TimeSeriesCompactionStrategyTest
         tscs.addSSTable(current);
         tscs.addSSTable(old);
 
-        Map<Long, Set<SSTableReader>> windows = tscs.windows(NOW);
+        Map<Long, Set<SSTableReader>> windows = tscs.windows();
         assertEquals(2, windows.size());
         for (Map.Entry<Long, Set<SSTableReader>> window : windows.entrySet())
             for (SSTableReader sstable : window.getValue())
@@ -195,5 +196,31 @@ public class TimeSeriesCompactionStrategyTest
         TimeSeriesCompactionStrategy tscs = strategy(mock(UnifiedCompactionStrategy.class));
         tscs.addSSTable(sstableAt(NOW - 400L * 24 * HOUR));
         assertEquals(Set.of(), tscs.expiredSSTables(NOW));
+    }
+
+    @Test
+    public void expiredSelectionIsFilteredThroughLiveSSTablesAndNeverTriesTheTracker()
+    {
+        UnifiedCompactionStrategy delegate = mock(UnifiedCompactionStrategy.class);
+        AbstractCompactionTask delegateTask = mock(AbstractCompactionTask.class);
+        when(delegate.getNextBackgroundTasks(anyLong())).thenReturn(List.of(delegateTask));
+
+        ColumnFamilyStore cfs = mock(ColumnFamilyStore.class, Mockito.RETURNS_DEEP_STUBS);
+        // Simulate a zombie: this instance's own bookkeeping still classifies the sstable as an expired
+        // window, but the tracker no longer considers it live (e.g. removed via another path already).
+        // Mirrors UnifiedCompactionStrategy#getSSTables' zombie filter (CASSANDRA-18342).
+        when(cfs.getLiveSSTables()).thenReturn(Set.of());
+
+        Map<String, String> opts = options();
+        opts.put(TimeSeriesCompactionStrategyOptions.RETENTION, "30d");
+        TimeSeriesCompactionStrategy tscs = new TimeSeriesCompactionStrategy(cfs, opts, delegate);
+        tscs.addSSTable(sstableAt(NOW - 31L * 24 * HOUR));               // expired per classification, but not live
+
+        Collection<AbstractCompactionTask> tasks = tscs.getNextBackgroundTasksAt(NOW, 0);
+
+        // Nothing survived the live-set filter, so the tracker is never asked to mark anything compacting,
+        // and background tasks fall through to the delegate untouched.
+        Mockito.verify(cfs.getTracker(), Mockito.never()).tryModify(Mockito.anyCollection(), Mockito.any(OperationType.class));
+        assertEquals(List.of(delegateTask), List.copyOf(tasks));
     }
 }

@@ -50,6 +50,12 @@ import org.apache.cassandra.utils.Clock;
  * <p>
  * Instances only ever see the sstable slice the CompactionStrategyManager assigns them (per
  * repair status and per disk), so all window state is derived per call and never assumed complete.
+ * <p>
+ * <b>Caveat (this increment):</b> a closed window (past {@code window_size + freeze_after}) is no longer
+ * compacted by the delegate, so TTL/tombstone expiry within it is never re-evaluated there. The only
+ * mechanism that reclaims space in a closed window is the whole-window retention drop; without
+ * {@code retention} configured, TTL-expired data in a closed window is not reclaimed until the freeze
+ * increment lands (design spec section 10). If your table uses TTLs, set {@code retention}.
  */
 public class TimeSeriesCompactionStrategy extends AbstractCompactionStrategy
 {
@@ -64,14 +70,27 @@ public class TimeSeriesCompactionStrategy extends AbstractCompactionStrategy
 
     public TimeSeriesCompactionStrategy(ColumnFamilyStore cfs, Map<String, String> options)
     {
-        this(cfs, options, new UnifiedCompactionStrategy(cfs, new TimeSeriesCompactionStrategyOptions(options).delegateOptions(options)));
+        this(cfs, options, new TimeSeriesCompactionStrategyOptions(options));
+    }
+
+    // Builds the delegate from tsOptions built exactly once by the caller (either public ctor above, or the
+    // @VisibleForTesting ctor below), rather than each ctor building its own TimeSeriesCompactionStrategyOptions.
+    private TimeSeriesCompactionStrategy(ColumnFamilyStore cfs, Map<String, String> options, TimeSeriesCompactionStrategyOptions tsOptions)
+    {
+        this(cfs, options, tsOptions, new UnifiedCompactionStrategy(cfs, tsOptions.delegateOptions(options)));
     }
 
     @VisibleForTesting
     TimeSeriesCompactionStrategy(ColumnFamilyStore cfs, Map<String, String> options, UnifiedCompactionStrategy delegate)
     {
+        this(cfs, options, new TimeSeriesCompactionStrategyOptions(options), delegate);
+    }
+
+    private TimeSeriesCompactionStrategy(ColumnFamilyStore cfs, Map<String, String> options,
+                                         TimeSeriesCompactionStrategyOptions tsOptions, UnifiedCompactionStrategy delegate)
+    {
         super(cfs, options);
-        this.tsOptions = new TimeSeriesCompactionStrategyOptions(options);
+        this.tsOptions = tsOptions;
         this.delegate = delegate;
     }
 
@@ -90,13 +109,25 @@ public class TimeSeriesCompactionStrategy extends AbstractCompactionStrategy
         lastExpiredSelection = expired;
         if (!expired.isEmpty())
         {
-            LifecycleTransaction txn = cfs.getTracker().tryModify(expired, OperationType.COMPACTION);
-            if (txn != null)
+            // Mirror UCS's zombie-sstable filter (UnifiedCompactionStrategy#getSSTables, CASSANDRA-18342):
+            // only ever try to mark sstables the tracker still considers live, and never a suspect one, for
+            // compaction. expiredSSTables() classifies purely off this instance's own bookkeeping, which can
+            // be briefly stale relative to the tracker's live set.
+            Set<SSTableReader> toDrop = new HashSet<>(AbstractCompactionStrategy.filterSuspectSSTables(expired));
+            toDrop.retainAll(cfs.getLiveSSTables());
+            if (!toDrop.isEmpty())
             {
-                long cutoff = nowMillis - tsOptions.retentionMillis;
-                logger.info("Dropping {} expired-window sstables from {} (retention cutoff {})",
-                            expired.size(), cfs.getTableName(), cutoff);
-                return List.of(new TimeSeriesCompactionTask(cfs, txn, gcBefore, cutoff, tsOptions.timestampResolution));
+                LifecycleTransaction txn = cfs.getTracker().tryModify(toDrop, OperationType.COMPACTION);
+                if (txn != null)
+                {
+                    long cutoff = nowMillis - tsOptions.retentionMillis;
+                    logger.info("Dropping {} expired-window sstables from {} (retention cutoff {})",
+                                toDrop.size(), cfs.getTableName(), cutoff);
+                    return List.of(new TimeSeriesCompactionTask(cfs, txn, gcBefore, cutoff, tsOptions.timestampResolution));
+                }
+                logger.debug("Unable to mark {} expired-window sstables for compaction in {}; probably a background " +
+                             "compaction or the retention drop from a previous round got to them first",
+                             toDrop.size(), cfs.getTableName());
             }
         }
 
@@ -140,7 +171,7 @@ public class TimeSeriesCompactionStrategy extends AbstractCompactionStrategy
     }
 
     @VisibleForTesting
-    synchronized Map<Long, Set<SSTableReader>> windows(long nowMillis)
+    synchronized Map<Long, Set<SSTableReader>> windows()
     {
         Map<Long, Set<SSTableReader>> result = new TreeMap<>();
         for (SSTableReader sstable : sstables)
@@ -177,12 +208,21 @@ public class TimeSeriesCompactionStrategy extends AbstractCompactionStrategy
     public List<AbstractCompactionTask> getMaximalTasks(long gcBefore, boolean splitOutput)
     {
         // Preserve the window invariant for maximal compaction too: never cross windows, one task per window.
+        // A window that is itself expired (per the real clock) is routed through TimeSeriesCompactionTask so
+        // its retention cutoff is honoured here too, rather than silently rewriting it via a plain CompactionTask.
+        long nowMillis = Clock.Global.currentTimeMillis();
         List<AbstractCompactionTask> tasks = new ArrayList<>();
-        for (Set<SSTableReader> window : windows(Clock.Global.currentTimeMillis()).values())
+        for (Map.Entry<Long, Set<SSTableReader>> entry : windows().entrySet())
         {
+            Collection<SSTableReader> window = AbstractCompactionStrategy.filterSuspectSSTables(entry.getValue());
+            if (window.isEmpty())
+                continue;
             LifecycleTransaction txn = cfs.getTracker().tryModify(window, OperationType.COMPACTION);
-            if (txn != null)
-                tasks.add(new CompactionTask(cfs, txn, gcBefore));
+            if (txn == null)
+                continue;
+            tasks.add(tsOptions.isExpiredWindow(entry.getKey(), nowMillis)
+                      ? new TimeSeriesCompactionTask(cfs, txn, gcBefore, nowMillis - tsOptions.retentionMillis, tsOptions.timestampResolution)
+                      : new CompactionTask(cfs, txn, gcBefore));
         }
         return tasks;                                     // never null, unlike TWCS
     }

@@ -77,14 +77,26 @@ public final class TimeSeriesCompactionStrategyOptions
         return TimeWindowCompactionStrategy.getWindowBoundsInMillis(windowUnit, windowSizeInUnits, timestampMillis).left;
     }
 
+    /**
+     * Written in subtraction form ({@code windowStartMillis > nowMillis - windowSizeMillis - freezeAfterMillis})
+     * rather than the equivalent addition form ({@code windowStartMillis + windowSizeMillis + freezeAfterMillis
+     * > nowMillis}): {@code windowStartMillis} is derived from an sstable's max timestamp, which for a
+     * garbage/adversarial write can be near {@code Long.MAX_VALUE}. Adding {@code windowSizeMillis +
+     * freezeAfterMillis} to such a value silently wraps to a negative number, which would misclassify an
+     * active window as inactive (and, in {@link #isExpiredWindow}, as expired - leading to whole-sstable
+     * obsoletion with no rewrite). The subtraction's operands are both config-derived and bounded (the
+     * duration parser caps at {@code Integer.MAX_VALUE} days), so {@code nowMillis - windowSizeMillis -
+     * freezeAfterMillis} cannot itself wrap for any real clock value.
+     */
     public boolean isActiveWindow(long windowStartMillis, long nowMillis)
     {
-        return windowStartMillis + windowSizeMillis + freezeAfterMillis > nowMillis;
+        return windowStartMillis > nowMillis - windowSizeMillis - freezeAfterMillis;
     }
 
+    /** See {@link #isActiveWindow} for why this is written in subtraction form. */
     public boolean isExpiredWindow(long windowStartMillis, long nowMillis)
     {
-        return retentionMillis >= 0 && windowStartMillis + windowSizeMillis <= nowMillis - retentionMillis;
+        return retentionMillis >= 0 && windowStartMillis <= nowMillis - retentionMillis - windowSizeMillis;
     }
 
     /** A copy of {@code original} without this strategy's own keys - the options handed to the UCS delegate. */

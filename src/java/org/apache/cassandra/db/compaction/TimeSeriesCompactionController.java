@@ -36,6 +36,20 @@ import org.apache.cassandra.io.sstable.format.SSTableReader;
  * deliberate policy decision, not a correctness-preserving tombstone purge - all replicas apply the same
  * retention policy, so a brief resurrection of rows near the cutoff (e.g. via repair from a clock-skewed
  * replica that has not yet caught up to the same cutoff) is an accepted trade-off of this feature, not a bug.
+ * <p>
+ * Cross-replica clock skew is not the only case this trades away. Two purely local, single-replica cases
+ * follow from the same "whole sstable, by max timestamp" policy:
+ * <ul>
+ *   <li>An sstable is classified by its <i>max</i> timestamp, so a single arbitrarily-old row co-resident with
+ *       a recent one keeps that old row alive until the whole sstable's window passes retention - retention is
+ *       therefore a floor on how long data survives, not an exact per-row guarantee.</li>
+ *   <li>Dropping an expired sstable that holds a tombstone whose shadowed row lives in a different,
+ *       newer/mixed-window sstable permanently resurrects that row - the tombstone is gone, the row it was
+ *       covering is not, and no future compaction will re-encounter both together.</li>
+ * </ul>
+ * Exact per-row retention and safe tombstone handling in the presence of mixed-age sstables require flush-time
+ * window-splitting - so a flushed sstable's data never crosses a window boundary in the first place (design
+ * spec section 4 invariant) - which arrives in increment T3, not this one.
  */
 public class TimeSeriesCompactionController extends CompactionController
 {
