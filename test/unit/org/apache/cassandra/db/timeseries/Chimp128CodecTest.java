@@ -222,7 +222,7 @@ public class Chimp128CodecTest
     public void cursorAccessBeforeAdvanceThrows()
     {
         ByteBuffer payload = Chimp128Codec.encode(new long[]{ 1L }, new double[]{ 1.0 }, 1);
-        GorillaCodec.SampleCursor cursor = Chimp128Codec.cursor(payload);
+        SampleCursor cursor = Chimp128Codec.cursor(payload);
 
         assertThrowsIllegalState(cursor::timestamp);
         assertThrowsIllegalState(cursor::value);
@@ -241,7 +241,7 @@ public class Chimp128CodecTest
         ByteBuffer payload = Chimp128Codec.encode(timestamps, values, 100);
         payload.limit(payload.limit() - 10);   // 뒤 10바이트 절단
 
-        GorillaCodec.SampleCursor cursor = Chimp128Codec.cursor(payload);
+        SampleCursor cursor = Chimp128Codec.cursor(payload);
         while (cursor.advance())
         {
             // 절단 지점에서 IndexOutOfBoundsException(RuntimeException) 이 나야 한다
@@ -266,7 +266,7 @@ public class Chimp128CodecTest
             corrupted.put(corruptByte, (byte) (corrupted.get(corruptByte) ^ 0x5A));
             try
             {
-                GorillaCodec.SampleCursor cursor = Chimp128Codec.cursor(corrupted);
+                SampleCursor cursor = Chimp128Codec.cursor(corrupted);
                 int decoded = 0;
                 while (cursor.advance() && decoded < 200) decoded++;
             }
@@ -318,7 +318,7 @@ public class Chimp128CodecTest
     static void assertRoundtrip(long[] timestamps, double[] values, int count)
     {
         ByteBuffer payload = Chimp128Codec.encode(timestamps, values, count);
-        GorillaCodec.SampleCursor cursor = Chimp128Codec.cursor(payload);
+        SampleCursor cursor = Chimp128Codec.cursor(payload);
         for (int i = 0; i < count; i++)
         {
             assertTrue("ended early at " + i, cursor.advance());

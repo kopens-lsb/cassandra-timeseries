@@ -35,6 +35,9 @@ import java.nio.ByteOrder;
  */
 public final class ChunkCodecs
 {
+    public static final int HEADER_SIZE = 21;
+    public static final int MAX_SAMPLES = GorillaCodec.MAX_SAMPLES;
+
     private ChunkCodecs()
     {
     }
@@ -57,7 +60,43 @@ public final class ChunkCodecs
         }
     }
 
-    public static GorillaCodec.SampleCursor cursor(ByteBuffer payload)
+    /**
+     * Encodes {@code timestamps}/{@code values} with both codecs and returns whichever payload's
+     * {@link ByteBuffer#remaining()} is smaller -- ties favor {@link Codec#GORILLA}.
+     * <p>
+     * This is the "auto" chunk-codec policy: it costs one extra encode per window (on the order of
+     * milliseconds), which the bake-off in
+     * docs/superpowers/specs/2026-07-31-chimp128-codec-design.md and doc/timeseries/codec-bakeoff.md
+     * justifies -- chimp128 is roughly 3.2x smaller than gorilla on quantized data, but roughly 5x
+     * larger on constant series, so neither codec is a safe static default across workloads.
+     */
+    public static ByteBuffer encodeSmallest(long[] timestamps, double[] values, int count)
+    {
+        ByteBuffer gorilla = GorillaCodec.encode(timestamps, values, count);
+        ByteBuffer chimp = Chimp128Codec.encode(timestamps, values, count);
+        return chimp.remaining() < gorilla.remaining() ? chimp : gorilla;
+    }
+
+    /**
+     * Maps the version byte at {@code payload.position()} to the {@link Codec} that produced it,
+     * without mutating {@code payload}. Throws {@link IllegalArgumentException} naming the byte if
+     * it does not match a known codec version.
+     */
+    public static Codec codecOf(ByteBuffer payload)
+    {
+        byte version = versionByte(payload);
+        switch (version)
+        {
+            case GorillaCodec.VERSION:
+                return Codec.GORILLA;
+            case Chimp128Codec.VERSION:
+                return Codec.CHIMP128;
+            default:
+                throw new IllegalArgumentException("Unsupported chunk codec version: " + version);
+        }
+    }
+
+    public static SampleCursor cursor(ByteBuffer payload)
     {
         switch (versionByte(payload))
         {

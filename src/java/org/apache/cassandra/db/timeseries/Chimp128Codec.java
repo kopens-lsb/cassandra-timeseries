@@ -185,7 +185,7 @@ public final class Chimp128Codec
         return buffer;
     }
 
-    public static GorillaCodec.SampleCursor cursor(ByteBuffer payload)
+    public static SampleCursor cursor(ByteBuffer payload)
     {
         ByteBuffer buffer = payload.duplicate().order(ByteOrder.BIG_ENDIAN);
         byte version = buffer.get();
@@ -198,7 +198,7 @@ public final class Chimp128Codec
         buffer.getLong();
         BitReader bits = new BitReader(buffer);
 
-        return new GorillaCodec.SampleCursor()
+        return new SampleCursor()
         {
             private int index = -1;
             private long timestamp;

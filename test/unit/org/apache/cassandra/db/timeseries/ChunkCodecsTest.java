@@ -42,7 +42,7 @@ public class ChunkCodecsTest
         for (ChunkCodecs.Codec codec : ChunkCodecs.Codec.values())
         {
             ByteBuffer payload = ChunkCodecs.encode(codec, ts, vs, 3);
-            GorillaCodec.SampleCursor cursor = ChunkCodecs.cursor(payload);
+            SampleCursor cursor = ChunkCodecs.cursor(payload);
             for (int i = 0; i < 3; i++) { assertTrue(cursor.advance()); assertEquals(ts[i], cursor.timestamp()); }
             assertEquals(3, ChunkCodecs.sampleCount(payload));
         }
@@ -66,6 +66,61 @@ public class ChunkCodecsTest
             assertEquals(10L, ChunkCodecs.firstTimestamp(payload));
             assertEquals(30L, ChunkCodecs.lastTimestamp(payload));
         }
+    }
+
+    @Test
+    public void codecOfRoundtrip()
+    {
+        long[] ts = { 1L, 2L, 3L }; double[] vs = { 1.0, 2.0, 3.0 };
+        for (ChunkCodecs.Codec codec : ChunkCodecs.Codec.values())
+        {
+            ByteBuffer payload = ChunkCodecs.encode(codec, ts, vs, 3);
+            assertEquals(codec, ChunkCodecs.codecOf(payload));
+        }
+
+        ByteBuffer payload = ChunkCodecs.encode(ChunkCodecs.Codec.GORILLA, ts, vs, 3);
+        payload.put(payload.position(), (byte) 9);
+        assertThatThrownBy(() -> ChunkCodecs.codecOf(payload)).isInstanceOf(IllegalArgumentException.class);
+    }
+
+    @Test
+    public void encodeSmallestPicksGorillaForConstants()
+    {
+        int n = 1000;
+        long[] ts = new long[n]; double[] vs = new double[n];
+        for (int i = 0; i < n; i++) { ts[i] = i * 1000L; vs[i] = 42.0; }
+
+        ByteBuffer payload = ChunkCodecs.encodeSmallest(ts, vs, n);
+        assertEquals((byte) GorillaCodec.VERSION, payload.get(payload.position()));
+        assertEquals(ChunkCodecs.Codec.GORILLA, ChunkCodecs.codecOf(payload));
+    }
+
+    @Test
+    public void encodeSmallestPicksChimpForQuantizedWalk()
+    {
+        int n = 100_000;
+        long[] ts = new long[n]; double[] vs = new double[n];
+        java.util.Random random = new java.util.Random(17);
+        double walk = 50.0;
+        for (int i = 0; i < n; i++)
+        {
+            ts[i] = i * 1000L;
+            walk += (random.nextInt(3) - 1) * 0.1;
+            vs[i] = Math.round(walk * 10.0) / 10.0;
+        }
+
+        ByteBuffer payload = ChunkCodecs.encodeSmallest(ts, vs, n);
+        assertEquals((byte) Chimp128Codec.VERSION, payload.get(payload.position()));
+        assertEquals(ChunkCodecs.Codec.CHIMP128, ChunkCodecs.codecOf(payload));
+    }
+
+    @Test
+    public void headerConstantsAgree()
+    {
+        assertEquals(GorillaCodec.HEADER_SIZE, Chimp128Codec.HEADER_SIZE);
+        assertEquals(GorillaCodec.HEADER_SIZE, ChunkCodecs.HEADER_SIZE);
+        assertEquals(GorillaCodec.MAX_SAMPLES, Chimp128Codec.MAX_SAMPLES);
+        assertEquals(GorillaCodec.MAX_SAMPLES, ChunkCodecs.MAX_SAMPLES);
     }
 
     @Test
@@ -117,7 +172,7 @@ public class ChunkCodecsTest
             // decode timings too
             GorillaCodec.SampleCursor g = GorillaCodec.cursor(GorillaCodec.encode(ts, vs, n));
             long t3 = System.nanoTime(); while (g.advance()) {} long t4 = System.nanoTime();
-            GorillaCodec.SampleCursor c = Chimp128Codec.cursor(Chimp128Codec.encode(ts, vs, n));
+            SampleCursor c = Chimp128Codec.cursor(Chimp128Codec.encode(ts, vs, n));
             long t5 = System.nanoTime(); while (c.advance()) {} long t6 = System.nanoTime();
             System.out.printf("BAKEOFF %-22s gorilla=%.3f B/s chimp=%.3f B/s ratio=%.2f " +
                               "enc(g/c)=%d/%d ms dec(g/c)=%d/%d ms%n",

@@ -45,11 +45,9 @@ public final class GorillaCodec
     {
     }
 
-    public interface SampleCursor
+    /** Retained for source compatibility with existing {@code GorillaCodec.SampleCursor} references. */
+    public interface SampleCursor extends org.apache.cassandra.db.timeseries.SampleCursor
     {
-        boolean advance();
-        long timestamp();
-        double value();
     }
 
     public static ByteBuffer encode(long[] timestamps, double[] values, int count)
