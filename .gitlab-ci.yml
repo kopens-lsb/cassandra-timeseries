@@ -57,9 +57,11 @@ timeseries-tests:
     - ant testsome -Dtest.name=org.apache.cassandra.index.sai.cql.AllowFilteringTest
     # 3-node cluster semantics (consistency levels, paging, unrepaired rows)
     - ant test-jvm-dtest-some -Dtest.name=org.apache.cassandra.distributed.test.sai.AnalyzedLikeDistributedTest
-    # tiered storage: gorilla codec
+    # tiered storage: chunk codecs (gorilla v1, chimp128 v2) + version dispatcher/bake-off
     - ant testsome -Dtest.name=org.apache.cassandra.db.timeseries.BitStreamTest
     - ant testsome -Dtest.name=org.apache.cassandra.db.timeseries.GorillaCodecTest
+    - ant testsome -Dtest.name=org.apache.cassandra.db.timeseries.Chimp128CodecTest
+    - ant testsome -Dtest.name=org.apache.cassandra.db.timeseries.ChunkCodecsTest
     # time-series compaction strategy (TSCS T1)
     - ant testsome -Dtest.name=org.apache.cassandra.db.compaction.TimeSeriesCompactionStrategyOptionsTest
     - ant testsome -Dtest.name=org.apache.cassandra.db.compaction.TimeSeriesCompactionStrategyTest

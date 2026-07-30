@@ -1,4 +1,5 @@
 6.0.0
+ * Add chimp128 chunk codec (v2) with version-dispatched decoding and a codec bake-off report
  * Add TimeSeriesCompactionStrategy (T1): time-window classification with in-window UCS delegation and whole-window retention drops (T1: closed-window TTL reclamation requires 'retention' until freeze lands)
  * Add SAI full-text search: index_analyzer index option (ngram/standard/cjk/keyword presets or JSON config) enabling substring LIKE ('%fragment%', 'prefix%', '%suffix') on text columns, korean included, served by n-gram recall + raw-value precision recheck
  * Add time-series gap-filling: GROUP BY time_bucket_gapfill(width, ts, start, finish) materializes empty buckets, with locf() and interpolate() fill policies
