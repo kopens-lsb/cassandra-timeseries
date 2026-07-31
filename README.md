@@ -385,7 +385,52 @@ SELECT time_bucket(5m, ts), count(*) FROM logs
 
 동작 원리: 값 전체를 2~3글자 n-gram으로 색인(재현율) → 그램 교집합으로 후보 추출 → **원문에 LIKE 패턴 재적용**(정밀도). 색인은 원본 컬럼의 수 배 크기가 되므로 로그성 테이블에 선별 적용하세요. 2글자 미만 조각은 명시적 에러로 거부됩니다. `=`는 완전일치 의미를 유지합니다.
 
-## 11. 운영 팁
+## 11. 시계열 컴팩션(TSCS) 설정
+
+TWCS의 시간 정렬·통삭제와 UCS의 창 내부 컴팩션을 결합한 전용 전략입니다. 테이블 생성(또는 ALTER) 시 지정합니다:
+
+```sql
+CREATE TABLE ts.sensor (
+  tag_id text, timestamp timestamp, value double,
+  PRIMARY KEY (tag_id, timestamp)
+) WITH compaction = {
+  'class': 'TimeSeriesCompactionStrategy',
+  'window_size': '1h',           -- 시간 창 폭 (계층화 chunk_window와 맞추길 권장)
+  'freeze_after': '2h',          -- 창이 닫히고 이 시간이 지나면 동결(창당 1 SSTable로 수렴)
+  'scaling_parameters': 'T4',    -- 현재 창 내부는 UCS에 위임 (UCS 문법 그대로)
+  'retention': '30d',            -- 선택: 창 상한이 now-30d를 지나면 컴팩션 없이 통째 삭제
+  'max_future_window': '1d'      -- 선택: 미래 타임스탬프 가드 (기본 1d)
+};
+```
+
+- 닫힌 창은 자동으로 **창당 1 SSTable**로 동결되어 읽기 증폭이 최소화되고, TTL 데이터도 retention 없이 회수됩니다.
+- 지각(백필) 데이터는 flush/스트리밍 시 창 경계에서 분리되어 **자기 창에 국소 편입**됩니다 — 현재 창 컴팩션을 오염시키지 않습니다.
+- 상세: [설계 스펙](docs/superpowers/specs/2026-07-31-timeseries-compaction-design.md)
+
+## 12. 계층형 저장(tiered storage) 설정
+
+오래된 창을 Gorilla/Chimp128 청크로 압축해 `<테이블>__chunks`로 옮기고, **SELECT는 그대로**(투명 읽기가 핫+콜드 자동 병합) 쓰는 기능입니다. 테이블 `extensions`에 JSON 정책을 hex로 넣습니다:
+
+```sql
+-- 정책 JSON: {"hot_window":"7d","chunk_window":"1h","cold_window":"365d","interval":"1h","codec":"auto"}
+-- hex 인코딩: echo -n '<JSON>' | xxd -p | tr -d '\n'
+ALTER TABLE ts.sensor WITH extensions = {
+  'timeseries_tiering': 0x7b22686f745f77696e646f77223a223764222c226368756e6b5f77696e646f77223a223168222c22636f6c645f77696e646f77223a2233363564222c22696e74657276616c223a223168222c22636f646563223a226175746f227d
+};
+```
+
+| 필드 | 의미 |
+| --- | --- |
+| `hot_window` | 이 기간 안의 데이터는 행 그대로 유지 (예: `7d`) |
+| `chunk_window` | 청크 1개가 담는 창 폭 (최대 `31d`, TSCS `window_size`와 정렬 권장) |
+| `cold_window` | 선택 — 이 기간을 지난 청크는 통째 삭제 (미지정 시 영구 보관) |
+| `interval` | 백그라운드 재인코딩 주기 (60초 스위퍼가 주기 도래 테이블만 처리) |
+| `codec` | `auto`(창마다 작은 쪽 선택) \| `gorilla` \| `chimp128` |
+| `consistency` | 재인코더 CL — `LOCAL_QUORUM`(기본)/`QUORUM`/`EACH_QUORUM`/`ALL`만 허용 |
+
+운영: `nodetool retier <ks> <table>`(수동 1사이클), `nodetool tieringstatus`, `system_views.timeseries_tiering`. 지각 데이터는 이미 청크화된 창에 들어와도 다음 사이클에 병합됩니다(rows-win). 상세·제한사항: [tiered-storage.md](doc/timeseries/tiered-storage.md) · 실측: [벤치마크](doc/timeseries/tiering-benchmark.md)
+
+## 13. 운영 팁
 
 - **항상 파티션을 지정하세요**(`WHERE series = ...`) 그리고 시간 범위도 함께. 시계열 스캔은 `ts`로 정렬된 단일 파티션 안에서 가장 저렴합니다.
 - **파티션 크기를 제한하세요.** 고빈도 시리즈라면 파티션 키에 굵은 시간 버킷을 넣어 무한정 커지는 파티션을 막습니다. 예: `PRIMARY KEY ((series, day), ts)`.
