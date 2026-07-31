@@ -17,6 +17,8 @@
  */
 package org.apache.cassandra.cql3.statements.schema;
 
+import java.nio.ByteBuffer;
+import java.util.HashMap;
 import java.util.Map;
 import java.util.Set;
 
@@ -26,6 +28,7 @@ import com.google.common.collect.Sets;
 import org.apache.cassandra.config.DatabaseDescriptor;
 import org.apache.cassandra.cql3.statements.PropertyDefinitions;
 import org.apache.cassandra.exceptions.ConfigurationException;
+import org.apache.cassandra.exceptions.InvalidRequestException;
 import org.apache.cassandra.exceptions.SyntaxException;
 import org.apache.cassandra.schema.AutoRepairParams;
 import org.apache.cassandra.schema.CachingParams;
@@ -42,6 +45,7 @@ import org.apache.cassandra.service.consensus.TransactionalMode;
 import org.apache.cassandra.service.consensus.migration.TransactionalMigrationFromMode;
 import org.apache.cassandra.service.reads.SpeculativeRetryPolicy;
 import org.apache.cassandra.service.reads.repair.ReadRepairStrategy;
+import org.apache.cassandra.utils.ByteBufferUtil;
 
 import static java.lang.String.format;
 import static org.apache.cassandra.schema.TableParams.Option.ADDITIONAL_WRITE_POLICY;
@@ -54,6 +58,7 @@ import static org.apache.cassandra.schema.TableParams.Option.COMPACTION;
 import static org.apache.cassandra.schema.TableParams.Option.COMPRESSION;
 import static org.apache.cassandra.schema.TableParams.Option.CRC_CHECK_CHANCE;
 import static org.apache.cassandra.schema.TableParams.Option.DEFAULT_TIME_TO_LIVE;
+import static org.apache.cassandra.schema.TableParams.Option.EXTENSIONS;
 import static org.apache.cassandra.schema.TableParams.Option.GC_GRACE_SECONDS;
 import static org.apache.cassandra.schema.TableParams.Option.INCREMENTAL_BACKUPS;
 import static org.apache.cassandra.schema.TableParams.Option.MAX_INDEX_INTERVAL;
@@ -200,7 +205,30 @@ public final class TableAttributes extends PropertyDefinitions
         if (hasOption(Option.AUTO_REPAIR))
             builder.automatedRepair(AutoRepairParams.fromMap(getMap(Option.AUTO_REPAIR)));
 
+        if (hasOption(EXTENSIONS))
+        {
+            Map<String, ByteBuffer> extensions = new HashMap<>();
+            for (Map.Entry<String, String> entry : getMap(EXTENSIONS).entrySet())
+                extensions.put(entry.getKey(), parseExtensionValue(entry.getKey(), entry.getValue()));
+            builder.extensions(extensions);
+        }
+
         return builder.build();
+    }
+
+    private static ByteBuffer parseExtensionValue(String key, String value)
+    {
+        if (value == null || !value.startsWith("0x"))
+            throw new InvalidRequestException(format("Invalid value for extension '%s': expected a blob literal (0x...)", key));
+
+        try
+        {
+            return ByteBufferUtil.hexToBytes(value.substring(2));
+        }
+        catch (NumberFormatException e)
+        {
+            throw new InvalidRequestException(format("Invalid hex value for extension '%s': %s", key, e.getMessage()));
+        }
     }
 
     public boolean hasOption(Option option)
