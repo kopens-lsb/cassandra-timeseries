@@ -618,17 +618,6 @@ public class TieredStorageService implements TieredStorageServiceMBean
                     windowStart = windowEnd;
                 }
 
-                if (policy.coldWindowMillis >= 0)
-                {
-                    List<ByteBuffer> coldValues = Arrays.asList(
-                            tag, TimestampType.instance.fromTimeInMillis(nowMillis - policy.coldWindowMillis));
-                    List<UntypedResultSet.Row> expired = pagedSelect(selectExpiredQuery, cl, coldValues);
-                    if (!expired.isEmpty())
-                    {
-                        stats.chunksExpired += expired.size();
-                        QueryProcessor.process(deleteExpiredQuery, cl, coldValues);
-                    }
-                }
             }
             catch (RuntimeException e)
             {
@@ -642,6 +631,37 @@ public class TieredStorageService implements TieredStorageServiceMBean
         {
             logger.warn("Tiered storage runOnce: {}.{} skipped {} row(s) with no live value cell to encode " +
                         "(bare key insert, deleted value, or expired TTL)", keyspace, table, nullCellsSkipped[0]);
+        }
+
+        // Cold expiry enumerates tags from the CHUNK table, not the base table (SP3 R6): a tag whose
+        // base rows were all re-encoded (or TTL'd) away no longer appears in the base DISTINCT scan,
+        // but its cold chunks must still expire.
+        if (policy.coldWindowMillis >= 0)
+        {
+            TableMetadata chunkMeta = Schema.instance.getTableMetadata(keyspace, ChunkTables.chunkTableName(table));
+            if (chunkMeta != null)
+            {
+                for (ByteBuffer tag : enumerateTags(chunkMeta, tagCql, tagRaw, chunkRef, cl))
+                {
+                    try
+                    {
+                        List<ByteBuffer> coldValues = Arrays.asList(
+                                tag, TimestampType.instance.fromTimeInMillis(nowMillis - policy.coldWindowMillis));
+                        List<UntypedResultSet.Row> expired = pagedSelect(selectExpiredQuery, cl, coldValues);
+                        if (!expired.isEmpty())
+                        {
+                            stats.chunksExpired += expired.size();
+                            QueryProcessor.process(deleteExpiredQuery, cl, coldValues);
+                        }
+                    }
+                    catch (RuntimeException e)
+                    {
+                        logger.error("Tiered storage runOnce: {}.{} failed while expiring cold chunks of tag {} -- " +
+                                     "skipping to the next tag; retried next cycle", keyspace, table,
+                                     tagColumn.type.getString(tag), e);
+                    }
+                }
+            }
         }
 
         return stats;

@@ -311,6 +311,26 @@ public class TieredStorageServiceTest extends CQLTester
     }
 
     @Test
+    public void deadTagColdChunksStillExpire() throws Throwable
+    {
+        createTable("CREATE TABLE %s (tag text, ts timestamp, value double, PRIMARY KEY (tag, ts))");
+        setPolicy("{\"hot_window\":\"1h\",\"chunk_window\":\"1h\",\"cold_window\":\"2h\"}");
+
+        TableMetadata base = getCurrentColumnFamilyStore().metadata();
+        ChunkTables.ensureChunkTable(base);
+
+        // SP3 R6: this tag has NO base rows at all (fully re-encoded, then the base rows aged away) -
+        // it exists only in the chunk table. Chunk-table-driven expiry enumeration must still find
+        // and expire its cold chunk; the old base-DISTINCT enumeration never would have.
+        ByteBuffer expiring = ChunkCodecs.encodeSmallest(new long[]{ 0L }, new double[]{ 1.0 }, 1);
+        execute(chunkInsertQuery(), "dead", new Date(0L), 1, 500L, expiring, 1L);
+
+        TierRunStats stats = new TieredStorageService().runOnce(KEYSPACE, currentTable(), 10 * HOUR);
+        assertEquals(1, stats.chunksExpired);
+        assertEquals(0, execute(chunkSelectQuery(), "dead", new Date(0L)).size());
+    }
+
+    @Test
     public void nonCanonicalSchemaSkipsWithError() throws Throwable
     {
         createTable("CREATE TABLE %s (tag text, ts timestamp, value double, extra int, PRIMARY KEY (tag, ts))");
