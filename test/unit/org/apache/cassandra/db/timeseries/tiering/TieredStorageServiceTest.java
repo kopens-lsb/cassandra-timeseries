@@ -21,24 +21,25 @@ import java.nio.ByteBuffer;
 import java.util.Date;
 import java.util.Random;
 
-import ch.qos.logback.classic.Level;
-import ch.qos.logback.classic.Logger;
-import ch.qos.logback.classic.spi.ILoggingEvent;
-import ch.qos.logback.core.read.ListAppender;
 import org.junit.BeforeClass;
 import org.junit.Test;
 import org.slf4j.LoggerFactory;
 
 import org.apache.cassandra.cql3.CQLTester;
 import org.apache.cassandra.cql3.UntypedResultSet;
-import org.apache.cassandra.db.timeseries.ChunkCodecs;
 import org.apache.cassandra.db.timeseries.Chimp128Codec;
+import org.apache.cassandra.db.timeseries.ChunkCodecs;
 import org.apache.cassandra.db.timeseries.GorillaCodec;
 import org.apache.cassandra.db.timeseries.SampleCursor;
 import org.apache.cassandra.db.timeseries.tiering.TieredStorageService.TierRunStats;
 import org.apache.cassandra.schema.Schema;
 import org.apache.cassandra.schema.TableMetadata;
 import org.apache.cassandra.utils.ByteBufferUtil;
+
+import ch.qos.logback.classic.Level;
+import ch.qos.logback.classic.Logger;
+import ch.qos.logback.classic.spi.ILoggingEvent;
+import ch.qos.logback.core.read.ListAppender;
 
 import static org.junit.Assert.assertEquals;
 import static org.junit.Assert.assertFalse;

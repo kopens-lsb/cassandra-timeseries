@@ -26,6 +26,7 @@ import org.apache.cassandra.exceptions.ConfigurationException;
 import org.apache.cassandra.schema.KeyspaceMetadata;
 import org.apache.cassandra.schema.Schema;
 import org.apache.cassandra.schema.TableMetadata;
+import org.apache.cassandra.utils.LocalizeString;
 
 /**
  * {@code system_views.timeseries_tiering}: one row per table with a {@code timeseries_tiering} policy
@@ -99,7 +100,7 @@ final class TimeseriesTieringTable extends AbstractVirtualTable
                       .column(CHUNK_WINDOW_MS, policy.chunkWindowMillis)
                       .column(COLD_WINDOW_MS, policy.coldWindowMillis)
                       .column(INTERVAL_MS, policy.intervalMillis)
-                      .column(CODEC, policy.codec.name().toLowerCase())
+                      .column(CODEC, LocalizeString.toLowerCaseLocalized(policy.codec.name()))
                       .column(LAST_RUN_AT, lastRunAt == null ? -1L : lastRunAt)
                       .column(WINDOWS_ENCODED, stats == null ? 0L : stats.windowsEncoded)
                       .column(ROWS_ENCODED, stats == null ? 0L : stats.rowsEncoded)

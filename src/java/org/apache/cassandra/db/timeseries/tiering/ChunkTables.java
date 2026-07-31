@@ -20,8 +20,8 @@ package org.apache.cassandra.db.timeseries.tiering;
 import com.google.common.collect.ImmutableMap;
 
 import org.apache.cassandra.db.compaction.UnifiedCompactionStrategy;
-import org.apache.cassandra.db.marshal.BytesType;
 import org.apache.cassandra.db.marshal.ByteType;
+import org.apache.cassandra.db.marshal.BytesType;
 import org.apache.cassandra.db.marshal.Int32Type;
 import org.apache.cassandra.db.marshal.LongType;
 import org.apache.cassandra.db.marshal.TimestampType;

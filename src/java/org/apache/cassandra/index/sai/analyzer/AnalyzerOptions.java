@@ -37,6 +37,7 @@ import org.apache.lucene.analysis.standard.StandardTokenizer;
 
 import org.apache.cassandra.exceptions.InvalidRequestException;
 import org.apache.cassandra.utils.JsonUtils;
+import org.apache.cassandra.utils.LocalizeString;
 
 /**
  * Parsed and validated configuration of the {@code index_analyzer} SAI index option.
@@ -118,7 +119,7 @@ public class AnalyzerOptions
         if (trimmed.startsWith("{"))
             return fromJson(trimmed);
 
-        switch (trimmed.toLowerCase(Locale.ROOT))
+        switch (LocalizeString.toLowerCaseLocalized(trimmed, Locale.ROOT))
         {
             case "keyword":
                 return new AnalyzerOptions(trimmed, "keyword", 0, 0, false, false, false, false, false);
@@ -212,7 +213,7 @@ public class AnalyzerOptions
         Object value = map.get(key);
         if (!(value instanceof String) || ((String) value).isEmpty())
             throw new InvalidRequestException(String.format("'%s' requires a non-empty '%s' string in %s", context, key, INDEX_ANALYZER));
-        return ((String) value).toLowerCase(Locale.ROOT);
+        return LocalizeString.toLowerCaseLocalized((String) value, Locale.ROOT);
     }
 
     private static int intField(Map<String, Object> map, String key, int defaultValue)
@@ -243,7 +244,7 @@ public class AnalyzerOptions
         if (nfcNormalize && !Normalizer.isNormalized(result, Normalizer.Form.NFC))
             result = Normalizer.normalize(result, Normalizer.Form.NFC);
         if (lowercase)
-            result = result.toLowerCase(Locale.ROOT);
+            result = LocalizeString.toLowerCaseLocalized(result, Locale.ROOT);
         if (asciiFold)
         {
             char[] input = result.toCharArray();

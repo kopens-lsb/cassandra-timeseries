@@ -35,6 +35,7 @@ import org.apache.cassandra.schema.ColumnMetadata;
 import org.apache.cassandra.schema.TableMetadata;
 import org.apache.cassandra.utils.ByteBufferUtil;
 import org.apache.cassandra.utils.JsonUtils;
+import org.apache.cassandra.utils.LocalizeString;
 
 import static java.lang.String.format;
 
@@ -252,7 +253,7 @@ public final class TieringPolicy
     {
         try
         {
-            return CodecChoice.valueOf(value.toUpperCase());
+            return CodecChoice.valueOf(LocalizeString.toUpperCaseLocalized(value));
         }
         catch (IllegalArgumentException e)
         {

@@ -67,6 +67,7 @@ import org.apache.cassandra.service.pager.PagingState;
 import org.apache.cassandra.transport.Dispatcher;
 import org.apache.cassandra.transport.ProtocolVersion;
 import org.apache.cassandra.transport.messages.ResultMessage;
+import org.apache.cassandra.utils.Clock;
 import org.apache.cassandra.utils.JVMStabilityInspector;
 import org.apache.cassandra.utils.MBeanWrapper;
 
@@ -188,7 +189,7 @@ public class TieredStorageService implements TieredStorageServiceMBean
     @VisibleForTesting
     void sweep()
     {
-        long now = System.currentTimeMillis();
+        long now = Clock.Global.currentTimeMillis();
         for (KeyspaceMetadata keyspace : Schema.instance.getUserKeyspaces())
         {
             for (TableMetadata table : keyspace.tables)
@@ -253,8 +254,8 @@ public class TieredStorageService implements TieredStorageServiceMBean
             if (hook != null)
                 hook.accept(keyspace, table);
 
-            TierRunStats stats = runOnce(keyspace, table, System.currentTimeMillis());
-            lastRunAtMillisByTable.put(key, System.currentTimeMillis());
+            TierRunStats stats = runOnce(keyspace, table, Clock.Global.currentTimeMillis());
+            lastRunAtMillisByTable.put(key, Clock.Global.currentTimeMillis());
             lastStatsByTable.put(key, stats);
         }
         finally
