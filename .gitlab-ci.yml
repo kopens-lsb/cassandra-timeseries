@@ -73,6 +73,8 @@ timeseries-tests:
     - ant testsome -Dtest.name=org.apache.cassandra.db.compaction.TimeSeriesCompactionStrategyTest
     - ant testsome -Dtest.name=org.apache.cassandra.db.compaction.TimeSeriesCompactionStrategyE2ETest
     - ant testsome -Dtest.name=org.apache.cassandra.db.compaction.timeseries.WindowFrozenListenersTest
+    - ant testsome -Dtest.name=org.apache.cassandra.db.compaction.timeseries.WindowRoutingIteratorTest
+    - ant testsome -Dtest.name=org.apache.cassandra.db.compaction.timeseries.TimeWindowSplittingMultiWriterTest
 
 # Build the Testcontainers-compatible Docker image (see docker/) and publish it as a loadable tarball to
 # the GitLab GENERIC PACKAGE registry — this instance has no container registry configured (no

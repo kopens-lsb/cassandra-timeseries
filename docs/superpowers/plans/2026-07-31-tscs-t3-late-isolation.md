@@ -30,7 +30,7 @@
 - `RangeTombstoneBoundaryMarker`(close+open 결합): 두 deletion time의 창이 다르면 `createCorrespondingCloseMarker()`/`createCorrespondingOpenMarker()`로 분해해 각자의 창으로 라우팅.
 - 각 출력은 원본 클러스터링 순서의 부분수열 → 정렬 불변식 자동 유지.
 
-**D3. 파티션 메타데이터 복제.** `partitionLevelDeletion`과 `staticRow`는 **해당 파티션이 기록되는 모든 창 출력에 복제**한다. 근거: 창 통삭제(retention/TTL)로 한 창의 SSTable이 사라져도 다른 창 데이터에 대한 파티션 삭제·스태틱이 유실되면 안 된다. 중복 기록은 병합 시 타임스탬프로 수렴(무해).
+**D3 (구현 중 개정). 파티션 헤더는 자기 창으로 1회 라우팅 — 복제 금지.** `partitionLevelDeletion`과 `staticRow`는 **자신의 max write-timestamp가 속한 창의 출력에만** 기록한다. 원안(전 창 복제)은 Task 2 테스트에서 결함이 실증됐다: 복제된 과거 삭제 타임스탬프가 새 창 SSTable의 min 메타데이터를 오염시켜 그 SSTable이 영구히 "걸침"으로 분류되고, Task 3의 분할 재작성과 무한 루프를 이룬다. 1회 라우팅의 안전 근거: ① 읽기는 파티션의 전 SSTable을 병합하므로 삭제는 어느 창에 있든 전역 적용된다. ② 창 통삭제는 오래된 창 우선이므로, 헤더가 든 창이 드롭되는 시점엔 그 삭제가 가릴 수 있는 더 오래된 창들은 이미 드롭된 후다(헤더 창 자신의 데이터는 함께 드롭). ③ gcGrace 이후의 지각 되살아남은 일반 Cassandra 시맨틱과 동일 — 문서화로 처리.
 
 **D4. 창 폭 결정은 flush 시각의 옵션 스냅샷.** ALTER 중 flush 경합은 "그 flush는 구 옵션" — 재작성하지 않는다(§8 ALTER 규칙과 일치).
 

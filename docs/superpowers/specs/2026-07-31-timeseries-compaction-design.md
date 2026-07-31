@@ -205,3 +205,30 @@ T3가 인수할 것(우선순위 순서 아님):
   `TimeSeriesCompactionTask`로, 그 외 창을 평범한 `CompactionTask`로 라우팅해 창 불변식은 지키지만
   `FreezeCompactionTask`를 거치지 않으므로 동결 이벤트를 발화하지 않는다 — 계층화 연동 관점에서 재검토.
 - jvm-dtest(3노드 리페어/스트리밍 창 편입)와 스케일 벤치(§9)는 T3 이후 일괄.
+
+### T3 구현 완료 노트 (2026-07-31)
+
+T3는 커밋 `e57cbf4f36..8b1fd162ff`(+마감 커밋)로 완료 — 프리미엄 모델 쿼터 소진으로 컨트롤러
+인라인 실행(계획서 `2026-07-31-tscs-t3-late-isolation.md`의 규범 결정 D1~D7 참고). 테스트:
+WindowRoutingIteratorTest 11, TimeWindowSplittingMultiWriterTest 4(SchemaLoader), Strategy 29(+3),
+E2E 5(+1) — 전부 CI 배선됨.
+
+구현 요약:
+- **창 경계 스플릿(§4)**: `db/compaction/timeseries/WindowRoutingIterator`(로우/마커를 셀
+  write-timestamp 축으로 창별 라우팅 — D1·D2; boundary 마커는 close/open으로 분해) +
+  `TimeWindowSplittingMultiWriter`(창별 지연 생성 라이터). `TimeSeriesCompactionStrategy.
+  createSSTableMultiWriter` 오버라이드로 **flush와 스트리밍이 같은 훅**을 타므로(RangeAware
+  SSTableWriter 경유 확인) 두 경로 모두 "SSTable은 정확히 한 창" 불변식을 만족한다.
+- **파티션 헤더는 자기 창으로 1회 라우팅(D3 개정)** — 전 창 복제 원안은 과거 삭제 타임스탬프가
+  새 창 SSTable min 메타데이터를 오염시켜 영구 걸침·무한 분할 루프를 유발함을 테스트로 실증하고
+  폐기. 안전 근거: 읽기 병합의 전역 적용 + 창 통삭제의 오래된-창-우선 순서.
+- **레거시 걸침 국소 재동결(§4/§10)**: `SplitRefreezeCompactionTask` — 안티컴팩션 안무(공유 txn +
+  창별 SSTableRewriter)로 걸침 단일 SSTable을 창별 산출물로 재작성. 리스너 미발화(동결 완결은
+  후속 라운드의 FreezeCompactionTask 몫). 우선순위 만료 > 동결 > 분할 > 위임, splitBacklog가
+  getEstimatedRemainingTasks에 반영.
+- T2 인계 소화: (a) 완료, (b) 완료(스플릿+국소 재동결), (c) 구경계는 걸침이 되는 순간 분할 경로가
+  자연 처리 — 별도 인정 로직 불필요로 종결, (d) 동시성 설정화는 계속 보류.
+
+후속(비목표로 명시): UCS 토큰 샤딩과 flush 스플릿 합성(D6), 3노드 jvm-dtest(리페어/스트리밍 창
+편입 — 기존 멀티노드 검증 공백에 합류), (g) 테스트 공백 2건, `ant testsome` 오타 FQCN 무음 통과의
+상류 수정(ai-ci-test 가드는 완료). 스케일 벤치는 SP3 후 일괄(§9).
