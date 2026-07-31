@@ -42,6 +42,7 @@ import org.apache.cassandra.utils.ByteBufferUtil;
 
 import static org.junit.Assert.assertEquals;
 import static org.junit.Assert.assertFalse;
+import static org.junit.Assert.assertNotNull;
 import static org.junit.Assert.assertNull;
 import static org.junit.Assert.assertTrue;
 import static org.junit.Assert.fail;
@@ -451,6 +452,55 @@ public class TieredStorageServiceTest extends CQLTester
         assertEquals(0, row.getLong("late_merges"));
         assertEquals(0, row.getLong("chunks_expired"));
         assertTrue("last_run_at should be a real timestamp once retier has run", row.getLong("last_run_at") > 0);
+    }
+
+    @Test
+    public void sweepIsolatesPerTableFailures() throws Throwable
+    {
+        // Regression for a review finding: one table's run failing inside the global sweep (e.g. an
+        // UnavailableException because its keyspace cannot meet the policy's consistency level) must
+        // not abort the tick for every table iterated after it, and must be logged rather than
+        // escaping into the scheduled executor (whose failure wrapper swallows request-failure
+        // exceptions silently). Two policy-bearing tables; one's run deterministically throws via the
+        // preRunHookForTesting seam (a healthy single-node cluster cannot provoke the real failure).
+        // The test is order-independent: without the per-table catch the injected throwable escapes
+        // sweep() and fails this test no matter which table the schema walk visits first.
+        String badTable = createTable("CREATE TABLE %s (tag text, ts timestamp, value double, PRIMARY KEY (tag, ts))");
+        setPolicy("{\"hot_window\":\"2h\",\"chunk_window\":\"1h\"}");
+        String goodTable = createTable("CREATE TABLE %s (tag text, ts timestamp, value double, PRIMARY KEY (tag, ts))");
+        setPolicy("{\"hot_window\":\"2h\",\"chunk_window\":\"1h\"}");
+
+        TieredStorageService service = new TieredStorageService(); // fresh instance: both tables are due (never run)
+        service.preRunHookForTesting = (ks, table) ->
+        {
+            if (badTable.equals(table))
+                throw new RuntimeException("injected failure for " + ks + '.' + table);
+        };
+
+        Logger serviceLogger = (Logger) LoggerFactory.getLogger(TieredStorageService.class);
+        ListAppender<ILoggingEvent> appender = new ListAppender<>();
+        appender.start();
+        serviceLogger.addAppender(appender);
+        try
+        {
+            service.sweep(); // must complete without throwing
+        }
+        finally
+        {
+            serviceLogger.detachAppender(appender);
+        }
+
+        // The failing table was logged (keyspace.table named), not silently swallowed...
+        assertTrue("expected a WARN naming the failed table",
+                   appender.list.stream().anyMatch(e -> e.getLevel() == Level.WARN &&
+                                                        e.getFormattedMessage().contains(KEYSPACE + "." + badTable)));
+        // ...its run never completed...
+        assertNull(service.lastRunAtMillis(KEYSPACE, badTable));
+        assertNull(service.lastStats(KEYSPACE, badTable));
+        // ...and the other table still got its run on the same tick.
+        assertNotNull("the second table's run must survive the first table's failure",
+                      service.lastRunAtMillis(KEYSPACE, goodTable));
+        assertNotNull(service.lastStats(KEYSPACE, goodTable));
     }
 
     @Test

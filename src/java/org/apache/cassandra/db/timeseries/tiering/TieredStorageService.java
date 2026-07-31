@@ -30,6 +30,7 @@ import java.util.TreeMap;
 import java.util.concurrent.ConcurrentHashMap;
 import java.util.concurrent.TimeUnit;
 import java.util.concurrent.atomic.AtomicBoolean;
+import java.util.function.BiConsumer;
 
 import com.google.common.annotations.VisibleForTesting;
 
@@ -66,6 +67,7 @@ import org.apache.cassandra.service.pager.PagingState;
 import org.apache.cassandra.transport.Dispatcher;
 import org.apache.cassandra.transport.ProtocolVersion;
 import org.apache.cassandra.transport.messages.ResultMessage;
+import org.apache.cassandra.utils.JVMStabilityInspector;
 import org.apache.cassandra.utils.MBeanWrapper;
 
 import static java.lang.String.format;
@@ -141,6 +143,16 @@ public class TieredStorageService implements TieredStorageServiceMBean
     private final ConcurrentHashMap<String, TierRunStats> lastStatsByTable = new ConcurrentHashMap<>();
 
     /**
+     * Test-only seam: invoked with {@code (keyspace, table)} at the top of every guarded run, i.e.
+     * inside the scope whose failures {@link #sweep} must isolate per table (and {@link #retier} must
+     * propagate). Lets a test deterministically fail one table's run -- standing in for, say, an
+     * {@code UnavailableException} out of {@link #runOnce}'s tag enumeration -- which cannot be
+     * provoked naturally on a healthy single-node cluster.
+     */
+    @VisibleForTesting
+    volatile BiConsumer<String, String> preRunHookForTesting;
+
+    /**
      * Registers the {@value #MBEAN_NAME} MBean and schedules the single, process-wide sweep
      * ({@link #sweep}) that drives every policy-bearing table's re-encode cycle, on
      * {@link ScheduledExecutors#optionalTasks} at a fixed {@value #SWEEP_DELAY_SECONDS}s delay.
@@ -165,16 +177,33 @@ public class TieredStorageService implements TieredStorageServiceMBean
      * completed run, invokes the guarded runner ({@link #runGuarded}). A table whose policy fails to
      * parse is retried every tick too (cheaply -- {@link #runOnce} fails fast and logs the specifics)
      * rather than being permanently ignored until an operator notices and fixes it.
+     * <p>
+     * Each table's run is individually isolated: one table failing (say, an
+     * {@link org.apache.cassandra.exceptions.UnavailableException} because its keyspace cannot
+     * currently meet the policy's consistency level) must neither abort the tick for every table
+     * iterated after it -- the failing table's {@code lastRunAt} never advances, so it would
+     * deterministically fail first and starve the rest every tick -- nor escape into the scheduled
+     * executor, whose failure wrapper swallows request-failure exceptions without logging.
      */
-    private void sweep()
+    @VisibleForTesting
+    void sweep()
     {
         long now = System.currentTimeMillis();
         for (KeyspaceMetadata keyspace : Schema.instance.getUserKeyspaces())
         {
             for (TableMetadata table : keyspace.tables)
             {
-                if (dueForSweep(keyspace.name, table, now))
-                    runGuarded(keyspace.name, table.name, false);
+                try
+                {
+                    if (dueForSweep(keyspace.name, table, now))
+                        runGuarded(keyspace.name, table.name, false);
+                }
+                catch (Throwable t)
+                {
+                    JVMStabilityInspector.inspectThrowable(t);
+                    logger.warn("Tiered storage sweep failed for {}.{}; skipping it this tick and continuing " +
+                                "with the remaining tables", keyspace.name, table.name, t);
+                }
             }
         }
     }
@@ -220,6 +249,10 @@ public class TieredStorageService implements TieredStorageServiceMBean
 
         try
         {
+            BiConsumer<String, String> hook = preRunHookForTesting;
+            if (hook != null)
+                hook.accept(keyspace, table);
+
             TierRunStats stats = runOnce(keyspace, table, System.currentTimeMillis());
             lastRunAtMillisByTable.put(key, System.currentTimeMillis());
             lastStatsByTable.put(key, stats);
