@@ -20,9 +20,11 @@ package org.apache.cassandra.db.timeseries;
 import java.nio.ByteBuffer;
 import java.nio.ByteOrder;
 import java.nio.charset.StandardCharsets;
+import java.util.ArrayList;
 import java.util.Arrays;
 import java.util.Collections;
 import java.util.HashSet;
+import java.util.List;
 import java.util.Random;
 import java.util.Set;
 import java.util.SortedMap;
@@ -331,11 +333,23 @@ public class ColumnarChunkCodecTest
     {
         int n = 300;
         long[] ts = sequentialTimestamps(n);
-        SortedMap<String, ColumnarChunkCodec.ColumnInput> columns = representativeColumns(n);
+        SortedMap<String, ColumnarChunkCodec.ColumnInput> natural = representativeColumns(n);
 
-        ByteBuffer first = ColumnarChunkCodec.encode(ts, n, columns);
-        ByteBuffer second = ColumnarChunkCodec.encode(ts, n, columns);
+        ByteBuffer first = ColumnarChunkCodec.encode(ts, n, natural);
+        ByteBuffer second = ColumnarChunkCodec.encode(ts, n, natural);
         assertEquals(first, second);
+
+        // same entries, but built with a reversed comparator and a reversed insertion order, to
+        // prove the directory's determinism comes from encode() re-sorting by name itself, not
+        // from whatever order/comparator the caller's SortedMap happened to be built with
+        SortedMap<String, ColumnarChunkCodec.ColumnInput> reversed = new TreeMap<>(Collections.<String>reverseOrder());
+        List<String> keysInReverseInsertOrder = new ArrayList<>(natural.keySet());
+        Collections.reverse(keysInReverseInsertOrder);
+        for (String key : keysInReverseInsertOrder)
+            reversed.put(key, natural.get(key));
+
+        ByteBuffer third = ColumnarChunkCodec.encode(ts, n, reversed);
+        assertEquals(first, third);
     }
 
     private static SortedMap<String, ColumnarChunkCodec.ColumnInput> representativeColumns(int n)
@@ -403,6 +417,155 @@ public class ColumnarChunkCodecTest
         ByteBuffer corrupted = ByteBuffer.wrap(bytes);
         assertThatThrownBy(() -> ColumnarChunkCodec.cursor(corrupted, null))
             .isInstanceOf(IllegalArgumentException.class);
+    }
+
+    @Test
+    public void corruptDictionaryCountThrowsWithoutAllocating()
+    {
+        int n = 5;
+        // exactly 2 distinct values -> dictionary mode; "QQMARKERQQ" sorts first (starts with 'Q',
+        // ASCII < 'z') among the two, so it is the dictionary's first entry, right after the mode
+        // byte and the dictCount varint
+        String marker = "QQMARKERQQ";
+        ByteBuffer[] values = new ByteBuffer[n];
+        for (int i = 0; i < n; i++)
+            values[i] = bytesOf(i % 2 == 0 ? marker : "zzz-other");
+        SortedMap<String, ColumnarChunkCodec.ColumnInput> columns = new TreeMap<>();
+        columns.put("tag", new ColumnarChunkCodec.ColumnInput(ColumnarChunkCodec.TYPE_TEXT, values));
+
+        ByteBuffer payload = ColumnarChunkCodec.encode(sequentialTimestamps(n), n, columns);
+        byte[] bytes = new byte[payload.remaining()];
+        payload.duplicate().get(bytes);
+
+        byte[] markerBytes = marker.getBytes(StandardCharsets.UTF_8);
+        int markerPos = indexOf(bytes, markerBytes);
+        assertTrue("marker not found in encoded payload", markerPos >= 0);
+        int dictCountPos = markerPos - 2;   // marker's own len-prefix byte, then dictCount, then mode
+        assertEquals("mode byte", 0, bytes[dictCountPos - 1] & 0xFF);
+        assertEquals("dictCount before corruption", 2, bytes[dictCountPos] & 0xFF);
+        assertEquals("marker's own length prefix", markerBytes.length, bytes[markerPos - 1] & 0xFF);
+
+        // overwrite the (originally single-byte) dictCount varint with a multi-byte huge-value
+        // varint (continuation bits set); if this reached `new byte[dictCount][]` unguarded, a
+        // ~2^35-entry array would OOM well before this test could complete, so completing at all
+        // -- let alone quickly, with a clean IllegalArgumentException -- is the proof
+        byte[] corrupted = bytes.clone();
+        corrupted[dictCountPos] = (byte) 0xFF;
+        corrupted[dictCountPos + 1] = (byte) 0xFF;
+        corrupted[dictCountPos + 2] = (byte) 0xFF;
+        corrupted[dictCountPos + 3] = (byte) 0xFF;
+        corrupted[dictCountPos + 4] = (byte) 0x7F;
+
+        assertThatThrownBy(() -> ColumnarChunkCodec.cursor(ByteBuffer.wrap(corrupted), null))
+            .isInstanceOf(IllegalArgumentException.class);
+    }
+
+    @Test
+    public void corruptRawModeEntryLengthThrowsIllegalArgument()
+    {
+        int n = 300;   // > 256 distinct values forces raw mode
+        String firstValue = "ROWMARKERZERO";
+        ByteBuffer[] values = new ByteBuffer[n];
+        values[0] = bytesOf(firstValue);
+        for (int i = 1; i < n; i++)
+            values[i] = bytesOf("distinct-" + i);
+        SortedMap<String, ColumnarChunkCodec.ColumnInput> columns = new TreeMap<>();
+        columns.put("tag", new ColumnarChunkCodec.ColumnInput(ColumnarChunkCodec.TYPE_TEXT, values));
+
+        ByteBuffer payload = ColumnarChunkCodec.encode(sequentialTimestamps(n), n, columns);
+        byte[] bytes = new byte[payload.remaining()];
+        payload.duplicate().get(bytes);
+
+        // raw mode lays entries out in row order (unsorted), so row 0's value is the very first
+        // entry right after the mode byte: [mode][len][bytes]...
+        byte[] markerBytes = firstValue.getBytes(StandardCharsets.UTF_8);
+        int markerPos = indexOf(bytes, markerBytes);
+        assertTrue("marker not found in encoded payload", markerPos >= 0);
+        int lenPos = markerPos - 1;
+        assertEquals("row 0's own length prefix", markerBytes.length, bytes[lenPos] & 0xFF);
+        assertEquals("mode byte", 1, bytes[lenPos - 1] & 0xFF);
+
+        byte[] corrupted = bytes.clone();
+        corrupted[lenPos] = (byte) 0xFF;
+        corrupted[lenPos + 1] = (byte) 0xFF;
+        corrupted[lenPos + 2] = (byte) 0xFF;
+        corrupted[lenPos + 3] = (byte) 0xFF;
+        corrupted[lenPos + 4] = (byte) 0x7F;
+
+        assertThatThrownBy(() -> ColumnarChunkCodec.cursor(ByteBuffer.wrap(corrupted), null))
+            .isInstanceOf(IllegalArgumentException.class);
+    }
+
+    @Test
+    public void corruptConstantValueLengthInDirectoryThrowsIllegalArgument()
+    {
+        int n = 10;
+        ByteBuffer[] values = new ByteBuffer[n];
+        for (int i = 0; i < n; i++)
+            values[i] = bytesOf(192);   // identical everywhere -> CONSTANT column
+        SortedMap<String, ColumnarChunkCodec.ColumnInput> columns = new TreeMap<>();
+        columns.put("c", new ColumnarChunkCodec.ColumnInput(ColumnarChunkCodec.TYPE_INT32, values));
+
+        ByteBuffer payload = ColumnarChunkCodec.encode(sequentialTimestamps(n), n, columns);
+        byte[] bytes = new byte[payload.remaining()];
+        payload.duplicate().get(bytes);
+
+        // the single column "c"'s directory entry starts right after the header: typeCode(1) +
+        // flags(1) + nameLen(1) + name(1, "c") + sectionLen varint(1, value 0 -- constant columns
+        // have a 0-byte data section) + constLen varint -- this is reachable before any data
+        // section is read, so a corrupt constLen fires earliest of all three sites
+        int constLenPos = ColumnarChunkCodec.HEADER_SIZE + 5;
+        assertEquals("int32's canonical form is 4 bytes", 4, bytes[constLenPos] & 0xFF);
+
+        byte[] corrupted = bytes.clone();
+        corrupted[constLenPos] = (byte) 0xFF;
+        corrupted[constLenPos + 1] = (byte) 0xFF;
+        corrupted[constLenPos + 2] = (byte) 0xFF;
+        corrupted[constLenPos + 3] = (byte) 0xFF;
+        corrupted[constLenPos + 4] = (byte) 0x7F;
+
+        assertThatThrownBy(() -> ColumnarChunkCodec.cursor(ByteBuffer.wrap(corrupted), null))
+            .isInstanceOf(IllegalArgumentException.class);
+    }
+
+    @Test
+    public void corruptRowCountThrowsWithoutAllocating()
+    {
+        ByteBuffer payload = simpleTwoColumnPayload();
+        byte[] bytes = new byte[payload.remaining()];
+        payload.duplicate().get(bytes);
+
+        // rowCount is the int32 right after the version byte
+        byte[] corrupted = bytes.clone();
+        corrupted[1] = (byte) 0x20;   // ~536 million rows, still positive after the int cast
+        corrupted[2] = 0;
+        corrupted[3] = 0;
+        corrupted[4] = 0;
+
+        assertThatThrownBy(() -> ColumnarChunkCodec.cursor(ByteBuffer.wrap(corrupted), null))
+            .isInstanceOf(IllegalArgumentException.class);
+    }
+
+    @Test
+    public void headerPeeksOnTruncatedBufferThrowIllegalArgument()
+    {
+        ByteBuffer truncated = ByteBuffer.wrap(new byte[]{ 3, 0 });   // valid version byte, nothing else
+        assertThatThrownBy(() -> ColumnarChunkCodec.rowCount(truncated)).isInstanceOf(IllegalArgumentException.class);
+        assertThatThrownBy(() -> ColumnarChunkCodec.firstTimestamp(truncated)).isInstanceOf(IllegalArgumentException.class);
+        assertThatThrownBy(() -> ColumnarChunkCodec.lastTimestamp(truncated)).isInstanceOf(IllegalArgumentException.class);
+    }
+
+    private static int indexOf(byte[] haystack, byte[] needle)
+    {
+        outer:
+        for (int i = 0; i <= haystack.length - needle.length; i++)
+        {
+            for (int j = 0; j < needle.length; j++)
+                if (haystack[i + j] != needle[j])
+                    continue outer;
+            return i;
+        }
+        return -1;
     }
 
     @Test

@@ -111,9 +111,13 @@ public final class ColumnarChunkCodec
                 throw new IllegalArgumentException("timestamps must be strictly increasing: " +
                                                    timestamps[i] + " after " + timestamps[i - 1]);
 
-        // re-sort by natural String order regardless of the caller's SortedMap comparator, so the
-        // directory's determinism does not depend on how the caller happened to build the map
-        SortedMap<String, ColumnInput> sorted = new TreeMap<>(columns);
+        // Re-sort by natural String order regardless of the caller's SortedMap comparator, so the
+        // directory's determinism does not depend on how the caller happened to build the map.
+        // NOTE: this must be `new TreeMap<>()` + putAll(), not `new TreeMap<>(columns)` -- per
+        // TreeMap(SortedMap), that constructor ADOPTS the source map's comparator (or its absence)
+        // instead of forcing natural order, which would silently defeat this whole re-sort.
+        SortedMap<String, ColumnInput> sorted = new TreeMap<>();
+        sorted.putAll(columns);
         if (sorted.size() > 0xFFFF)
             throw new IllegalArgumentException("too many columns: " + sorted.size());
 
@@ -453,14 +457,21 @@ public final class ColumnarChunkCodec
 
     private static ColumnarCursor buildCursor(ByteBuffer payload, Set<String> projection)
     {
+        int payloadRemaining = payload.remaining();
         ByteBuffer buffer = payload.duplicate();
         buffer.order(ByteOrder.BIG_ENDIAN);
         byte version = buffer.get();
         if (version != VERSION)
             throw new IllegalArgumentException("Unsupported columnar chunk version: " + version);
         int rowCount = buffer.getInt();
-        if (rowCount < 1)
-            throw new IllegalArgumentException("Corrupt columnar chunk: rowCount " + rowCount);
+        // Even in the cheapest legitimate encoding (all-zero delta-of-delta, 1 bit/row), rowCount
+        // rows need at least rowCount/8 bytes of timestamp bitstream alone -- a rowCount that could
+        // not possibly fit in a payload this size is corrupt, and must be rejected before it is
+        // used to size any allocation (new long[rowCount], new boolean[rowCount], ...): otherwise a
+        // single corrupted header field turns into an OutOfMemoryError instead of a clean reject.
+        if (rowCount < 1 || rowCount > 8L * payloadRemaining)
+            throw new IllegalArgumentException("Corrupt columnar chunk: rowCount " + rowCount +
+                                               " is not plausible for a " + payloadRemaining + "-byte payload");
         long firstTimestamp = buffer.getLong();
         buffer.getLong();   // last timestamp: header-only metadata, re-derived below from the DoD stream
         int columnCount = buffer.getShort() & 0xFFFF;
@@ -537,11 +548,25 @@ public final class ColumnarChunkCodec
         byte[] constBytes = null;
         if ((flags & FLAG_CONSTANT) != 0)
         {
-            int constLen = (int) readVarLong(buffer);
+            int constLen = checkedLength("constBytes", readVarLong(buffer), buffer.remaining());
             constBytes = new byte[constLen];
             buffer.get(constBytes);
         }
         return new ColumnMeta(name, typeCode, flags, sectionLen, constBytes);
+    }
+
+    /**
+     * Validates a length read out of a payload before it is used to size an allocation: a
+     * negative length, or one exceeding what is actually left to read in the enclosing buffer or
+     * section, is definitely corrupt and must fail fast here rather than let a bogus huge value
+     * reach {@code new byte[len]} (or {@code new byte[len][]}) and OOM the node.
+     */
+    private static int checkedLength(String field, long len, int available)
+    {
+        if (len < 0 || len > available)
+            throw new IllegalArgumentException("Corrupt columnar chunk: " + field + " length " + len +
+                                               " invalid (available " + available + ")");
+        return (int) len;
     }
 
     private static ByteBuffer[] decodeColumn(ByteBuffer buffer, int offset, ColumnMeta meta, int rowCount)
@@ -711,11 +736,18 @@ public final class ColumnarChunkCodec
         int mode = section.get() & 0xFF;
         if (mode == MODE_DICTIONARY)
         {
-            int dictCount = (int) readVarLong(section);
+            long dictCountLong = readVarLong(section);
+            // the write side never emits more than MAX_DICTIONARY_SIZE entries (see
+            // encodeDictOrRaw); a larger value here is definitionally corrupt, and rejecting it
+            // up front also keeps the `new byte[dictCount][]` below cheap regardless of payload size
+            if (dictCountLong < 0 || dictCountLong > MAX_DICTIONARY_SIZE)
+                throw new IllegalArgumentException("Corrupt columnar chunk: dictionary size " + dictCountLong +
+                                                   " outside [0, " + MAX_DICTIONARY_SIZE + "]");
+            int dictCount = (int) dictCountLong;
             byte[][] dictionary = new byte[dictCount][];
             for (int i = 0; i < dictCount; i++)
             {
-                int len = (int) readVarLong(section);
+                int len = checkedLength("dictionary entry", readVarLong(section), section.remaining());
                 byte[] bytes = new byte[len];
                 section.get(bytes);
                 dictionary[i] = bytes;
@@ -733,7 +765,7 @@ public final class ColumnarChunkCodec
         {
             for (int i = 0; i < n; i++)
             {
-                int len = (int) readVarLong(section);
+                int len = checkedLength("text/opaque value", readVarLong(section), section.remaining());
                 byte[] bytes = new byte[len];
                 section.get(bytes);
                 out[i] = bytes;
@@ -782,37 +814,71 @@ public final class ColumnarChunkCodec
 
     public static int rowCount(ByteBuffer payload)
     {
-        ByteBuffer buffer = checkedHeader(payload);
-        return buffer.getInt(buffer.position() + 1);
+        try
+        {
+            ByteBuffer buffer = checkedHeader(payload);
+            return buffer.getInt(buffer.position() + 1);
+        }
+        catch (IllegalArgumentException e)
+        {
+            throw e;
+        }
+        catch (RuntimeException e)
+        {
+            throw new IllegalArgumentException("Corrupt columnar chunk: truncated header", e);
+        }
     }
 
     public static long firstTimestamp(ByteBuffer payload)
     {
-        ByteBuffer buffer = checkedHeader(payload);
-        return buffer.getLong(buffer.position() + 5);
+        try
+        {
+            ByteBuffer buffer = checkedHeader(payload);
+            return buffer.getLong(buffer.position() + 5);
+        }
+        catch (IllegalArgumentException e)
+        {
+            throw e;
+        }
+        catch (RuntimeException e)
+        {
+            throw new IllegalArgumentException("Corrupt columnar chunk: truncated header", e);
+        }
     }
 
     public static long lastTimestamp(ByteBuffer payload)
     {
-        ByteBuffer buffer = checkedHeader(payload);
-        return buffer.getLong(buffer.position() + 13);
+        try
+        {
+            ByteBuffer buffer = checkedHeader(payload);
+            return buffer.getLong(buffer.position() + 13);
+        }
+        catch (IllegalArgumentException e)
+        {
+            throw e;
+        }
+        catch (RuntimeException e)
+        {
+            throw new IllegalArgumentException("Corrupt columnar chunk: truncated header", e);
+        }
     }
 
+    /**
+     * Duplicates {@code payload}, pins the duplicate's byte order to big-endian, and verifies the
+     * version byte. Bounds/format problems surfacing from here (an {@link IndexOutOfBoundsException}
+     * from a too-short buffer, for instance) are caught and rewrapped by each of this method's three
+     * callers above, not here -- {@link #rowCount}/{@link #firstTimestamp}/{@link #lastTimestamp}
+     * each read further into the header after this call returns, so the header peeks need one
+     * wrapping layer around their whole body, not just around this version check.
+     */
     private static ByteBuffer checkedHeader(ByteBuffer payload)
     {
         ByteBuffer buffer = payload.duplicate();
         buffer.order(ByteOrder.BIG_ENDIAN);
-        try
-        {
-            byte version = buffer.get(buffer.position());
-            if (version != VERSION)
-                throw new IllegalArgumentException("Unsupported columnar chunk version: " + version);
-            return buffer;
-        }
-        catch (IndexOutOfBoundsException e)
-        {
-            throw new IllegalArgumentException("Corrupt columnar chunk: truncated header", e);
-        }
+        byte version = buffer.get(buffer.position());
+        if (version != VERSION)
+            throw new IllegalArgumentException("Unsupported columnar chunk version: " + version);
+        return buffer;
     }
 
     /** Parsed column directory entry, plus its decoded null bitmap (filled in after all entries are read). */
