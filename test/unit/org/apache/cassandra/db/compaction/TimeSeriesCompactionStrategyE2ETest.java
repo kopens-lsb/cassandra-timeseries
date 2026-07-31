@@ -21,6 +21,7 @@ package org.apache.cassandra.db.compaction;
 import java.nio.ByteBuffer;
 import java.util.Collection;
 import java.util.List;
+import java.util.concurrent.CopyOnWriteArrayList;
 import java.util.concurrent.TimeUnit;
 
 import com.google.common.collect.ImmutableMap;
@@ -37,9 +38,12 @@ import org.apache.cassandra.db.ColumnFamilyStore;
 import org.apache.cassandra.db.DecoratedKey;
 import org.apache.cassandra.db.Keyspace;
 import org.apache.cassandra.db.RowUpdateBuilder;
+import org.apache.cassandra.db.compaction.timeseries.WindowFrozenListener;
+import org.apache.cassandra.db.compaction.timeseries.WindowFrozenListeners;
 import org.apache.cassandra.exceptions.ConfigurationException;
 import org.apache.cassandra.io.sstable.format.SSTableReader;
 import org.apache.cassandra.schema.KeyspaceParams;
+import org.apache.cassandra.schema.TableMetadata;
 
 import static org.apache.cassandra.utils.FBUtilities.nowInSeconds;
 import static org.junit.Assert.assertEquals;
@@ -62,6 +66,7 @@ public class TimeSeriesCompactionStrategyE2ETest extends SchemaLoader
 {
     private static final String KEYSPACE1 = "TimeSeriesCompactionStrategyE2ETest";
     private static final String CF_STANDARD1 = "Standard1";
+    private static final String CF_GCGRACE0 = "StandardGcGrace0";
     private static final int TTL_SECONDS = 10;
 
     @BeforeClass
@@ -71,7 +76,8 @@ public class TimeSeriesCompactionStrategyE2ETest extends SchemaLoader
         ServerTestUtils.prepareServer();
         SchemaLoader.createKeyspace(KEYSPACE1,
                                     KeyspaceParams.simple(1),
-                                    SchemaLoader.standardCFMD(KEYSPACE1, CF_STANDARD1));
+                                    SchemaLoader.standardCFMD(KEYSPACE1, CF_STANDARD1),
+                                    SchemaLoader.standardCFMD(KEYSPACE1, CF_GCGRACE0).gcGraceSeconds(0));
     }
 
     @Test
@@ -189,6 +195,156 @@ public class TimeSeriesCompactionStrategyE2ETest extends SchemaLoader
         {
             for (AbstractCompactionTask task : tasks)
                 task.transaction.abort();
+        }
+    }
+
+    /** Records fire counts - used to verify idempotent-consumer semantics (exactly one event per freeze/re-freeze). */
+    private static final class RecordingListener implements WindowFrozenListener
+    {
+        final List<Long> windowStarts = new CopyOnWriteArrayList<>();
+        final List<SSTableReader> frozen = new CopyOnWriteArrayList<>();
+
+        @Override
+        public void onWindowFrozen(TableMetadata table, long windowStartMillis, SSTableReader sstable)
+        {
+            windowStarts.add(windowStartMillis);
+            frozen.add(sstable);
+        }
+    }
+
+    @Test
+    public void testFreezeThenLateDataRefreeze()
+    {
+        Keyspace keyspace = Keyspace.open(KEYSPACE1);
+        ColumnFamilyStore cfs = keyspace.getColumnFamilyStore(CF_STANDARD1);
+        cfs.truncateBlocking();
+        cfs.disableAutoCompaction();
+
+        ByteBuffer value = ByteBuffer.wrap(new byte[100]);
+
+        // Two sstables that both fall entirely within one 1-minute window (same min/max window): base is
+        // that window's start, an hour in the past so the window is well closed.
+        long windowSizeMillis = 60_000L;
+        long base = ((System.currentTimeMillis() - TimeUnit.HOURS.toMillis(1)) / windowSizeMillis) * windowSizeMillis;
+        for (int i = 0; i < 2; i++)
+        {
+            new RowUpdateBuilder(cfs.metadata(), base + 1000 + i, Util.dk("frozen-" + i).getKey())
+                .clustering("column")
+                .add("val", value).build().applyUnsafe();
+            Util.flush(cfs);
+        }
+        assertEquals(2, cfs.getLiveSSTables().size());
+
+        // No retention configured: the expired-window branch must not sweep this window out from under the
+        // freeze path, so this test exercises freeze in isolation.
+        cfs.setCompactionParameters(ImmutableMap.of("class", "TimeSeriesCompactionStrategy",
+                                                    "timestamp_resolution", "MILLISECONDS",
+                                                    "window_size", "1m",
+                                                    "freeze_after", "1m"));
+
+        RecordingListener listener = new RecordingListener();
+        WindowFrozenListeners.registerListener(listener);
+        try
+        {
+            TimeSeriesCompactionStrategy tscs = (TimeSeriesCompactionStrategy)
+                cfs.getCompactionStrategyManager().getCompactionStrategyFor(cfs.getLiveSSTables().iterator().next());
+
+            // 1) Freeze: the closed window's 2 sstables -> one FreezeCompactionTask -> a single sstable and
+            // exactly one fire.
+            Collection<AbstractCompactionTask> tasks = tscs.getNextBackgroundTasks(nowInSeconds());
+            AbstractCompactionTask task = Iterables.getOnlyElement(tasks, null);
+            assertNotNull(task);
+            assertTrue(task instanceof FreezeCompactionTask);
+            assertEquals(2, Iterables.size(task.transaction.originals()));
+            task.execute(ActiveCompactionsTracker.NOOP);
+
+            assertEquals(1, cfs.getLiveSSTables().size());
+            assertEquals(1, listener.windowStarts.size());
+            assertEquals(base, (long) listener.windowStarts.get(0));
+            assertEquals(cfs.getLiveSSTables().iterator().next(), listener.frozen.get(0));
+
+            // 2) A FROZEN window is not reselected (stateless classification) and does not re-fire.
+            Collection<AbstractCompactionTask> idle = tscs.getNextBackgroundTasks(nowInSeconds());
+            for (AbstractCompactionTask t : idle)                    // clean up txns even on contract violation
+                t.transaction.abort();
+            assertTrue(idle.isEmpty());
+            assertEquals(1, listener.windowStarts.size());
+
+            // 3) Late data: a late write into the same window flips FROZEN back to FREEZING -> re-freeze and
+            // a second fire (design spec section 4).
+            new RowUpdateBuilder(cfs.metadata(), base + 5000, Util.dk("late").getKey())
+                .clustering("column")
+                .add("val", value).build().applyUnsafe();
+            Util.flush(cfs);
+            assertEquals(2, cfs.getLiveSSTables().size());
+
+            Collection<AbstractCompactionTask> refreeze = tscs.getNextBackgroundTasks(nowInSeconds());
+            AbstractCompactionTask refreezeTask = Iterables.getOnlyElement(refreeze, null);
+            assertNotNull(refreezeTask);
+            assertTrue(refreezeTask instanceof FreezeCompactionTask);
+            refreezeTask.execute(ActiveCompactionsTracker.NOOP);
+
+            assertEquals(1, cfs.getLiveSSTables().size());
+            assertEquals(2, listener.windowStarts.size());           // re-freeze = exactly one additional fire
+            assertEquals(base, (long) listener.windowStarts.get(1));
+        }
+        finally
+        {
+            WindowFrozenListeners.unsafeClearListeners();
+        }
+    }
+
+    /**
+     * Structural resolution of T1's caveat ("TTL reclaim of a closed window needs retention"): without any
+     * retention configured, the freeze compaction's real CompactionController + gcBefore reclaims TTL'd data
+     * in a closed window. If the whole window is expired, the output is zero sstables and the window itself
+     * disappears - and in that case no event fires (there is no sstable to hand a consumer).
+     */
+    @Test
+    public void testFreezeReclaimsTTLDataInClosedWindowWithoutRetention() throws Exception
+    {
+        Keyspace keyspace = Keyspace.open(KEYSPACE1);
+        ColumnFamilyStore cfs = keyspace.getColumnFamilyStore(CF_GCGRACE0);   // gcGraceSeconds(0)
+        cfs.truncateBlocking();
+        cfs.disableAutoCompaction();
+
+        ByteBuffer value = ByteBuffer.wrap(new byte[100]);
+        long windowSizeMillis = 60_000L;
+        long base = ((System.currentTimeMillis() - TimeUnit.HOURS.toMillis(1)) / windowSizeMillis) * windowSizeMillis;
+        for (int i = 0; i < 2; i++)
+        {
+            new RowUpdateBuilder(cfs.metadata(), base + 1000 + i, 1 /* TTL 1s */, Util.dk("ttl-" + i).getKey())
+                .clustering("column")
+                .add("val", value).build().applyUnsafe();
+            Util.flush(cfs);
+        }
+        assertEquals(2, cfs.getLiveSSTables().size());
+
+        cfs.setCompactionParameters(ImmutableMap.of("class", "TimeSeriesCompactionStrategy",
+                                                    "timestamp_resolution", "MILLISECONDS",
+                                                    "window_size", "1m",
+                                                    "freeze_after", "1m"));
+        Thread.sleep(2000);   // TTL(1s) elapses: gcGrace 0 means gcBefore=now judges both sstables fully expired
+
+        RecordingListener listener = new RecordingListener();
+        WindowFrozenListeners.registerListener(listener);
+        try
+        {
+            TimeSeriesCompactionStrategy tscs = (TimeSeriesCompactionStrategy)
+                cfs.getCompactionStrategyManager().getCompactionStrategyFor(cfs.getLiveSSTables().iterator().next());
+
+            Collection<AbstractCompactionTask> tasks = tscs.getNextBackgroundTasks(nowInSeconds());
+            AbstractCompactionTask task = Iterables.getOnlyElement(tasks, null);
+            assertNotNull(task);
+            assertTrue(task instanceof FreezeCompactionTask);
+            task.execute(ActiveCompactionsTracker.NOOP);
+
+            assertTrue(cfs.getLiveSSTables().isEmpty());             // reclaimed with no retention configured
+            assertEquals(0, listener.windowStarts.size());           // window vanished = no event
+        }
+        finally
+        {
+            WindowFrozenListeners.unsafeClearListeners();
         }
     }
 }
