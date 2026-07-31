@@ -102,6 +102,51 @@ public class TieredStorageServiceTest extends CQLTester
     }
 
     @Test
+    public void hotWindowRowsSurviveDenseIngestion() throws Throwable
+    {
+        // Regression for a round-2 review finding: the window walk's cutoff check must be enforced on
+        // EVERY path that can advance windowStart, including the dense "windowStart = windowEnd"
+        // continuation after a successfully-processed window -- not just on initial discovery and the
+        // empty-window jump. Continuous, gap-free ingestion across the cutoff boundary is required to
+        // exercise this: an empty window anywhere would route through nextClosedWindowStart's own
+        // cutoff check and mask the bug, which is exactly how the round-1 test suite missed it (every
+        // hot marker row there sat past an empty window).
+        createTable("CREATE TABLE %s (tag text, ts timestamp, value double, PRIMARY KEY (tag, ts))");
+        setPolicy("{\"hot_window\":\"2h\",\"chunk_window\":\"1h\"}");
+
+        long now = 5 * HOUR;
+        long cutoff = 3 * HOUR; // windowStartFor(now - hot_window) = windowStartFor(3h) = 3h
+
+        insertRow("dense", 0L, 10.0, 1);          // window [0,1h)      -- closed
+        insertRow("dense", HOUR, 11.0, 2);        // window [1h,2h)     -- closed
+        insertRow("dense", cutoff - 1, 12.0, 3);  // window [2h,3h)     -- closed; pins cutoff-1ms
+        insertRow("dense", cutoff, 13.0, 4);      // window [3h,4h)     -- hot; pins ts == cutoff exactly
+        insertRow("dense", 4 * HOUR, 14.0, 5);    // window [4h,5h)     -- hot ("current" window)
+
+        TierRunStats stats = new TieredStorageService().runOnce(KEYSPACE, currentTable(), now);
+
+        assertEquals(3, stats.windowsEncoded); // only the 3 closed windows
+        assertEquals(3, stats.rowsEncoded);
+
+        // Every row at or after cutoff -- including the one exactly at ts == cutoff -- must still be
+        // in base, completely untouched.
+        assertEquals(2, execute("SELECT * FROM %s WHERE tag = ? AND ts >= ?", "dense", new Date(cutoff)).size());
+        assertEquals(1, execute("SELECT * FROM %s WHERE tag = ? AND ts = ?", "dense", new Date(cutoff)).size());
+        assertEquals(1, execute("SELECT * FROM %s WHERE tag = ? AND ts = ?", "dense", new Date(4 * HOUR)).size());
+
+        // The closed rows (ts < cutoff) are gone.
+        assertEquals(0, execute("SELECT * FROM %s WHERE tag = ? AND ts < ?", "dense", new Date(cutoff)).size());
+
+        // No chunk was ever written for a window at or after cutoff.
+        assertEquals(0, execute(chunkSelectQuery(), "dense", new Date(cutoff)).size());
+        assertEquals(0, execute(chunkSelectQuery(), "dense", new Date(4 * HOUR)).size());
+
+        // The three closed windows were encoded normally.
+        for (long windowStart : new long[]{ 0L, HOUR, 2 * HOUR })
+            assertEquals(1, execute(chunkSelectQuery(), "dense", new Date(windowStart)).size());
+    }
+
+    @Test
     public void roundtripThroughChunks() throws Throwable
     {
         createTable("CREATE TABLE %s (tag text, ts timestamp, value double, PRIMARY KEY (tag, ts))");

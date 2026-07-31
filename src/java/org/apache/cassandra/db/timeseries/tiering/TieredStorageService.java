@@ -88,6 +88,11 @@ import static java.lang.String.format;
  * {@code nextClosedWindowStart}), so peak memory is one window's worth of rows, not the whole
  * backlog. A failure re-encoding one tag (a decode error on a corrupt existing chunk, a read/write
  * timeout, ...) is logged and skipped rather than aborting every other tag on the table.
+ * <p>
+ * The window walk's loop guards {@code windowStart >= cutoff} on every path that can advance it --
+ * initial discovery, the empty-window jump, and the dense (window-after-window) continuation alike --
+ * so no window that reaches into the hot region is ever fetched, encoded, or deleted, no matter how
+ * densely a tag is being ingested.
  */
 public class TieredStorageService
 {
@@ -200,11 +205,25 @@ public class TieredStorageService
                 long windowStart = firstClosedWindowStart(oldestRowQuery, tsRaw, tag, cutoff, policy, cl);
                 while (windowStart >= 0)
                 {
+                    // Belt: no window that reaches into (or past) the hot region may ever be fetched,
+                    // encoded, or deleted, no matter which path set windowStart -- discovery, the
+                    // empty-window jump below, and the dense continuation at the bottom of this loop
+                    // all funnel through this one check before doing anything.
+                    if (windowStart >= cutoff)
+                        break;
+
                     long windowEnd = windowStart + policy.chunkWindowMillis;
+                    // Suspenders: windowStart is always chunk-window-aligned (windowStartFor's output,
+                    // or windowStart+chunkWindowMillis below, which preserves alignment) and so is
+                    // cutoff, so windowEnd <= cutoff is already implied by the guard just above -- this
+                    // clamp is redundant given that invariant, but applied anyway to the two operations
+                    // that actually touch hot data (this read, and the delete below), as a second,
+                    // independent guard against the exact class of bug the belt above exists to fix.
+                    long readEnd = Math.min(windowEnd, cutoff);
                     List<UntypedResultSet.Row> windowRows = pagedSelect(windowRowsQuery, cl, Arrays.asList(
                             tag,
                             TimestampType.instance.fromTimeInMillis(windowStart),
-                            TimestampType.instance.fromTimeInMillis(windowEnd)));
+                            TimestampType.instance.fromTimeInMillis(readEnd)));
 
                     if (windowRows.isEmpty())
                     {
@@ -297,7 +316,7 @@ public class TieredStorageService
                             LongType.instance.decompose(maxWt),
                             tag,
                             TimestampType.instance.fromTimeInMillis(windowStart),
-                            TimestampType.instance.fromTimeInMillis(windowEnd)));
+                            TimestampType.instance.fromTimeInMillis(readEnd)));
 
                     stats.windowsEncoded++;
                     stats.rowsEncoded += rowsThisWindow;
