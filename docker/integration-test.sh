@@ -450,9 +450,12 @@ check_nodetool "nodetool retier runs one re-encode cycle" '' retier it sensor
 check "chunk row created for the window (samples = 3)" \
     "SELECT samples FROM it.sensor__chunks WHERE tag_id='pump-01' AND window_start=$WIN_MS;" \
     '^ *3'
-check "re-encoded base rows are deleted" \
+check "re-encoded rows stay transparently readable (SP3: merged from the chunk)" \
     "SELECT count(*) FROM it.sensor WHERE tag_id='pump-01' AND timestamp >= $WIN_MS AND timestamp < $WIN_END_MS;" \
-    '^ *0'
+    '^ *3'
+check "transparent point lookup returns the encoded value" \
+    "SELECT value FROM it.sensor WHERE tag_id='pump-01' AND timestamp = $(( WIN_MS + 900000 ));" \
+    '^ *20'
 check "window remains queryable via the chunk table" \
     "SELECT tag_id, window_start, codec, samples FROM it.sensor__chunks WHERE tag_id='pump-01';" \
     '\(1 rows\)'
@@ -460,17 +463,20 @@ check "window remains queryable via the chunk table" \
 # Late row into the already-encoded window: its server-side writetime is newer than the range
 # tombstone the first cycle issued (USING TIMESTAMP maxWt), so it survives to be merged.
 cql "INSERT INTO it.sensor (tag_id, timestamp, value) VALUES ('pump-01', $(( WIN_MS + 2100000 )), 40);" > /dev/null
-check "late row survives the first cycle's range tombstone" \
+check "late row joins the merged view (3 chunk samples + 1 live late row)" \
     "SELECT count(*) FROM it.sensor WHERE tag_id='pump-01' AND timestamp >= $WIN_MS AND timestamp < $WIN_END_MS;" \
-    '^ *1'
+    '^ *4'
 
 check_nodetool "nodetool retier merges the late row" '' retier it sensor
 check "chunk re-encoded merged (samples 3 -> 4)" \
     "SELECT samples FROM it.sensor__chunks WHERE tag_id='pump-01' AND window_start=$WIN_MS;" \
     '^ *4'
-check "merged late row's base copy is deleted" \
+check "merged view still complete after the late row is re-encoded (4 chunk samples)" \
     "SELECT count(*) FROM it.sensor WHERE tag_id='pump-01' AND timestamp >= $WIN_MS AND timestamp < $WIN_END_MS;" \
-    '^ *0'
+    '^ *4'
+check "aggregate spans the chunk transparently (avg of 10,20,30,40)" \
+    "SELECT avg(value) FROM it.sensor WHERE tag_id='pump-01' AND timestamp >= $WIN_MS AND timestamp < $WIN_END_MS;" \
+    '^ *25'
 
 check_nodetool "nodetool tieringstatus lists it.sensor (interval 5m)" 'it +sensor +300000' tieringstatus
 check "system_views.timeseries_tiering exposes policy and run stats" \

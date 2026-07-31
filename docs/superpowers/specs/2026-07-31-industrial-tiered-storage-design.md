@@ -203,3 +203,27 @@ SP3가 인수할 것 (최종 리뷰 지시):
 - 오버플로 웨지 태그는 사이클마다 상한+1페이지 IO 재발(로그 있음) — 운영 문서화 유지.
 - 멀티노드(3노드) 검증 공백은 여전히 이연 상태.
 - 두 번째(병합 카운트) MAX_SAMPLES 가드 전용 테스트 미존재 — SP3 테스트 웨이브에서 보강.
+
+## 9. SP3 구현 완료 노트 (2026-07-31)
+
+SP3는 커밋 `ff982c4621..`(마감 커밋 포함)로 완료 — 쿼터 제약으로 컨트롤러 인라인 실행(계획서
+`2026-07-31-sp3-transparent-reads.md`, R1~R6). 테스트: ChunkReadSupportTest 6, ChunkMergeIteratorTest 7,
+TransparentReadTest 10(E2E 매트릭스: 전범위/콜드만/포인트/핫콜드 집계/gap-fill densify/지각 우선/
+손상 스킵/다중 페이지 에러/LIMIT·DESC/비계층 무영향), TieredStorageServiceTest 16(+dead-tag) — CI 배선.
+도커 IT에 투명 조회 검증 추가(병합 count/포인트/집계).
+
+구현: `tiering/ChunkReadSupport`(디코드→합성 로우, writetime=max_row_writetime 근사 — 이 선택이
+업스트림 타임스탬프 화해를 곧 rows-win 규칙으로 만든다), `ChunkMergePartitionIterator`(요청 키 순
+파티션 워크 + 2-way 병합 + 전부-청크화 파티션 합성), `TransparentReads`(발동 판정·사용자 CL 청크
+조회·손상 스킵+ClientWarn·hot-only 강등), SelectStatement 3개 결합점(비페이징/페이징 단일 fetch/내부).
+§3.3.1의 LIMIT 증명과 v1 페이징 스코프(다중 페이지 병합 = 에러+힌트) 그대로 구현.
+
+구현 중 확정된 추가 규범:
+- **재인코더 내부 바이패스**: 계층화 기계 자신의 베이스 읽기는 `TransparentReads.enterInternalBypass()`
+  (ThreadLocal)로 병합을 우회해야 한다 — 우회 없으면 인코딩된 창이 라이브로 재관측되어 멱등성 루프.
+  runOnce가 브래킷하며, 물리 상태를 검증하는 테스트도 같은 브래킷을 쓴다(raw() 헬퍼).
+- 무경계 슬라이스(Long.MIN/MAX)는 창 산술 전 ±2^62 클램프(언더플로 랩 방지, 테스트로 실증된 버그).
+- R6: 콜드 만료 열거를 청크 테이블 기준으로 전환 — §8의 "죽은 태그" 구조 공백 해소.
+
+잔여(후속): 멀티노드(3노드) 검증 공백(기존 이연과 합류); 정책 파싱 per-query(스키마 버전 캐시 미구현,
+µs 단위라 낮은 우선순위); 클라이언트 페이징의 무상태 재개 앵커 설계(v2 후보).

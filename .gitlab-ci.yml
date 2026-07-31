@@ -66,6 +66,10 @@ timeseries-tests:
     # ALTER TABLE extensions validation
     - ant testsome -Dtest.name=org.apache.cassandra.db.timeseries.tiering.TieringPolicyTest
     - ant testsome -Dtest.name=org.apache.cassandra.db.timeseries.tiering.TieredStorageServiceTest
+    # transparent reads (SP3): chunk decode, coordinator merge, end-to-end SELECT matrix
+    - ant testsome -Dtest.name=org.apache.cassandra.db.timeseries.tiering.ChunkReadSupportTest
+    - ant testsome -Dtest.name=org.apache.cassandra.db.timeseries.tiering.ChunkMergeIteratorTest
+    - ant testsome -Dtest.name=org.apache.cassandra.db.timeseries.tiering.TransparentReadTest
     - ant testsome -Dtest.name=org.apache.cassandra.tools.nodetool.mock.TieredStorageMockTest
     - ant testsome -Dtest.name=org.apache.cassandra.cql3.validation.operations.AlterTableExtensionsTest
     # time-series compaction strategy (TSCS T1 window classification + T2 freeze state machine)
