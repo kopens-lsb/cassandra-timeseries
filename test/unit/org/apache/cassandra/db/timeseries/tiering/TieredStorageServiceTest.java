@@ -106,11 +106,11 @@ public class TieredStorageServiceTest extends CQLTester
                 byte codec = chunkRow.getByte("codec");
                 assertTrue(codec == GorillaCodec.VERSION || codec == Chimp128Codec.VERSION);
 
-                assertEquals(0, execute("SELECT * FROM %s WHERE tag = ? AND ts >= ? AND ts < ?",
+                assertEquals(0, raw("SELECT * FROM %s WHERE tag = ? AND ts >= ? AND ts < ?",
                                         tag, new Date(windowStart), new Date(windowStart + HOUR)).size());
             }
 
-            assertEquals(1, execute("SELECT * FROM %s WHERE tag = ? AND ts = ?", tag, new Date(4 * HOUR)).size());
+            assertEquals(1, raw("SELECT * FROM %s WHERE tag = ? AND ts = ?", tag, new Date(4 * HOUR)).size());
         }
     }
 
@@ -143,12 +143,12 @@ public class TieredStorageServiceTest extends CQLTester
 
         // Every row at or after cutoff -- including the one exactly at ts == cutoff -- must still be
         // in base, completely untouched.
-        assertEquals(2, execute("SELECT * FROM %s WHERE tag = ? AND ts >= ?", "dense", new Date(cutoff)).size());
-        assertEquals(1, execute("SELECT * FROM %s WHERE tag = ? AND ts = ?", "dense", new Date(cutoff)).size());
-        assertEquals(1, execute("SELECT * FROM %s WHERE tag = ? AND ts = ?", "dense", new Date(4 * HOUR)).size());
+        assertEquals(2, raw("SELECT * FROM %s WHERE tag = ? AND ts >= ?", "dense", new Date(cutoff)).size());
+        assertEquals(1, raw("SELECT * FROM %s WHERE tag = ? AND ts = ?", "dense", new Date(cutoff)).size());
+        assertEquals(1, raw("SELECT * FROM %s WHERE tag = ? AND ts = ?", "dense", new Date(4 * HOUR)).size());
 
         // The closed rows (ts < cutoff) are gone.
-        assertEquals(0, execute("SELECT * FROM %s WHERE tag = ? AND ts < ?", "dense", new Date(cutoff)).size());
+        assertEquals(0, raw("SELECT * FROM %s WHERE tag = ? AND ts < ?", "dense", new Date(cutoff)).size());
 
         // No chunk was ever written for a window at or after cutoff.
         assertEquals(0, execute(chunkSelectQuery(), "dense", new Date(cutoff)).size());
@@ -201,14 +201,14 @@ public class TieredStorageServiceTest extends CQLTester
         assertEquals(4, first.rowsEncoded);
         assertEquals(0, first.lateMerges);
 
-        assertEquals(0, execute("SELECT * FROM %s WHERE tag = ? AND ts >= ? AND ts < ?",
+        assertEquals(0, raw("SELECT * FROM %s WHERE tag = ? AND ts >= ? AND ts < ?",
                                 "t", new Date(0L), new Date(HOUR)).size());
 
         // Late row: newer writetime (104) than the tombstone the first run issued (USING TIMESTAMP 103).
         long lateTs = 2_400_000L;
         insertRow("t", lateTs, 42.0, 104);
 
-        UntypedResultSet survived = execute("SELECT * FROM %s WHERE tag = ? AND ts = ?", "t", new Date(lateTs));
+        UntypedResultSet survived = raw("SELECT * FROM %s WHERE tag = ? AND ts = ?", "t", new Date(lateTs));
         assertEquals(1, survived.size());
         assertEquals(42.0, survived.one().getDouble("value"), 0.0);
 
@@ -232,7 +232,7 @@ public class TieredStorageServiceTest extends CQLTester
         }
         assertTrue("expected the late sample to be present in the merged chunk", foundLate);
 
-        assertEquals(0, execute("SELECT * FROM %s WHERE tag = ? AND ts = ?", "t", new Date(lateTs)).size());
+        assertEquals(0, raw("SELECT * FROM %s WHERE tag = ? AND ts = ?", "t", new Date(lateTs)).size());
     }
 
     @Test
@@ -258,7 +258,7 @@ public class TieredStorageServiceTest extends CQLTester
         ByteBuffer payload = ChunkCodecs.encodeSmallest(tsValues, values, tsValues.length);
         execute(chunkInsertQuery(), "i", new Date(0L), tsValues.length, 300L, payload, 301L);
 
-        assertEquals(4, execute("SELECT * FROM %s WHERE tag = ? AND ts >= ? AND ts < ?",
+        assertEquals(4, raw("SELECT * FROM %s WHERE tag = ? AND ts >= ? AND ts < ?",
                                 "i", new Date(0L), new Date(HOUR)).size());
 
         TierRunStats stats = new TieredStorageService().runOnce(KEYSPACE, currentTable(), 5 * HOUR);
@@ -281,7 +281,7 @@ public class TieredStorageServiceTest extends CQLTester
         assertFalse(cursor.advance());
 
         // The interrupted cycle's delete now completes.
-        assertEquals(0, execute("SELECT * FROM %s WHERE tag = ? AND ts >= ? AND ts < ?",
+        assertEquals(0, raw("SELECT * FROM %s WHERE tag = ? AND ts >= ? AND ts < ?",
                                 "i", new Date(0L), new Date(HOUR)).size());
     }
 
@@ -397,7 +397,7 @@ public class TieredStorageServiceTest extends CQLTester
         assertFalse(cursor.advance());
 
         // The range delete covers the whole window regardless of which individual rows had a value.
-        assertEquals(0, execute("SELECT * FROM %s WHERE tag = ? AND ts >= ? AND ts < ?",
+        assertEquals(0, raw("SELECT * FROM %s WHERE tag = ? AND ts >= ? AND ts < ?",
                                 "n", new Date(0L), new Date(HOUR)).size());
     }
 
@@ -467,7 +467,7 @@ public class TieredStorageServiceTest extends CQLTester
 
         // "big" encoded nothing: no chunk row, and every source row is still in base, untouched.
         assertEquals(0, execute(chunkSelectQuery(), "big", new Date(0L)).size());
-        assertEquals(5, execute("SELECT * FROM %s WHERE tag = ? AND ts < ?", "big", new Date(HOUR)).size());
+        assertEquals(5, raw("SELECT * FROM %s WHERE tag = ? AND ts < ?", "big", new Date(HOUR)).size());
 
         // The abort was logged at ERROR, naming the tag and telling the operator what to change.
         assertTrue("expected an ERROR naming tag 'big' and pointing at chunk_window",
@@ -479,7 +479,7 @@ public class TieredStorageServiceTest extends CQLTester
         assertEquals(1, stats.windowsEncoded);
         assertEquals(2, stats.rowsEncoded);
         assertEquals(1, execute(chunkSelectQuery(), "small", new Date(0L)).size());
-        assertEquals(0, execute("SELECT * FROM %s WHERE tag = ? AND ts < ?", "small", new Date(HOUR)).size());
+        assertEquals(0, raw("SELECT * FROM %s WHERE tag = ? AND ts < ?", "small", new Date(HOUR)).size());
     }
 
     @Test
@@ -513,8 +513,8 @@ public class TieredStorageServiceTest extends CQLTester
         assertEquals(2, execute(chunkSelectQuery(), "d", new Date(0L)).one().getInt("samples"));
 
         // ...every closed source row is gone, and the hot row survived.
-        assertEquals(0, execute("SELECT * FROM %s WHERE tag = ? AND ts < ?", "d", new Date(4 * HOUR)).size());
-        assertEquals(1, execute("SELECT * FROM %s WHERE tag = ? AND ts = ?", "d", new Date(5 * HOUR)).size());
+        assertEquals(0, raw("SELECT * FROM %s WHERE tag = ? AND ts < ?", "d", new Date(4 * HOUR)).size());
+        assertEquals(1, raw("SELECT * FROM %s WHERE tag = ? AND ts = ?", "d", new Date(5 * HOUR)).size());
     }
 
     @Test
@@ -627,6 +627,24 @@ public class TieredStorageServiceTest extends CQLTester
     {
         execute("INSERT INTO %s (tag, ts, value) VALUES (?, ?, ?) USING TIMESTAMP ?",
                 tag, new Date(tsMillis), value, writetime);
+    }
+
+    /**
+     * Base-table verification reads must see the PHYSICAL rows, not SP3's transparent hot+chunk
+     * merge - these tests assert that the re-encoder actually deleted/kept raw rows. Logical
+     * (merged) visibility is TransparentReadTest's job.
+     */
+    private UntypedResultSet raw(String query, Object... values) throws Throwable
+    {
+        TransparentReads.enterInternalBypass();
+        try
+        {
+            return execute(query, values);
+        }
+        finally
+        {
+            TransparentReads.exitInternalBypass();
+        }
     }
 
     private void setPolicy(String json) throws Throwable

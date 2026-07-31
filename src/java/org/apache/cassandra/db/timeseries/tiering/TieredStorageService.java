@@ -363,6 +363,21 @@ public class TieredStorageService implements TieredStorageServiceMBean
      */
     public TierRunStats runOnce(String keyspace, String table, long nowMillis)
     {
+        // The re-encoder's own reads must see raw base rows, never the transparent hot+chunk merge -
+        // merged reads would make already-encoded windows look live again (idempotency loop).
+        TransparentReads.enterInternalBypass();
+        try
+        {
+            return runOnceInner(keyspace, table, nowMillis);
+        }
+        finally
+        {
+            TransparentReads.exitInternalBypass();
+        }
+    }
+
+    private TierRunStats runOnceInner(String keyspace, String table, long nowMillis)
+    {
         TierRunStats stats = new TierRunStats();
 
         TableMetadata base = Schema.instance.getTableMetadata(keyspace, table);

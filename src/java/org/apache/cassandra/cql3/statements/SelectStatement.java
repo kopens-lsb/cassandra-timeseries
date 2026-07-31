@@ -526,6 +526,7 @@ public class SelectStatement implements CQLStatement.SingleKeyspaceCqlStatement,
 
             rows = execute(state,
                            Pager.forDistributedQuery(pager, cl, state.getClientState()),
+                           query,
                            options,
                            selectors,
                            pageSize,
@@ -615,7 +616,11 @@ public class SelectStatement implements CQLStatement.SingleKeyspaceCqlStatement,
     {
         try (PartitionIterator data = query.execute(options.getConsistency(), state, requestTime))
         {
-            return processResults(data, options, selectors, nowInSec, userLimit, aggregationSpec, unmask, state);
+            // SP3 transparent tiered reads: merge decoded chunk rows in (no-op unless the table has
+            // a tiering policy and the query reaches below the hot window).
+            PartitionIterator merged = org.apache.cassandra.db.timeseries.tiering.TransparentReads
+                                       .maybeWrap(table, query, data, options.getConsistency());
+            return processResults(merged, options, selectors, nowInSec, userLimit, aggregationSpec, unmask, state);
         }
     }
 
@@ -694,6 +699,7 @@ public class SelectStatement implements CQLStatement.SingleKeyspaceCqlStatement,
 
     private ResultMessage.Rows execute(QueryState state,
                                        Pager pager,
+                                       ReadQuery query,
                                        QueryOptions options,
                                        Selectors selectors,
                                        int pageSize,
@@ -728,15 +734,32 @@ public class SelectStatement implements CQLStatement.SingleKeyspaceCqlStatement,
                   + " you must either remove the ORDER BY or the IN and sort client side, or disable paging for this query");
 
         ResultMessage.Rows msg;
+        boolean tieredMerge;
         try (PartitionIterator page = pager.fetchPage(pageSize, requestTime))
         {
-            msg = processResults(page, options, selectors, nowInSec, userLimit, aggregationSpec, unmask, state.getClientState());
+            // SP3 transparent tiered reads. Aggregations page internally within this single fetch,
+            // so a merged aggregation over hot+cold is complete here; only queries that would need
+            // MORE client pages cannot merge consistently (checked below). Internal pagers read
+            // chunks through the internal path (null consistency).
+            PartitionIterator merged = org.apache.cassandra.db.timeseries.tiering.TransparentReads
+                                       .maybeWrap(table, query, page,
+                                                  pager instanceof Pager.NormalPager ? options.getConsistency() : null);
+            tieredMerge = org.apache.cassandra.db.timeseries.tiering.TransparentReads.isMerged(merged);
+            msg = processResults(merged, options, selectors, nowInSec, userLimit, aggregationSpec, unmask, state.getClientState());
         }
 
         // Please note that the isExhausted state of the pager only gets updated when we've closed the page, so this
         // shouldn't be moved inside the 'try' above.
         if (!pager.isExhausted() && !pager.pager.isTopK())
+        {
+            // Cross-page synthetic-row continuity has no anchor in the hot pager's PagingState, so a
+            // multi-page transparent tiered read would duplicate or lose chunk rows - fail loudly
+            // with a remedy instead (design spec section 3.3.1 v1 scope).
+            checkFalse(tieredMerge,
+                       "Transparent tiered read spans multiple pages; increase the page size above the expected row count, " +
+                       "narrow the time range, or aggregate (e.g. time_bucket GROUP BY) so the result fits one page");
             msg.result.metadata.setHasMorePages(pager.state());
+        }
 
         return msg;
     }
@@ -794,7 +817,10 @@ public class SelectStatement implements CQLStatement.SingleKeyspaceCqlStatement,
             {
                 try (PartitionIterator data = query.executeInternal(executionController))
                 {
-                    return processResults(data, options, selectors, nowInSec, userLimit, null, unmask, state.getClientState());
+                    // SP3 transparent tiered reads on the internal/local path (cl == null).
+                    PartitionIterator merged = org.apache.cassandra.db.timeseries.tiering.TransparentReads
+                                               .maybeWrap(table, query, data, null);
+                    return processResults(merged, options, selectors, nowInSec, userLimit, null, unmask, state.getClientState());
                 }
             }
 
@@ -802,6 +828,7 @@ public class SelectStatement implements CQLStatement.SingleKeyspaceCqlStatement,
 
             return execute(state,
                            Pager.forInternalQuery(pager, executionController),
+                           query,
                            options,
                            selectors,
                            pageSize,
