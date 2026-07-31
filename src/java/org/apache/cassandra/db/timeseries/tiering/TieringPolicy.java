@@ -248,10 +248,11 @@ public final class TieringPolicy
      *     have per-element cells and timestamps that a chunk's opaque per-row bytes cannot represent.
      *     Frozen collections are single-cell and are fine, carried as opaque bytes.</li>
      *     <li>zero or several clustering columns, or a clustering column that is not a timestamp.</li>
-     *     <li>a <b>secondary index (SAI or otherwise) on a regular column</b> -- re-encoded rows are
-     *     deleted from the base table, so they disappear from the index and index queries would
-     *     silently return only data younger than {@code hot_window}. Indexes on static, partition key
-     *     or clustering columns are unaffected and stay supported.</li>
+     *     <li>a <b>secondary index (SAI or otherwise) on anything but a static column</b> -- index
+     *     entries are per base row, so the re-encoder's delete removes them and index queries would
+     *     silently return only data younger than {@code hot_window}. That covers regular, clustering
+     *     <em>and</em> partition-key-component targets alike; only a static-column index survives,
+     *     because its entries sit outside every clustering range the re-encoder deletes.</li>
      *     <li>a <b>materialized view</b> over the table -- the range delete propagates to the view
      *     (view maintenance reads the deleted base rows and issues the matching view deletions), but
      *     transparent reads only reconstruct rows for the <em>base</em> table, so the view would
@@ -312,7 +313,7 @@ public final class TieringPolicy
                                column.name.toCQLString(), String.join(", ", ChunkTables.RESERVED_COLUMN_NAMES));
         }
 
-        String indexError = regularColumnIndexError(metadata);
+        String indexError = unsafeIndexError(metadata);
         if (indexError != null)
             return indexError;
 
@@ -324,29 +325,49 @@ public final class TieringPolicy
      * Every index is resolved to its target column via {@link TargetParser} (the same parse the index
      * implementations themselves use, so {@code values(m)}/{@code keys(m)}/quoted names all resolve
      * identically); an index whose target cannot be resolved is rejected rather than assumed safe.
+     * <p>
+     * Only a <b>static</b> target is safe, and the reason is specific to static columns rather than to
+     * "not a regular column": every other kind of index entry is keyed by a base <em>row</em>, so the
+     * re-encoder's clustering-range delete removes it. That includes a clustering-column index (which
+     * CQL permits -- {@code CreateIndexStatement} only bans indexing the sole partition key column) and
+     * an index on one component of a composite partition key, whose entries also disappear once every
+     * row of the partition has been chunked. A static column's entries sit at
+     * {@code Clustering.STATIC_CLUSTERING}, outside every clustering range the re-encoder deletes.
      */
-    private static String regularColumnIndexError(TableMetadata metadata)
+    private static String unsafeIndexError(TableMetadata metadata)
     {
         for (IndexMetadata index : metadata.indexes)
         {
             String target = index.options.get(IndexTarget.TARGET_OPTION_NAME);
             if (target == null)
-                return format("index '%s' records no target column, so tiering cannot establish that it does not " +
-                               "cover a regular column", index.name);
+                return format("index '%s' records no target column, so tiering cannot establish that it is on a " +
+                               "static column (the only kind of index that survives tiering)", index.name);
 
             Pair<ColumnMetadata, IndexTarget.Type> parsed = TargetParser.parse(metadata, target);
             if (parsed == null)
                 return format("index '%s' targets '%s', which does not resolve to a column of this table, so " +
-                               "tiering cannot establish that it does not cover a regular column",
+                               "tiering cannot establish that it is on a static column (the only kind of index " +
+                               "that survives tiering)",
                                index.name, target);
 
-            if (parsed.left.isRegular())
-                return format("index '%s' is on regular column '%s': re-encoded rows are deleted from the base " +
-                               "table, so they vanish from the index and index queries would silently return only " +
-                               "data younger than hot_window. Indexes on static or primary key columns are fine",
-                               index.name, parsed.left.name.toCQLString());
+            if (!parsed.left.isStatic())
+                return format("index '%s' is on %s column '%s': index entries are per base row, and re-encoded " +
+                               "rows are deleted from the base table, so they vanish from the index and index " +
+                               "queries would silently return only data younger than hot_window. Only indexes on " +
+                               "static columns survive tiering, because static entries live outside every " +
+                               "clustering range the re-encoder deletes",
+                               index.name, columnKind(parsed.left), parsed.left.name.toCQLString());
         }
         return null;
+    }
+
+    private static String columnKind(ColumnMetadata column)
+    {
+        if (column.isPartitionKey())
+            return "partition key";
+        if (column.isClusteringColumn())
+            return "clustering";
+        return "regular";
     }
 
     /**

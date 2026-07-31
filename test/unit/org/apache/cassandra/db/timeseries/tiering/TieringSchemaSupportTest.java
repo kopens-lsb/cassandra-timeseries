@@ -89,13 +89,29 @@ public class TieringSchemaSupportTest extends CQLTester
     }
 
     @Test
+    public void secondaryIndexOnTheClusteringColumnIsRejected() throws Throwable
+    {
+        // Proves the premise as well as the rule: CQL really does allow indexing the timestamp
+        // clustering column, and those entries are per row, so the range delete takes them with it.
+        createTable("CREATE TABLE %s (tag text, ts timestamp, value double, PRIMARY KEY (tag, ts))");
+        String index = createIndex("CREATE CUSTOM INDEX ON %s(ts) USING 'sai'");
+
+        String error = TieringPolicy.unsupportedSchemaError(metadata());
+        assertNotNull(error);
+        assertTrue(error, error.contains(index));
+        assertTrue(error, error.contains("clustering column 'ts'"));
+    }
+
+    @Test
     public void secondaryIndexOnAStaticColumnIsAccepted() throws Throwable
     {
         // The production table carries SAI on static asset_id/opc_id: static cells are never chunked
-        // and never deleted, so the index stays complete.
-        createTable("CREATE TABLE %s (tag text, ts timestamp, asset_id text static, value double, " +
-                    "PRIMARY KEY (tag, ts))");
+        // and never deleted (their index entries sit at Clustering.STATIC_CLUSTERING, outside every
+        // clustering range the re-encoder deletes), so the index stays complete.
+        createTable("CREATE TABLE %s (tag text, ts timestamp, asset_id text static, opc_id text static, " +
+                    "value double, PRIMARY KEY (tag, ts))");
         createIndex("CREATE CUSTOM INDEX ON %s(asset_id) USING 'sai'");
+        createIndex("CREATE CUSTOM INDEX ON %s(opc_id) USING 'sai'");
 
         assertNull(TieringPolicy.unsupportedSchemaError(metadata()));
     }

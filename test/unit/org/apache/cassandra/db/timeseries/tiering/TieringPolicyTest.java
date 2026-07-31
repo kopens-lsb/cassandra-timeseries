@@ -367,18 +367,32 @@ public class TieringPolicyTest
     }
 
     @Test
-    public void testIndexOnStaticOrKeyColumnAccepted()
+    public void testIndexOnStaticColumnAccepted()
     {
-        // The real table carries SAI on static asset_id/opc_id. Those rows never move, so the index
-        // stays complete -- only regular-column indexes are a problem.
+        // The real table carries SAI on static asset_id/opc_id. A static column's index entries live at
+        // Clustering.STATIC_CLUSTERING, outside every clustering range the re-encoder deletes, so they
+        // are the only index entries that survive tiering.
         TableMetadata table = TableMetadata.builder("ks", "tbl")
                                             .addPartitionKeyColumn("tag", UTF8Type.instance)
                                             .addClusteringColumn("ts", TimestampType.instance)
                                             .addStaticColumn("asset_id", UTF8Type.instance)
+                                            .addStaticColumn("opc_id", UTF8Type.instance)
                                             .addRegularColumn("value", DoubleType.instance)
                                             .indexes(Indexes.of(index("by_asset", "asset_id"),
-                                                                index("by_tag", "tag"),
-                                                                index("by_ts", "ts")))
+                                                                index("by_opc", "opc_id")))
+                                            .build();
+        assertNull(TieringPolicy.unsupportedSchemaError(table));
+    }
+
+    @Test
+    public void testTableWithNoRegularColumnsAccepted()
+    {
+        // A pure event log: the timestamp axis is itself the data, and a chunk encodes it. Deliberately
+        // accepted -- there is no reason to demand a value column.
+        TableMetadata table = TableMetadata.builder("ks", "tbl")
+                                            .addPartitionKeyColumn("tag", UTF8Type.instance)
+                                            .addClusteringColumn("ts", TimestampType.instance)
+                                            .addStaticColumn("site_id", UTF8Type.instance)
                                             .build();
         assertNull(TieringPolicy.unsupportedSchemaError(table));
     }
@@ -468,7 +482,44 @@ public class TieringPolicyTest
         String error = TieringPolicy.unsupportedSchemaError(table);
         assertNotNull(error);
         assertTrue(error, error.contains("by_value"));
-        assertTrue(error, error.contains("value"));
+        assertTrue(error, error.contains("regular column 'value'"));
+    }
+
+    @Test
+    public void testIndexOnClusteringColumnRejected()
+    {
+        // CQL permits CREATE INDEX ON t(ts) -- CreateIndexStatement only bans indexing the sole
+        // partition key column -- and its entries are per row, so the re-encoder's range delete removes
+        // them exactly as it does a regular column's. `SELECT ... WHERE ts = ?` would then silently
+        // return only rows younger than hot_window.
+        TableMetadata table = TableMetadata.builder("ks", "tbl")
+                                            .addPartitionKeyColumn("tag", UTF8Type.instance)
+                                            .addClusteringColumn("ts", TimestampType.instance)
+                                            .addRegularColumn("value", DoubleType.instance)
+                                            .indexes(Indexes.of(index("by_ts", "ts")))
+                                            .build();
+        String error = TieringPolicy.unsupportedSchemaError(table);
+        assertNotNull(error);
+        assertTrue(error, error.contains("by_ts"));
+        assertTrue(error, error.contains("clustering column 'ts'"));
+    }
+
+    @Test
+    public void testIndexOnPartitionKeyComponentRejected()
+    {
+        // One component of a composite key: also per-row entries, so once every row of a partition has
+        // been chunked that partition contributes nothing to the index.
+        TableMetadata table = TableMetadata.builder("ks", "tbl")
+                                            .addPartitionKeyColumn("asset_id", UTF8Type.instance)
+                                            .addPartitionKeyColumn("date", UTF8Type.instance)
+                                            .addClusteringColumn("ts", TimestampType.instance)
+                                            .addRegularColumn("value", DoubleType.instance)
+                                            .indexes(Indexes.of(index("by_date", "date")))
+                                            .build();
+        String error = TieringPolicy.unsupportedSchemaError(table);
+        assertNotNull(error);
+        assertTrue(error, error.contains("by_date"));
+        assertTrue(error, error.contains("partition key column 'date'"));
     }
 
     @Test
