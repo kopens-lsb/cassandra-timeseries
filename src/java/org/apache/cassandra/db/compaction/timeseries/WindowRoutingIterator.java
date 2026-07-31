@@ -19,6 +19,7 @@
 package org.apache.cassandra.db.compaction.timeseries;
 
 import java.util.ArrayList;
+import java.util.Iterator;
 import java.util.List;
 import java.util.NavigableMap;
 import java.util.TreeMap;
@@ -27,13 +28,16 @@ import java.util.function.LongUnaryOperator;
 
 import com.google.common.annotations.VisibleForTesting;
 
+import org.apache.cassandra.db.DeletionTime;
 import org.apache.cassandra.db.LivenessInfo;
+import org.apache.cassandra.db.rows.AbstractUnfilteredRowIterator;
 import org.apache.cassandra.db.rows.Cell;
 import org.apache.cassandra.db.rows.ColumnData;
 import org.apache.cassandra.db.rows.ComplexColumnData;
 import org.apache.cassandra.db.rows.RangeTombstoneBoundMarker;
 import org.apache.cassandra.db.rows.RangeTombstoneBoundaryMarker;
 import org.apache.cassandra.db.rows.Row;
+import org.apache.cassandra.db.rows.Rows;
 import org.apache.cassandra.db.rows.Unfiltered;
 import org.apache.cassandra.db.rows.UnfilteredRowIterator;
 
@@ -108,6 +112,73 @@ public final class WindowRoutingIterator
     private static List<Unfiltered> bucket(NavigableMap<Long, List<Unfiltered>> buckets, long windowStart)
     {
         return buckets.computeIfAbsent(windowStart, k -> new ArrayList<>());
+    }
+
+    /**
+     * Routes a partition into per-window {@link UnfilteredRowIterator} slices ready to be appended
+     * to per-window writers. The partition header (partition-level deletion, static row) is placed
+     * exactly ONCE, in the window of its own max write timestamp (plan D3, revised): replicating it
+     * would stamp old deletion timestamps into newer windows' sstable metadata, leaving them
+     * permanently "spanning" for the freeze classifier. Read-time partition merge applies the
+     * deletion to all windows anyway, and whole-window retention drops proceed oldest-first, so by
+     * the time the header's window is dropped every window it could still shadow is already gone.
+     *
+     * @return window start (ms) → that window's slice; empty map for a truly empty partition
+     */
+    public static NavigableMap<Long, UnfilteredRowIterator> slices(UnfilteredRowIterator partition,
+                                                                   LongUnaryOperator windowStartOfMillis,
+                                                                   TimeUnit tableResolution)
+    {
+        DeletionTime partitionDeletion = partition.partitionLevelDeletion();
+        Row staticRow = partition.staticRow();
+        NavigableMap<Long, List<Unfiltered>> routed = route(partition, windowStartOfMillis, tableResolution);
+
+        long headerWindow = Long.MIN_VALUE;
+        if (!partitionDeletion.isLive() || !staticRow.isEmpty())
+        {
+            long headerMillis = Long.MIN_VALUE;
+            if (!partitionDeletion.isLive())
+                headerMillis = toMillis(partitionDeletion.markedForDeleteAt(), tableResolution);
+            if (!staticRow.isEmpty())
+                headerMillis = Math.max(headerMillis, routingMillis(staticRow, tableResolution));
+            headerWindow = windowStartOfMillis.applyAsLong(headerMillis);
+            routed.computeIfAbsent(headerWindow, k -> List.of());
+        }
+
+        NavigableMap<Long, UnfilteredRowIterator> slices = new TreeMap<>();
+        for (var entry : routed.entrySet())
+        {
+            boolean carriesHeader = entry.getKey() == headerWindow;
+            slices.put(entry.getKey(), new WindowSlice(partition,
+                                                       carriesHeader ? partitionDeletion : DeletionTime.LIVE,
+                                                       carriesHeader ? staticRow : Rows.EMPTY_STATIC_ROW,
+                                                       entry.getValue().iterator()));
+        }
+        return slices;
+    }
+
+    /** One window's view of a partition: original key/columns/stats + that window's unfiltereds. */
+    private static final class WindowSlice extends AbstractUnfilteredRowIterator
+    {
+        private final Iterator<Unfiltered> content;
+
+        WindowSlice(UnfilteredRowIterator source, DeletionTime partitionDeletion, Row staticRow, Iterator<Unfiltered> content)
+        {
+            super(source.metadata(),
+                  source.partitionKey(),
+                  partitionDeletion,
+                  source.columns(),
+                  staticRow,
+                  false,
+                  source.stats());
+            this.content = content;
+        }
+
+        @Override
+        protected Unfiltered computeNext()
+        {
+            return content.hasNext() ? content.next() : endOfData();
+        }
     }
 
     /** The write-timestamp (converted to epoch millis) that decides an unfiltered's window. */

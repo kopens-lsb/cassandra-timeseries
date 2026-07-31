@@ -347,4 +347,52 @@ public class TimeSeriesCompactionStrategyE2ETest extends SchemaLoader
             WindowFrozenListeners.unsafeClearListeners();
         }
     }
+
+    @Test
+    public void testSplitRefreezeLegacySpanningSSTable()
+    {
+        Keyspace keyspace = Keyspace.open(KEYSPACE1);
+        ColumnFamilyStore cfs = keyspace.getColumnFamilyStore(CF_STANDARD1);
+        cfs.truncateBlocking();
+        cfs.disableAutoCompaction();
+        java.nio.ByteBuffer value = java.nio.ByteBuffer.wrap(new byte[16]);
+
+        // Recreate a LEGACY spanning sstable: flush rows from two windows in one memtable while the
+        // schema strategy is still the default (non-TSCS) - TSCS's own flush writer would split it.
+        long now = System.currentTimeMillis();
+        DecoratedKey key = Util.dk("span");
+        new RowUpdateBuilder(cfs.metadata(), now - TimeUnit.HOURS.toMillis(1), key.getKey())
+            .clustering("c-old").add("val", value).build().applyUnsafe();
+        new RowUpdateBuilder(cfs.metadata(), now - TimeUnit.MINUTES.toMillis(10), key.getKey())
+            .clustering("c-new").add("val", value).build().applyUnsafe();
+        Util.flush(cfs);
+        assertEquals(1, cfs.getLiveSSTables().size());
+        SSTableReader spanning = cfs.getLiveSSTables().iterator().next();
+
+        cfs.setCompactionParameters(ImmutableMap.of("class", "TimeSeriesCompactionStrategy",
+                                                    "timestamp_resolution", "MILLISECONDS",
+                                                    "window_size", "1m",
+                                                    "freeze_after", "1m"));
+        TimeSeriesCompactionStrategy tscs =
+            (TimeSeriesCompactionStrategy) cfs.getCompactionStrategyManager().getCompactionStrategyFor(spanning);
+
+        Collection<AbstractCompactionTask> tasks = tscs.getNextBackgroundTasks(nowInSeconds());
+        AbstractCompactionTask task = Iterables.getOnlyElement(tasks, null);
+        assertNotNull(task);
+        assertTrue(task instanceof SplitRefreezeCompactionTask);
+        task.execute(ActiveCompactionsTracker.NOOP);
+
+        // One contained sstable per window; both rows still readable; nothing left to do next round
+        // (each window is now a single contained sstable = FROZEN - the freeze path never reselects it).
+        assertEquals(2, cfs.getLiveSSTables().size());
+        for (SSTableReader s : cfs.getLiveSSTables())
+            assertEquals(s.toString(), windowOfMinute(s.getMinTimestamp()), windowOfMinute(s.getMaxTimestamp()));
+        assertEquals(2, Util.getOnlyPartition(Util.cmd(cfs, key).build()).rowCount());
+        assertTrue(tscs.getNextBackgroundTasksAt(System.currentTimeMillis(), nowInSeconds()).isEmpty());
+    }
+
+    private static long windowOfMinute(long ms)
+    {
+        return ms - Math.floorMod(ms, 60_000L);
+    }
 }

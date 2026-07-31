@@ -78,6 +78,7 @@ public class TimeSeriesCompactionStrategy extends AbstractCompactionStrategy
     // number of FREEZING windows (>= 2 sstables) seen on the most recent background round, for
     // getEstimatedRemainingTasks() - freezes starve behind other tables' work if the CSM cannot see them.
     private volatile int freezeBacklog;
+    private volatile int splitBacklog;
     // the freeze candidate that failed tryModify on the previous round: cross-round version of TWCS's
     // previousCandidate guard (:100-106) - warn when the same candidate is stuck two rounds running,
     // but keep retrying (unlike TWCS's intra-call loop, skipping here would never retry at all).
@@ -173,6 +174,37 @@ public class TimeSeriesCompactionStrategy extends AbstractCompactionStrategy
                     logger.debug("Unable to mark window {} of {} for freezing; will retry next round",
                                  freeze.getKey(), cfs.getTableName());
                 previousFreezeCandidate = toFreeze;
+            }
+        }
+        if (!freezeAttempted)
+        {
+            // Legacy SPANNING sstables (single sstable failing containment in a closed window) are
+            // split-rewritten into per-window sstables - lower priority than regular freezes (plan D7).
+            Map.Entry<Long, Set<SSTableReader>> split = nextSplitRefreezeCandidate(nowMillis);
+            if (split != null)
+            {
+                Set<SSTableReader> toSplit = new HashSet<>(AbstractCompactionStrategy.filterSuspectSSTables(split.getValue()));
+                toSplit.retainAll(cfs.getLiveSSTables());
+                if (toSplit.size() == 1)
+                {
+                    freezeAttempted = true;
+                    LifecycleTransaction txn = cfs.getTracker().tryModify(toSplit, OperationType.COMPACTION);
+                    if (txn != null)
+                    {
+                        previousFreezeCandidate = Set.of();
+                        logger.debug("Split-refreezing spanning sstable in window {} of {}", split.getKey(), cfs.getTableName());
+                        return List.of(new SplitRefreezeCompactionTask(cfs, txn, gcBefore,
+                                                                       tsOptions::windowStartFor, tsOptions.timestampResolution));
+                    }
+                    if (toSplit.equals(previousFreezeCandidate))
+                        logger.warn("Could not acquire references for split-refreezing sstables {} which is not a problem" +
+                                    " per se, unless it happens frequently, in which case it must be reported. Will retry later.",
+                                    toSplit);
+                    else
+                        logger.debug("Unable to mark window {} of {} for split-refreeze; will retry next round",
+                                     split.getKey(), cfs.getTableName());
+                    previousFreezeCandidate = toSplit;
+                }
             }
         }
         if (!freezeAttempted)
@@ -324,6 +356,34 @@ public class TimeSeriesCompactionStrategy extends AbstractCompactionStrategy
         return oldest;
     }
 
+    /**
+     * The oldest closed window whose single sstable fails containment (a legacy SPANNING sstable -
+     * pre-T3 data or a strategy switch; TSCS's own flush/streaming writer no longer produces them).
+     * These classify FREEZING but cannot be fixed by freezing (rewriting one sstable into one
+     * sstable never restores containment) - they need {@link SplitRefreezeCompactionTask}.
+     * Side effect: refreshes {@link #splitBacklog}.
+     */
+    @VisibleForTesting
+    synchronized Map.Entry<Long, Set<SSTableReader>> nextSplitRefreezeCandidate(long nowMillis)
+    {
+        Map.Entry<Long, Set<SSTableReader>> oldest = null;
+        int backlog = 0;
+        for (Map.Entry<Long, Set<SSTableReader>> window : windows().entrySet())
+        {
+            if (tsOptions.isFarFutureWindow(window.getKey(), nowMillis))
+                continue;                                 // same precondition hygiene as nextFreezeCandidate
+            if (window.getValue().size() != 1)
+                continue;
+            if (classify(window.getKey(), window.getValue(), nowMillis) != WindowState.FREEZING)
+                continue;                                 // FROZEN (contained) or still active/expired
+            backlog++;
+            if (oldest == null)
+                oldest = window;
+        }
+        splitBacklog = backlog;
+        return oldest;
+    }
+
     @VisibleForTesting
     UnifiedCompactionStrategy delegate()
     {
@@ -395,7 +455,8 @@ public class TimeSeriesCompactionStrategy extends AbstractCompactionStrategy
     {
         return delegate.getEstimatedRemainingTasks()
                + (lastExpiredSelection.isEmpty() ? 0 : 1)
-               + freezeBacklog;
+               + freezeBacklog
+               + splitBacklog;
     }
 
     @Override

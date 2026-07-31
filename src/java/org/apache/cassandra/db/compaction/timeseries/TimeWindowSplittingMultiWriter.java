@@ -20,7 +20,6 @@ package org.apache.cassandra.db.compaction.timeseries;
 
 import java.util.ArrayList;
 import java.util.Collection;
-import java.util.Iterator;
 import java.util.List;
 import java.util.NavigableMap;
 import java.util.TreeMap;
@@ -28,15 +27,10 @@ import java.util.concurrent.TimeUnit;
 import java.util.function.LongUnaryOperator;
 
 import org.apache.cassandra.db.ColumnFamilyStore;
-import org.apache.cassandra.db.DeletionTime;
 import org.apache.cassandra.db.SerializationHeader;
 import org.apache.cassandra.db.commitlog.CommitLogPosition;
 import org.apache.cassandra.db.commitlog.IntervalSet;
 import org.apache.cassandra.db.lifecycle.ILifecycleTransaction;
-import org.apache.cassandra.db.rows.AbstractUnfilteredRowIterator;
-import org.apache.cassandra.db.rows.Row;
-import org.apache.cassandra.db.rows.Rows;
-import org.apache.cassandra.db.rows.Unfiltered;
 import org.apache.cassandra.db.rows.UnfilteredRowIterator;
 import org.apache.cassandra.index.Index;
 import org.apache.cassandra.io.sstable.Descriptor;
@@ -108,36 +102,10 @@ public class TimeWindowSplittingMultiWriter implements SSTableMultiWriter
         if (partition.isReverseOrder())
             throw new IllegalStateException("Window-splitting writer only supports forward iteration");
 
-        DeletionTime partitionDeletion = partition.partitionLevelDeletion();
-        Row staticRow = partition.staticRow();
-        NavigableMap<Long, List<Unfiltered>> routed = WindowRoutingIterator.route(partition, windowStartOfMillis, tableResolution);
-
-        // The partition header (partition-level deletion, static row) routes by its OWN max write
-        // timestamp, exactly once (plan D3, revised): replicating it into every output would stamp
-        // old deletion timestamps into newer windows' sstable metadata, leaving them permanently
-        // "spanning" for the freeze classifier. Read-time partition merge applies the deletion to
-        // all windows anyway, and whole-window retention drops proceed oldest-first, so by the time
-        // the header's window is dropped every window it could still shadow is already gone.
-        long headerWindow = Long.MIN_VALUE;
-        if (!partitionDeletion.isLive() || !staticRow.isEmpty())
-        {
-            long headerMillis = Long.MIN_VALUE;
-            if (!partitionDeletion.isLive())
-                headerMillis = TimeUnit.MILLISECONDS.convert(partitionDeletion.markedForDeleteAt(), tableResolution);
-            if (!staticRow.isEmpty())
-                headerMillis = Math.max(headerMillis, WindowRoutingIterator.routingMillis(staticRow, tableResolution));
-            headerWindow = windowStartOfMillis.applyAsLong(headerMillis);
-            routed.computeIfAbsent(headerWindow, k -> List.of());
-        }
-
-        for (var entry : routed.entrySet())
-        {
-            boolean carriesHeader = entry.getKey() == headerWindow;
-            writerFor(entry.getKey()).append(new WindowSlice(partition,
-                                                             carriesHeader ? partitionDeletion : DeletionTime.LIVE,
-                                                             carriesHeader ? staticRow : Rows.EMPTY_STATIC_ROW,
-                                                             entry.getValue().iterator()));
-        }
+        // Header placement (deletion/static once, in its own window) is WindowRoutingIterator's
+        // contract - see slices() for the rationale (plan D3, revised).
+        for (var entry : WindowRoutingIterator.slices(partition, windowStartOfMillis, tableResolution).entrySet())
+            writerFor(entry.getKey()).append(entry.getValue());
     }
 
     private SSTableWriter writerFor(long windowStart)
@@ -267,27 +235,4 @@ public class TimeWindowSplittingMultiWriter implements SSTableMultiWriter
             writer.close();
     }
 
-    /** One window's view of a partition: original header (deletion, static row, stats) + that window's unfiltereds. */
-    private static final class WindowSlice extends AbstractUnfilteredRowIterator
-    {
-        private final Iterator<Unfiltered> content;
-
-        WindowSlice(UnfilteredRowIterator source, DeletionTime partitionDeletion, Row staticRow, Iterator<Unfiltered> content)
-        {
-            super(source.metadata(),
-                  source.partitionKey(),
-                  partitionDeletion,
-                  source.columns(),
-                  staticRow,
-                  false,
-                  source.stats());
-            this.content = content;
-        }
-
-        @Override
-        protected Unfiltered computeNext()
-        {
-            return content.hasNext() ? content.next() : endOfData();
-        }
-    }
 }

@@ -572,4 +572,72 @@ public class TimeSeriesCompactionStrategyTest
         // 위임 3 + 만료 0 + FREEZING 창 2 — 백로그를 안 세면 CSM 정렬에서 다른 테이블에 밀려 동결이 기아한다
         assertEquals(5, tscs.getEstimatedRemainingTasks());
     }
+
+    @Test
+    public void spanningSingleIsSelectedForSplitRefreeze()
+    {
+        // T3: 레거시 걸침 단일 sstable은 동결 후보는 아니지만(위 테스트) 분할 재작성 후보다 (스펙 §4/§10)
+        UnifiedCompactionStrategy delegate = mock(UnifiedCompactionStrategy.class);
+        when(delegate.getNextBackgroundTasks(anyLong())).thenReturn(List.of());
+        ColumnFamilyStore cfs = mock(ColumnFamilyStore.class, Mockito.RETURNS_DEEP_STUBS);
+        stubTracker(cfs);
+        TimeSeriesCompactionStrategy tscs = new TimeSeriesCompactionStrategy(cfs, options(), delegate);
+
+        SSTableReader spanning = sstableSpanning(NOW - 11 * HOUR, NOW - 10 * HOUR);
+        tscs.addSSTable(spanning);
+        when(cfs.getLiveSSTables()).thenReturn(Set.of(spanning));
+
+        Collection<AbstractCompactionTask> tasks = tscs.getNextBackgroundTasksAt(NOW, 0);
+
+        assertEquals(1, tasks.size());
+        AbstractCompactionTask task = List.copyOf(tasks).get(0);
+        assertTrue(task instanceof SplitRefreezeCompactionTask);
+        assertEquals(Set.of(spanning), task.transaction.originals());
+        verify(delegate, Mockito.never()).getNextBackgroundTasks(anyLong());   // 분할이 위임보다 우선
+    }
+
+    @Test
+    public void normalFreezeBeatsSplitRefreeze()
+    {
+        // 우선순위: 만료 > 동결 > 분할 재작성 > 위임 (라운드당 태스크 1개)
+        UnifiedCompactionStrategy delegate = mock(UnifiedCompactionStrategy.class);
+        when(delegate.getNextBackgroundTasks(anyLong())).thenReturn(List.of());
+        ColumnFamilyStore cfs = mock(ColumnFamilyStore.class, Mockito.RETURNS_DEEP_STUBS);
+        stubTracker(cfs);
+        TimeSeriesCompactionStrategy tscs = new TimeSeriesCompactionStrategy(cfs, options(), delegate);
+
+        SSTableReader spanning = sstableSpanning(NOW - 31 * HOUR, NOW - 30 * HOUR);   // 더 오래된 걸침 창
+        SSTableReader f1 = sstableAt(NOW - 10 * HOUR);
+        SSTableReader f2 = sstableAt(NOW - 10 * HOUR + 60_000);
+        for (SSTableReader s : List.of(spanning, f1, f2))
+            tscs.addSSTable(s);
+        when(cfs.getLiveSSTables()).thenReturn(Set.of(spanning, f1, f2));
+
+        Collection<AbstractCompactionTask> tasks = tscs.getNextBackgroundTasksAt(NOW, 0);
+
+        assertEquals(1, tasks.size());
+        assertTrue(List.copyOf(tasks).get(0) instanceof FreezeCompactionTask);   // 걸침이 더 오래돼도 동결 우선
+    }
+
+    @Test
+    public void splitBacklogCountsInEstimatedRemainingTasks()
+    {
+        UnifiedCompactionStrategy delegate = mock(UnifiedCompactionStrategy.class);
+        when(delegate.getNextBackgroundTasks(anyLong())).thenReturn(List.of());
+        when(delegate.getEstimatedRemainingTasks()).thenReturn(0);
+        ColumnFamilyStore cfs = mock(ColumnFamilyStore.class, Mockito.RETURNS_DEEP_STUBS);
+        stubTracker(cfs);
+        TimeSeriesCompactionStrategy tscs = new TimeSeriesCompactionStrategy(cfs, options(), delegate);
+
+        SSTableReader spanA = sstableSpanning(NOW - 11 * HOUR, NOW - 10 * HOUR);
+        SSTableReader spanB = sstableSpanning(NOW - 21 * HOUR, NOW - 20 * HOUR);
+        tscs.addSSTable(spanA);
+        tscs.addSSTable(spanB);
+        when(cfs.getLiveSSTables()).thenReturn(Set.of(spanA, spanB));
+
+        tscs.getNextBackgroundTasksAt(NOW, 0);
+
+        // 위임 0 + 만료 0 + 동결 0 + 걸침 2 — 분할 백로그도 CSM 정렬에 보여야 기아하지 않는다
+        assertEquals(2, tscs.getEstimatedRemainingTasks());
+    }
 }
