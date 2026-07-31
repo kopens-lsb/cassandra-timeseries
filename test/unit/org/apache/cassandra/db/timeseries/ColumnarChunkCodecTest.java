@@ -80,7 +80,7 @@ public class ColumnarChunkCodecTest
         }
 
         SortedMap<String, ColumnarChunkCodec.ColumnInput> columns = new TreeMap<>();
-        columns.put("c_double", new ColumnarChunkCodec.ColumnInput(ColumnarChunkCodec.TYPE_DOUBLE_GORILLA, doubleValues));
+        columns.put("c_double", new ColumnarChunkCodec.ColumnInput(ColumnarChunkCodec.TYPE_DOUBLE_CHIMP, doubleValues));
         columns.put("c_bool", new ColumnarChunkCodec.ColumnInput(ColumnarChunkCodec.TYPE_BOOLEAN, boolValues));
         columns.put("c_int32", new ColumnarChunkCodec.ColumnInput(ColumnarChunkCodec.TYPE_INT32, int32Values));
         columns.put("c_int64", new ColumnarChunkCodec.ColumnInput(ColumnarChunkCodec.TYPE_INT64, int64Values));
@@ -147,7 +147,7 @@ public class ColumnarChunkCodecTest
         long[] ts = sequentialTimestamps(n);
         ByteBuffer[] values = new ByteBuffer[n];   // every entry null
         SortedMap<String, ColumnarChunkCodec.ColumnInput> columns = new TreeMap<>();
-        columns.put("maybe_col", new ColumnarChunkCodec.ColumnInput(ColumnarChunkCodec.TYPE_DOUBLE_GORILLA, values));
+        columns.put("maybe_col", new ColumnarChunkCodec.ColumnInput(ColumnarChunkCodec.TYPE_DOUBLE_CHIMP, values));
 
         ByteBuffer payload = ColumnarChunkCodec.encode(ts, n, columns);
         ColumnarCursor cursor = ColumnarChunkCodec.cursor(payload, null);
@@ -365,7 +365,7 @@ public class ColumnarChunkCodecTest
             constantValues[i] = bytesOf(0);
         }
         SortedMap<String, ColumnarChunkCodec.ColumnInput> columns = new TreeMap<>();
-        columns.put("readings", new ColumnarChunkCodec.ColumnInput(ColumnarChunkCodec.TYPE_DOUBLE_GORILLA, doubleValues));
+        columns.put("readings", new ColumnarChunkCodec.ColumnInput(ColumnarChunkCodec.TYPE_DOUBLE_CHIMP, doubleValues));
         columns.put("labels", new ColumnarChunkCodec.ColumnInput(ColumnarChunkCodec.TYPE_TEXT, textValues));
         columns.put("error_code", new ColumnarChunkCodec.ColumnInput(ColumnarChunkCodec.TYPE_INT32, constantValues));
         return columns;
@@ -587,8 +587,9 @@ public class ColumnarChunkCodecTest
     @Test
     public void foreignVersionPayloadsAreRejectedByBothEntryPoints()
     {
-        ByteBuffer gorillaPayload = GorillaCodec.encode(new long[]{ 1L, 2L, 3L }, new double[]{ 1.0, 2.0, 3.0 }, 3);
         ByteBuffer chimpPayload = Chimp128Codec.encode(new long[]{ 1L, 2L, 3L }, new double[]{ 1.0, 2.0, 3.0 }, 3);
+        ByteBuffer gorillaPayload = chimpPayload.duplicate();
+        gorillaPayload.put(gorillaPayload.position(), (byte) 1);   // the removed v1 version byte
 
         assertThatThrownBy(() -> ColumnarChunkCodec.cursor(gorillaPayload, null))
             .isInstanceOf(IllegalArgumentException.class);
@@ -598,7 +599,46 @@ public class ColumnarChunkCodecTest
         ByteBuffer columnarPayload = simpleTwoColumnPayload();
         assertThatThrownBy(() -> ChunkCodecs.cursor(columnarPayload))
             .isInstanceOf(IllegalArgumentException.class);
-        assertEquals(ChunkCodecs.Codec.COLUMNAR, ChunkCodecs.codecOf(columnarPayload));
+    }
+
+    @Test
+    public void removedGorillaColumnTypeCodeIsRejectedNotMisread()
+    {
+        // Type code 0 was DOUBLE_GORILLA. A v3 chunk written before that codec was dropped must be
+        // rejected by name -- for a CONSTANT double column especially, whose raw constBytes would
+        // otherwise decode perfectly well under any type code and hide the format change.
+        SortedMap<String, ColumnarChunkCodec.ColumnInput> columns = new TreeMap<>();
+        columns.put("d", new ColumnarChunkCodec.ColumnInput(ColumnarChunkCodec.TYPE_DOUBLE_CHIMP,
+                                                             new ByteBuffer[]{ bytesOf(1.5), bytesOf(1.5),
+                                                                               bytesOf(1.5) }));
+        ByteBuffer payload = ColumnarChunkCodec.encode(new long[]{ 1L, 2L, 3L }, 3, columns);
+
+        byte[] bytes = new byte[payload.remaining()];
+        payload.duplicate().get(bytes);
+        // the first directory entry starts right after the header; its first byte is the type code
+        assertEquals(ColumnarChunkCodec.TYPE_DOUBLE_CHIMP, bytes[ColumnarChunkCodec.HEADER_SIZE]);
+        bytes[ColumnarChunkCodec.HEADER_SIZE] = 0x00;
+
+        assertThatThrownBy(() -> ColumnarChunkCodec.cursor(ByteBuffer.wrap(bytes), null))
+            .isInstanceOf(IllegalArgumentException.class)
+            .hasMessageContaining("gorilla");
+    }
+
+    @Test
+    public void unknownColumnTypeCodeIsRejected()
+    {
+        SortedMap<String, ColumnarChunkCodec.ColumnInput> columns = new TreeMap<>();
+        columns.put("d", new ColumnarChunkCodec.ColumnInput(ColumnarChunkCodec.TYPE_INT32,
+                                                             new ByteBuffer[]{ bytesOf(1), bytesOf(2), bytesOf(3) }));
+        ByteBuffer payload = ColumnarChunkCodec.encode(new long[]{ 1L, 2L, 3L }, 3, columns);
+
+        byte[] bytes = new byte[payload.remaining()];
+        payload.duplicate().get(bytes);
+        bytes[ColumnarChunkCodec.HEADER_SIZE] = 0x7F;
+
+        assertThatThrownBy(() -> ColumnarChunkCodec.cursor(ByteBuffer.wrap(bytes), null))
+            .isInstanceOf(IllegalArgumentException.class)
+            .hasMessageContaining("unknown column type code");
     }
 
     @Test

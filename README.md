@@ -19,7 +19,7 @@ SELECT time_bucket_gapfill(1h, ts, '2024-01-01', '2024-01-02'), locf(avg(value))
 FROM ts.metrics WHERE series='cpu' GROUP BY series, time_bucket_gapfill(1h, ts, '2024-01-01', '2024-01-02');
 ```
 
-**2. 오래된 데이터는 자동 압축, 조회는 그대로.** 계층형 저장이 지난 데이터를 Gorilla/Chimp128 청크로 압축해 옮기고, `SELECT`는 압축 여부를 몰라도 됩니다(투명 읽기가 자동 병합).
+**2. 오래된 데이터는 자동 압축, 조회는 그대로.** 계층형 저장이 지난 데이터를 Chimp128 청크로 압축해 옮기고, `SELECT`는 압축 여부를 몰라도 됩니다(투명 읽기가 자동 병합).
 
 **3. 압축이 조회까지 빠르게 만듭니다.** 1억 건 실측(단일 노드, 동일 하드웨어·동일 CQL·동일 결과값) — [벤치마크 전문](doc/timeseries/tiering-benchmark.md):
 
@@ -45,7 +45,7 @@ FROM ts.metrics WHERE series='cpu' GROUP BY series, time_bucket_gapfill(1h, ts, 
 | **Gap-fill** | `GROUP BY time_bucket_gapfill(width, ts, start, finish)` — 빈 버킷 실체화 + `locf()`/`interpolate()` 채움 정책 | [사용법 §3](#3-빈-구간-채우기--time_bucket_gapfill) |
 | **풀텍스트 검색** | SAI `LIKE` + `index_analyzer`(ngram/standard/cjk/keyword + JSON) — 단어 중간 조각·공백 걸침·한글까지 진짜 부분문자열 매치, ALLOW FILTERING 불필요 | [fulltext-search.md](doc/timeseries/fulltext-search.md) |
 | **시계열 컴팩션 (TSCS)** | `TimeSeriesCompactionStrategy` — 창 정렬 + 창 내부 UCS 위임 + retention 창 통삭제 + 닫힌 창 동결(창당 1 SSTable, `WindowFrozenListener` 이벤트 훅, far-future 가드 `max_future_window`, 닫힌 창 TTL 회수에 retention 불필요) + 지각 격리(flush/스트리밍 창 경계 스플릿 — 백필이 과거 창에 국소 편입, 레거시 걸침 SSTable 자동 분할) | [설계 스펙](docs/superpowers/specs/2026-07-31-timeseries-compaction-design.md) |
-| **Gorilla(v1)+Chimp128(v2) 청크 코덱** *(계층형 저장 1단계)* | `(timestamp, double)` 무손실 압축 2종 + 버전 디스패처(`ChunkCodecs`). Gorilla: 상수 계열 0.25 B/샘플(64배). Chimp128: 양자화 워크/주기 신호에서 61~69% 추가 절감하나 상수 계열은 5배 역행 — bake-off 결과 기본 코덱은 Gorilla 유지, Chimp128은 옵트인 | [bake-off 결과](doc/timeseries/codec-bakeoff.md) · [설계 스펙](docs/superpowers/specs/2026-07-31-industrial-tiered-storage-design.md) |
+| **Chimp128 청크 코덱** *(계층형 저장 1단계)* | `(timestamp, double)` 무손실 압축 — 델타-오브-델타 타임스탬프 + Chimp128 값 스트림. 양자화 워크/주기 신호(실제 산업 센서값)에서 1.4~2.5 B/샘플. 상수 계열은 코덱보다 먼저 컬럼 지향 청크의 CONSTANT 플래그가 O(1)로 처리 | [bake-off 결과](doc/timeseries/codec-bakeoff.md) · [설계 스펙](docs/superpowers/specs/2026-07-31-industrial-tiered-storage-design.md) |
 | **계층형 저장 (청크 스토어)** *(계층형 저장 2단계)* | 테이블 확장 `timeseries_tiering` 정책 — 백그라운드 재인코더가 hot_window를 지난 창을 청크로 압축해 `<테이블>__chunks`로 이동(지각 데이터 병합, cold_window 만료, CL 쿼럼 하한). `nodetool retier`/`tieringstatus`, `system_views.timeseries_tiering`. **투명 읽기(SP3)**: 베이스 테이블 SELECT가 핫 로우+청크를 자동 병합 — 시간범위·포인트·집계·gap-fill·LIMIT/DESC가 핫·콜드에 걸쳐 동작 | [tiered-storage.md](doc/timeseries/tiered-storage.md) |
 | **테스트 인프라** | 도커 통합 테스트 52건(릴리스 게이트), 1억 건 스케일 하네스, 3노드 jvm-dtest, GC 비교(ZGC vs G1) | [보고서들](doc/timeseries/) |
 | **배포/CI** | Testcontainers 호환 도커 이미지, GitLab CI(빌드→테스트→이미지→통합 게이트→릴리스), 태그 릴리스 자동화 | [.gitlab-ci.yml](.gitlab-ci.yml) |
@@ -443,7 +443,7 @@ CREATE TABLE ts.sensor (
 
 ## 12. 계층형 저장(tiered storage) 설정
 
-오래된 창을 Gorilla/Chimp128 청크로 압축해 `<테이블>__chunks`로 옮기고, **SELECT는 그대로**(투명 읽기가 핫+콜드 자동 병합) 쓰는 기능입니다. 테이블 `extensions`에 JSON 정책을 hex로 넣습니다:
+오래된 창을 Chimp128 청크로 압축해 `<테이블>__chunks`로 옮기고, **SELECT는 그대로**(투명 읽기가 핫+콜드 자동 병합) 쓰는 기능입니다. 테이블 `extensions`에 JSON 정책을 hex로 넣습니다:
 
 ### 12.1 대상 스키마 (필수)
 
@@ -464,7 +464,7 @@ CREATE TABLE ts.sensor (
 
 ```sql
 ALTER TABLE ts.sensor WITH extensions = {
-  'timeseries_tiering': '{"hot_window":"1d","chunk_window":"6h","cold_window":"365d","interval":"1h","codec":"auto"}'
+  'timeseries_tiering': '{"hot_window":"1d","chunk_window":"6h","cold_window":"365d","interval":"1h"}'
 };
 
 -- 적용 확인 (정책과 실행 통계가 함께 보입니다)
@@ -495,10 +495,9 @@ SELECT count(*) FROM ts.sensor        WHERE tag_id='pump-01';   -- 압축 전과
 | `chunk_window` | 청크 1개가 담는 시간 폭 (최대 `31d`). TSCS `window_size`와 맞추길 권장. 1초 주기 데이터면 `1h`(=3,600샘플)가 무난 |
 | `cold_window` | 선택 — 이 기간을 지난 청크는 통째 삭제(보존 정책). 미지정(`-1`)이면 영구 보관 |
 | `interval` | 백그라운드 재인코딩 주기 (예: `1h`). 60초 스위퍼가 주기 도래 테이블만 처리 |
-| `codec` | `auto`(기본, 창마다 두 코덱을 다 인코딩해 작은 쪽 저장) \| `gorilla` \| `chimp128` |
 | `consistency` | 재인코더 CL — `LOCAL_QUORUM`(기본) / `QUORUM` / `EACH_QUORUM` / `ALL`만 허용 (약한 CL은 데이터 유실 위험이라 차단) |
 
-**코덱 선택**: 그냥 `auto`를 쓰세요 — 창 단위로 더 작은 쪽이 자동 선택됩니다. 참고로 [실측](doc/timeseries/codec-bakeoff.md)상 값이 양자화된(0.1 단위 등) 산업 데이터는 Chimp128이 60~69% 더 작고, 값이 거의 변하지 않는 상수 계열은 Gorilla가 5배 유리합니다(0.25 B/샘플).
+**코덱 선택은 없습니다**: Chimp128이 유일한 청크 코덱이라 고를 것이 없습니다 (예전 `codec` 옵션은 제거됐고, 남아 있으면 `ALTER TABLE`이 거부합니다). 값이 거의 변하지 않는 상수 계열은 코덱을 타기 전에 컬럼 지향 청크의 CONSTANT 플래그가 O(1)로 처리합니다 — [실측](doc/timeseries/codec-bakeoff.md) 참고.
 
 ### 12.4 끄기·바꾸기
 

@@ -6,9 +6,12 @@
 스크립트: [`docker/tiering-bench.sh`](../../docker/tiering-bench.sh) · 원시 리포트:
 [베이스라인](tiering-bench-baseline.md) · [계층화 후](tiering-bench-tiered.md).
 
-정책: `{"hot_window":"1h","chunk_window":"1h","interval":"7d","codec":"auto"}` — 데이터가 전부
+정책: `{"hot_window":"1h","chunk_window":"1h","interval":"7d"}` — 데이터가 전부
 과거(2024-01-01 기준)라 **전 창이 콜드**가 되는 최대 부하 시나리오다. `gc_grace_seconds=0` +
 메이저 컴팩션으로 레인지 톰스톤을 실제 회수해 저장량을 쟀다(단일 노드 벤치 설정).
+(측정 당시 정책에는 `"codec":"auto"`가 있었다 — 창마다 Gorilla/Chimp128 중 작은 쪽을 골랐다.
+그 옵션은 이후 [Chimp128 단일 코덱으로 통합](codec-bakeoff.md)되며 제거됐으므로, 지금 빌드로
+같은 벤치를 돌리면 저장량 수치는 다시 재야 한다. 위 수치는 통합 이전 실측이다.)
 
 ## 요약
 

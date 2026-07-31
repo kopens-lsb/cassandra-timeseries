@@ -36,7 +36,7 @@
 
 ```sql
 ALTER TABLE pp.tm_tag_point WITH extensions = {
-  'timeseries_tiering': '{"hot_window":"2d","chunk_window":"1d","cold_window":"3650d","interval":"1h","codec":"auto","consistency":"LOCAL_QUORUM"}'
+  'timeseries_tiering': '{"hot_window":"2d","chunk_window":"1d","cold_window":"3650d","interval":"1h","consistency":"LOCAL_QUORUM"}'
 };
 ```
 
@@ -108,7 +108,6 @@ ALTER TABLE pp.tm_tag_point__chunks WITH
 | `hot_window` | `freeze_after`보다 크고(데이터가 안정된 뒤 압축), **TTL보다 훨씬 작게**. 권장: 그 테이블 TTL의 10% 이하 |
 | `cold_window` | 실제로 원하는 보존 기간. 미설정이면 영구 보관 |
 | `interval` | `chunk_window`보다 짧게. 하루 창이면 `1h`면 충분 |
-| `codec` | `auto` 고정 — 창마다 Gorilla/Chimp128 중 작은 쪽을 자동 선택 |
 | 안전망(TTL 또는 TSCS `retention`) | 재인코더가 며칠 멈춰도 버틸 만큼 넉넉히. 정상 동작 시엔 발동하지 않는다 |
 
 ### 튜닝 항목별 근거

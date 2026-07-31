@@ -35,27 +35,25 @@ import java.util.TreeSet;
 
 /**
  * Chunk codec version 3: a columnar format storing many named columns per chunk against one
- * shared timestamp axis, instead of the one-column-per-chunk layout of {@link GorillaCodec} /
- * {@link Chimp128Codec} (versions 1/2). Column values are grouped by column (not interleaved by
- * row) so a reader projecting a subset of columns can skip the rest without decoding them --
- * every column's data section records its own byte length in the directory for exactly this
- * purpose.
+ * shared timestamp axis, instead of the one-column-per-chunk layout of {@link Chimp128Codec}
+ * (version 2). Column values are grouped by column (not interleaved by row) so a reader projecting
+ * a subset of columns can skip the rest without decoding them -- every column's data section
+ * records its own byte length in the directory for exactly this purpose.
  * <p>
  * Per-column encoding is picked to make constant and all-null columns cost O(1) bytes regardless
  * of row count: a column whose present values are all identical stores the value once in the
  * directory (0-byte data section); a column with no present values at all stores nothing. Double
- * columns pick whichever of gorilla/chimp128's value-only stream is smaller (ties favor gorilla,
- * matching {@link ChunkCodecs#encodeSmallest}); text/opaque columns dictionary-encode when at
- * most 256 distinct present values occur, else fall back to length-prefixed raw bytes.
+ * columns use {@link Chimp128Codec}'s value-only stream; text/opaque columns dictionary-encode
+ * when at most 256 distinct present values occur, else fall back to length-prefixed raw bytes.
  * <p>
  * Layout: {@code HEADER_SIZE}-byte header (version, row count, first/last timestamp, column
  * count, directory size) -- column directory (one entry per column, sorted by name) -- null
  * presence bitmaps (RLE, skipped for columns that are all-present or all-null) -- timestamps
- * (first value raw, then a {@link GorillaCodec#writeDod}/{@link GorillaCodec#readDod}
+ * (first value raw, then a {@link TimestampCodec#writeDod}/{@link TimestampCodec#readDod}
  * delta-of-delta bitstream) -- column data sections, one per column, each exactly the
  * {@code sectionLen} bytes recorded for it in the directory.
  * <p>
- * Corruption surfaces as {@link IllegalArgumentException} (stricter than versions 1/2, which may
+ * Corruption surfaces as {@link IllegalArgumentException} (stricter than version 2, which may
  * also throw {@link IndexOutOfBoundsException} or {@link java.nio.BufferUnderflowException}):
  * every parsing path here is wrapped so truncated/malformed payloads are reported uniformly.
  * Buffers are read big-endian and never mutated.
@@ -65,7 +63,14 @@ public final class ColumnarChunkCodec
     public static final byte VERSION = 3;
     public static final int HEADER_SIZE = 25;
 
-    public static final byte TYPE_DOUBLE_GORILLA = 0x00;
+    /**
+     * Type code {@code 0x00} was DOUBLE_GORILLA, dropped when chimp128 became the only double
+     * codec. It is permanently reserved -- never reassigned to another type -- and rejected on
+     * read by {@link #readColumnMeta} with a message naming it, so a v3 chunk written by the
+     * pre-removal code fails loudly instead of being decoded as something it is not.
+     */
+    static final byte TYPE_DOUBLE_GORILLA_REMOVED = 0x00;
+
     public static final byte TYPE_DOUBLE_CHIMP = 0x01;
     public static final byte TYPE_BOOLEAN = 0x02;
     public static final byte TYPE_INT32 = 0x03;
@@ -87,7 +92,11 @@ public final class ColumnarChunkCodec
     {
     }
 
-    /** One column's input to {@link #encode}: its type and its values, in row order (null = absent). */
+    /**
+     * One column's input to {@link #encode}: its type and its values, in row order (null = absent).
+     * The type code is authoritative -- it is the code written to the directory verbatim, so it must
+     * be one of the {@code TYPE_*} constants above.
+     */
     public static final class ColumnInput
     {
         public final byte typeCode;
@@ -134,7 +143,7 @@ public final class ColumnarChunkCodec
         for (int i = 1; i < count; i++)
         {
             long delta = timestamps[i] - previousTimestamp;
-            GorillaCodec.writeDod(timestampBits, delta - previousDelta);
+            TimestampCodec.writeDod(timestampBits, delta - previousDelta);
             previousTimestamp = timestamps[i];
             previousDelta = delta;
         }
@@ -170,7 +179,7 @@ public final class ColumnarChunkCodec
     private static void encodeColumn(String name, ColumnInput input, int count, ByteArrayOutputStream directory,
                                       ByteArrayOutputStream nullBitmaps, List<byte[]> dataSections)
     {
-        if (input.typeCode < TYPE_DOUBLE_GORILLA || input.typeCode > TYPE_OPAQUE)
+        if (input.typeCode < TYPE_DOUBLE_CHIMP || input.typeCode > TYPE_OPAQUE)
             throw new IllegalArgumentException("column " + name + ": unknown type code " + input.typeCode);
         if (input.values.length < count)
             throw new IllegalArgumentException("column " + name + ": values array shorter than count " + count);
@@ -193,7 +202,6 @@ public final class ColumnarChunkCodec
         boolean allPresent = presentCount == count;
         boolean allNull = presentCount == 0;
         byte flags = allPresent ? FLAG_ALL_PRESENT : 0;
-        byte typeCode = input.typeCode;
         byte[] sectionBytes = EMPTY_BYTES;
         byte[] constBytes = null;
 
@@ -230,18 +238,14 @@ public final class ColumnarChunkCodec
             {
                 flags |= FLAG_CONSTANT;
                 constBytes = presentBytes[0];
-                if (typeCode == TYPE_DOUBLE_GORILLA || typeCode == TYPE_DOUBLE_CHIMP)
-                    typeCode = TYPE_DOUBLE_GORILLA;   // canonical tie-break; no section is written either way
             }
             else
             {
-                EncodedColumn encoded = encodeSection(name, typeCode, presentBytes, presentCount);
-                typeCode = encoded.typeCode;
-                sectionBytes = encoded.bytes;
+                sectionBytes = encodeSection(name, input.typeCode, presentBytes, presentCount);
             }
         }
 
-        directory.write(typeCode);
+        directory.write(input.typeCode);
         directory.write(flags);
         directory.write(nameBytes.length);
         directory.write(nameBytes, 0, nameBytes.length);
@@ -258,24 +262,10 @@ public final class ColumnarChunkCodec
         dataSections.add(sectionBytes);
     }
 
-    /** Holds a data section's bytes plus the type code that actually produced them (double bake-off). */
-    private static final class EncodedColumn
-    {
-        final byte typeCode;
-        final byte[] bytes;
-
-        EncodedColumn(byte typeCode, byte[] bytes)
-        {
-            this.typeCode = typeCode;
-            this.bytes = bytes;
-        }
-    }
-
-    private static EncodedColumn encodeSection(String name, byte typeCode, byte[][] presentBytes, int n)
+    private static byte[] encodeSection(String name, byte typeCode, byte[][] presentBytes, int n)
     {
         switch (typeCode)
         {
-            case TYPE_DOUBLE_GORILLA:
             case TYPE_DOUBLE_CHIMP:
             {
                 double[] values = new double[n];
@@ -288,42 +278,37 @@ public final class ColumnarChunkCodec
                 boolean[] values = new boolean[n];
                 for (int i = 0; i < n; i++)
                     values[i] = presentBytes[i][0] != 0;
-                return new EncodedColumn(TYPE_BOOLEAN, encodeBooleanSection(values, n));
+                return encodeBooleanSection(values, n);
             }
             case TYPE_INT32:
             {
                 long[] values = new long[n];
                 for (int i = 0; i < n; i++)
                     values[i] = ByteBuffer.wrap(presentBytes[i]).getInt();
-                return new EncodedColumn(TYPE_INT32, encodeIntSection(values, n, 4));
+                return encodeIntSection(values, n, 4);
             }
             case TYPE_INT64:
             {
                 long[] values = new long[n];
                 for (int i = 0; i < n; i++)
                     values[i] = ByteBuffer.wrap(presentBytes[i]).getLong();
-                return new EncodedColumn(TYPE_INT64, encodeIntSection(values, n, 8));
+                return encodeIntSection(values, n, 8);
             }
             case TYPE_TEXT:
             case TYPE_OPAQUE:
-                return new EncodedColumn(typeCode, encodeDictOrRaw(presentBytes, n));
+                return encodeDictOrRaw(presentBytes, n);
             default:
                 throw new IllegalArgumentException("column " + name + ": unknown type code " + typeCode);
         }
     }
 
-    private static EncodedColumn encodeDoubleSection(double[] values, int n)
+    private static byte[] encodeDoubleSection(double[] values, int n)
     {
-        BitWriter gorilla = new BitWriter();
-        GorillaCodec.encodeValues(gorilla, values, n);
         BitWriter chimp = new BitWriter();
         Chimp128Codec.encodeValues(chimp, values, n);
-
-        boolean useChimp = chimp.sizeInBytes() < gorilla.sizeInBytes();
-        BitWriter chosen = useChimp ? chimp : gorilla;
-        ByteBuffer buffer = ByteBuffer.allocate(chosen.sizeInBytes());
-        chosen.writeTo(buffer);
-        return new EncodedColumn(useChimp ? TYPE_DOUBLE_CHIMP : TYPE_DOUBLE_GORILLA, buffer.array());
+        ByteBuffer buffer = ByteBuffer.allocate(chimp.sizeInBytes());
+        chimp.writeTo(buffer);
+        return buffer.array();
     }
 
     private static byte[] encodeBooleanSection(boolean[] values, int n)
@@ -501,7 +486,7 @@ public final class ColumnarChunkCodec
         long previous = firstTimestamp;
         for (int i = 1; i < rowCount; i++)
         {
-            delta += GorillaCodec.readDod(timestampBits);
+            delta += TimestampCodec.readDod(timestampBits);
             previous += delta;
             timestamps[i] = previous;
         }
@@ -540,6 +525,15 @@ public final class ColumnarChunkCodec
     private static ColumnMeta readColumnMeta(ByteBuffer buffer, int dirEnd)
     {
         byte typeCode = buffer.get();
+        // Validated here rather than at the point of use, so it covers constant/all-null columns
+        // too -- those never reach decodeColumn's type switch, and a chunk carrying a type code
+        // this build cannot honour must be rejected whatever its flags say.
+        if (typeCode == TYPE_DOUBLE_GORILLA_REMOVED)
+            throw new IllegalArgumentException("Unsupported columnar chunk: double column type code " +
+                                               TYPE_DOUBLE_GORILLA_REMOVED + " (gorilla) was removed -- chimp128 " +
+                                               "(type code " + TYPE_DOUBLE_CHIMP + ") is the only double codec");
+        if (typeCode < TYPE_DOUBLE_CHIMP || typeCode > TYPE_OPAQUE)
+            throw new IllegalArgumentException("Corrupt columnar chunk: unknown column type code " + typeCode);
         byte flags = buffer.get();
         int nameLen = buffer.get() & 0xFF;
         byte[] nameBytes = new byte[nameLen];
@@ -603,10 +597,9 @@ public final class ColumnarChunkCodec
 
         switch (meta.typeCode)
         {
-            case TYPE_DOUBLE_GORILLA:
             case TYPE_DOUBLE_CHIMP:
             {
-                double[] values = decodeDoubleSection(section, presentCount, meta.typeCode);
+                double[] values = decodeDoubleSection(section, presentCount);
                 int p = 0;
                 for (int r = 0; r < rowCount; r++)
                     if (allPresent || meta.presence[r])
@@ -682,27 +675,13 @@ public final class ColumnarChunkCodec
         return n;
     }
 
-    private static double[] decodeDoubleSection(ByteBuffer section, int n, byte typeCode)
+    private static double[] decodeDoubleSection(ByteBuffer section, int n)
     {
         BitReader bits = new BitReader(section);
         double[] out = new double[n];
-        if (typeCode == TYPE_DOUBLE_GORILLA)
-        {
-            GorillaCodec.ValueDecoder decoder = new GorillaCodec.ValueDecoder();
-            for (int i = 0; i < n; i++)
-                out[i] = Double.longBitsToDouble(decoder.readBits(bits));
-        }
-        else if (typeCode == TYPE_DOUBLE_CHIMP)
-        {
-            Chimp128Codec.ValueDecoder decoder = new Chimp128Codec.ValueDecoder();
-            for (int i = 0; i < n; i++)
-                out[i] = Double.longBitsToDouble(decoder.readBits(bits));
-        }
-        else
-        {
-            throw new IllegalArgumentException("Corrupt columnar chunk: type code " + typeCode +
-                                               " is not a double codec");
-        }
+        Chimp128Codec.ValueDecoder decoder = new Chimp128Codec.ValueDecoder();
+        for (int i = 0; i < n; i++)
+            out[i] = Double.longBitsToDouble(decoder.readBits(bits));
         return out;
     }
 

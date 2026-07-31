@@ -67,11 +67,12 @@ timeseries-tests:
     - ant testsome -Dtest.name=org.apache.cassandra.index.sai.cql.AllowFilteringTest
     # 3-node cluster semantics (consistency levels, paging, unrepaired rows)
     - ant test-jvm-dtest-some -Dtest.name=org.apache.cassandra.distributed.test.sai.AnalyzedLikeDistributedTest
-    # tiered storage: chunk codecs (gorilla v1, chimp128 v2) + version dispatcher/bake-off
+    # tiered storage: chunk codecs (chimp128 v2, columnar v3) + version dispatcher
     - ant testsome -Dtest.name=org.apache.cassandra.db.timeseries.BitStreamTest
-    - ant testsome -Dtest.name=org.apache.cassandra.db.timeseries.GorillaCodecTest
+    - ant testsome -Dtest.name=org.apache.cassandra.db.timeseries.TimestampCodecTest
     - ant testsome -Dtest.name=org.apache.cassandra.db.timeseries.Chimp128CodecTest
     - ant testsome -Dtest.name=org.apache.cassandra.db.timeseries.ChunkCodecsTest
+    - ant testsome -Dtest.name=org.apache.cassandra.db.timeseries.ColumnarChunkCodecTest
     # tiered storage: chunk store re-encoder (SP2) — policy, re-encode cycle, nodetool commands,
     # ALTER TABLE extensions validation
     - ant testsome -Dtest.name=org.apache.cassandra.db.timeseries.tiering.TieringPolicyTest

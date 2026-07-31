@@ -29,7 +29,6 @@ import org.apache.cassandra.cql3.CQLTester;
 import org.apache.cassandra.cql3.UntypedResultSet;
 import org.apache.cassandra.db.timeseries.Chimp128Codec;
 import org.apache.cassandra.db.timeseries.ChunkCodecs;
-import org.apache.cassandra.db.timeseries.GorillaCodec;
 import org.apache.cassandra.db.timeseries.SampleCursor;
 import org.apache.cassandra.db.timeseries.tiering.TieredStorageService.TierRunStats;
 import org.apache.cassandra.schema.Schema;
@@ -103,8 +102,7 @@ public class TieredStorageServiceTest extends CQLTester
                 assertEquals(1, chunkRows.size());
                 UntypedResultSet.Row chunkRow = chunkRows.one();
                 assertEquals(4, chunkRow.getInt("samples"));
-                byte codec = chunkRow.getByte("codec");
-                assertTrue(codec == GorillaCodec.VERSION || codec == Chimp128Codec.VERSION);
+                assertEquals(Chimp128Codec.VERSION, chunkRow.getByte("codec"));
 
                 assertEquals(0, raw("SELECT * FROM %s WHERE tag = ? AND ts >= ? AND ts < ?",
                                         tag, new Date(windowStart), new Date(windowStart + HOUR)).size());
@@ -255,7 +253,7 @@ public class TieredStorageServiceTest extends CQLTester
         // have used -- NOT the wall-clock timestamp a plain execute() would default to (which, being
         // far larger than anything runOnce ever writes, would make every cell of this pre-written row
         // permanently win over runOnce's re-merge and pass the assertions below vacuously).
-        ByteBuffer payload = ChunkCodecs.encodeSmallest(tsValues, values, tsValues.length);
+        ByteBuffer payload = ChunkCodecs.encode(tsValues, values, tsValues.length);
         execute(chunkInsertQuery(), "i", new Date(0L), tsValues.length, 300L, payload, 301L);
 
         assertEquals(4, raw("SELECT * FROM %s WHERE tag = ? AND ts >= ? AND ts < ?",
@@ -297,10 +295,10 @@ public class TieredStorageServiceTest extends CQLTester
         long now = 10 * HOUR;
         insertRow("cold", now - 100_000L, 1.0, 1); // hot row -- keeps the tag enumerated
 
-        ByteBuffer expiring = ChunkCodecs.encodeSmallest(new long[]{ 0L }, new double[]{ 1.0 }, 1);
+        ByteBuffer expiring = ChunkCodecs.encode(new long[]{ 0L }, new double[]{ 1.0 }, 1);
         execute(chunkInsertQuery(), "cold", new Date(0L), 1, 500L, expiring, 1L);
 
-        ByteBuffer surviving = ChunkCodecs.encodeSmallest(new long[]{ 9 * HOUR }, new double[]{ 2.0 }, 1);
+        ByteBuffer surviving = ChunkCodecs.encode(new long[]{ 9 * HOUR }, new double[]{ 2.0 }, 1);
         execute(chunkInsertQuery(), "cold", new Date(9 * HOUR), 1, 600L, surviving, 2L);
 
         TierRunStats stats = new TieredStorageService().runOnce(KEYSPACE, currentTable(), now);
@@ -322,7 +320,7 @@ public class TieredStorageServiceTest extends CQLTester
         // SP3 R6: this tag has NO base rows at all (fully re-encoded, then the base rows aged away) -
         // it exists only in the chunk table. Chunk-table-driven expiry enumeration must still find
         // and expire its cold chunk; the old base-DISTINCT enumeration never would have.
-        ByteBuffer expiring = ChunkCodecs.encodeSmallest(new long[]{ 0L }, new double[]{ 1.0 }, 1);
+        ByteBuffer expiring = ChunkCodecs.encode(new long[]{ 0L }, new double[]{ 1.0 }, 1);
         execute(chunkInsertQuery(), "dead", new Date(0L), 1, 500L, expiring, 1L);
 
         TierRunStats stats = new TieredStorageService().runOnce(KEYSPACE, currentTable(), 10 * HOUR);
@@ -361,8 +359,11 @@ public class TieredStorageServiceTest extends CQLTester
     }
 
     @Test
-    public void autoCodecPicksPerWindow() throws Throwable
+    public void everyChunkIsWrittenWithTheChimpCodecVersion() throws Throwable
     {
+        // Chimp128 is the only codec, so the chunk row's `codec` column is a fixed 2 for every
+        // pattern -- constant series and quantized walks alike. (This replaces the per-window
+        // gorilla/chimp bake-off that used to make this column vary.)
         createTable("CREATE TABLE %s (tag text, ts timestamp, value double, PRIMARY KEY (tag, ts))");
         setPolicy("{\"hot_window\":\"2h\",\"chunk_window\":\"1h\"}");
 
@@ -388,7 +389,7 @@ public class TieredStorageServiceTest extends CQLTester
         byte constCodec = execute(chunkSelectQuery(), "const", new Date(0L)).one().getByte("codec");
         byte quantCodec = execute(chunkSelectQuery(), "quant", new Date(0L)).one().getByte("codec");
 
-        assertEquals(GorillaCodec.VERSION, constCodec);
+        assertEquals(Chimp128Codec.VERSION, constCodec);
         assertEquals(Chimp128Codec.VERSION, quantCodec);
     }
 

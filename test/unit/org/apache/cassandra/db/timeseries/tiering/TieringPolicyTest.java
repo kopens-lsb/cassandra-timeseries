@@ -31,7 +31,6 @@ import org.apache.cassandra.db.marshal.Int32Type;
 import org.apache.cassandra.db.marshal.ReversedType;
 import org.apache.cassandra.db.marshal.TimestampType;
 import org.apache.cassandra.db.marshal.UTF8Type;
-import org.apache.cassandra.db.timeseries.tiering.TieringPolicy.CodecChoice;
 import org.apache.cassandra.exceptions.ConfigurationException;
 import org.apache.cassandra.schema.TableMetadata;
 import org.apache.cassandra.schema.TableParams;
@@ -71,12 +70,11 @@ public class TieringPolicyTest
     {
         TieringPolicy policy = TieringPolicy.parse(
             "{\"hot_window\":\"7d\", \"chunk_window\":\"1h\", \"cold_window\":\"365d\", " +
-            "\"codec\":\"gorilla\", \"consistency\":\"QUORUM\", \"interval\":\"10m\"}");
+            "\"consistency\":\"QUORUM\", \"interval\":\"10m\"}");
 
         assertEquals(TimeUnit.DAYS.toMillis(7), policy.hotWindowMillis);
         assertEquals(TimeUnit.HOURS.toMillis(1), policy.chunkWindowMillis);
         assertEquals(TimeUnit.DAYS.toMillis(365), policy.coldWindowMillis);
-        assertEquals(CodecChoice.GORILLA, policy.codec);
         assertEquals(ConsistencyLevel.QUORUM, policy.consistency);
         assertEquals(TimeUnit.MINUTES.toMillis(10), policy.intervalMillis);
     }
@@ -89,7 +87,6 @@ public class TieringPolicyTest
         assertEquals(TimeUnit.DAYS.toMillis(7), policy.hotWindowMillis);
         assertEquals(TimeUnit.HOURS.toMillis(1), policy.chunkWindowMillis);
         assertEquals(-1, policy.coldWindowMillis);
-        assertEquals(CodecChoice.AUTO, policy.codec);
         assertEquals(ConsistencyLevel.LOCAL_QUORUM, policy.consistency);
         assertEquals(TimeUnit.MINUTES.toMillis(5), policy.intervalMillis);
     }
@@ -107,7 +104,7 @@ public class TieringPolicyTest
         TieringPolicy policy = TieringPolicy.parse("{\"hot_window\":\"7d\"}");
         String s = policy.toString();
         assertTrue(s.contains("hot_window"));
-        assertTrue(s.contains("AUTO"));
+        assertTrue(s.contains("chunk_window"));
         assertTrue(s.contains("LOCAL_QUORUM"));
     }
 
@@ -182,9 +179,14 @@ public class TieringPolicyTest
     }
 
     @Test
-    public void testBadCodecRejected()
+    public void testRemovedCodecKeyRejectedByName()
     {
-        assertConfigurationException("{\"hot_window\":\"7d\", \"codec\":\"snappy\"}", "codec");
+        // `codec` was removed when chimp128 became the only codec. A stored policy that still sets
+        // it must fail loudly and name the key -- silently ignoring it would leave an operator
+        // believing a codec choice is still in force.
+        assertConfigurationException("{\"hot_window\":\"7d\", \"codec\":\"auto\"}", "codec");
+        assertConfigurationException("{\"hot_window\":\"7d\", \"codec\":\"gorilla\"}", "no longer supported");
+        assertConfigurationException("{\"hot_window\":\"7d\", \"codec\":\"chimp128\"}", "chimp128 is now the only chunk codec");
     }
 
     @Test

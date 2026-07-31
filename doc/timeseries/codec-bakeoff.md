@@ -1,5 +1,24 @@
 # Chunk codec bake-off: Gorilla (v1) vs Chimp128 (v2)
 
+> ## 결론 (2026-08-01, SP4 Task 1.5) — **Chimp128이 유일한 코덱**
+>
+> 이 bake-off 이후 **Gorilla는 삭제됐고 Chimp128이 유일한 double 코덱**이 됐습니다. 정책의
+> `codec` 옵션(`auto`/`gorilla`/`chimp128`)도 함께 제거됐습니다.
+>
+> **이유**: 아래 측정에서 Gorilla가 이긴 유일한 구간은 **상수(near-constant) 계열**(5배 우세)
+> 뿐입니다. 그런데 컬럼 지향 청크 포맷(v3, SP4 Task 1)이 **CONSTANT 플래그**로 상수 컬럼을
+> 어떤 코덱보다 먼저, 행 수와 무관하게 **O(1) 바이트**로 처리합니다 — 값을 디렉토리에 한 번만
+> 저장하고 데이터 섹션은 0바이트입니다. 즉 Gorilla의 유일한 강점이 코덱 레이어에 도달하기도
+> 전에 사라졌습니다. 남는 위험은 "거의 변하지 않지만 완전한 상수는 아닌" double 계열인데,
+> 그 경우에도 Gorilla를 되살리는 대신 **double용 RLE 경로**를 추가하는 편이 낫습니다(RLE는
+> 그 패턴에서 Gorilla보다도 작습니다).
+>
+> 아래의 측정치·표·판정문은 당시 기록 그대로 보존합니다(`ChunkCodecsTest#bakeoff`는 Gorilla와
+> 함께 삭제되어 더 이상 재현되지 않습니다). Chimp128 단독의 크기 회귀 기준은
+> `Chimp128CodecTest#sizeRegressionBaselines`가 이어받았습니다.
+
+## 당시 기록 (2026-07-31)
+
 Source: `org.apache.cassandra.db.timeseries.ChunkCodecsTest#bakeoff` · 100,000 samples/pattern,
 seed 17, single JVM run (JIT warm-up not isolated -- see the timing caveat below). Promotion
 criteria: [chimp128-codec design spec](../../docs/superpowers/specs/2026-07-31-chimp128-codec-design.md),

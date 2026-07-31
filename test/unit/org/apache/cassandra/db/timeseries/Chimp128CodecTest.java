@@ -81,7 +81,7 @@ public class Chimp128CodecTest
     }
 
     @Test
-    public void headerMatchesGorillaLayoutWithVersion2()
+    public void headerLayoutWithVersion2()
     {
         long[] timestamps = { 1000L, 2000L };
         double[] values = { 1.0, 2.0 };
@@ -99,24 +99,38 @@ public class Chimp128CodecTest
     }
 
     @Test
-    public void quantizedBeatsGorillaProvisionally()
+    public void sizeRegressionBaselines()
     {
-        // 승격 판정은 Task 3 bake-off가 하지만, 코어 단계에서 방향성만 확인:
-        // 양자화 워크에서 chimp payload가 gorilla payload보다 크면 구현이 잘못된 것
+        // Size regression bounds for the ONLY double codec: an encoding change that blows any of
+        // these needs an explicit decision, not a silent merge. Values are the measured bytes/sample
+        // (see doc/timeseries/codec-bakeoff.md) with headroom; the quantized walk is the pattern
+        // chimp128 was chosen for, the random-bits pattern is the incompressible worst case that must
+        // still not exceed the 16-byte raw (ts + value) representation it replaces.
+        assertTrue("constant: " + bytesPerSample(0),        bytesPerSample(0) <= 1.5);
+        assertTrue("quantized-walk: " + bytesPerSample(1),  bytesPerSample(1) <= 2.0);
+        assertTrue("full-precision: " + bytesPerSample(2),  bytesPerSample(2) <= 7.5);
+        assertTrue("random-bits: " + bytesPerSample(3),     bytesPerSample(3) <= 9.0);
+    }
+
+    private static double bytesPerSample(int pattern)
+    {
         int n = 10_000;
+        java.util.Random random = new java.util.Random(7);
         long[] timestamps = new long[n];
         double[] values = new double[n];
-        java.util.Random random = new java.util.Random(3);
-        double v = 50.0;
+        double walk = 50;
         for (int i = 0; i < n; i++)
         {
             timestamps[i] = i * 1000L;
-            v += (random.nextInt(3) - 1) * 0.1;
-            values[i] = Math.round(v * 10.0) / 10.0;
+            switch (pattern)
+            {
+                case 0:  values[i] = 42.0; break;
+                case 1:  walk += (random.nextInt(3) - 1) * 0.1; values[i] = Math.round(walk * 10.0) / 10.0; break;
+                case 2:  walk += random.nextGaussian(); values[i] = walk; break;
+                default: values[i] = Double.longBitsToDouble(random.nextLong()); break;
+            }
         }
-        int chimp = Chimp128Codec.encode(timestamps, values, n).remaining();
-        int gorilla = GorillaCodec.encode(timestamps, values, n).remaining();
-        assertTrue("chimp=" + chimp + " gorilla=" + gorilla, chimp <= gorilla);
+        return Chimp128Codec.encode(timestamps, values, n).remaining() / (double) n;
     }
 
     @Test
@@ -197,8 +211,10 @@ public class Chimp128CodecTest
     @Test
     public void peeksRejectForeignVersion()
     {
-        // a GorillaCodec (v1) payload fed to the chimp peeks must be rejected as a foreign version
-        ByteBuffer payload = GorillaCodec.encode(new long[]{ 1L }, new double[]{ 1.0 }, 1);
+        // a payload carrying any other version byte -- including 1, the removed gorilla format,
+        // whose header layout is byte-identical -- must be rejected rather than half-decoded
+        ByteBuffer payload = Chimp128Codec.encode(new long[]{ 1L }, new double[]{ 1.0 }, 1);
+        payload.put(payload.position(), (byte) 1);
 
         assertThrowsIllegalArgument(() -> Chimp128Codec.sampleCount(payload));
         assertThrowsIllegalArgument(() -> Chimp128Codec.firstTimestamp(payload));

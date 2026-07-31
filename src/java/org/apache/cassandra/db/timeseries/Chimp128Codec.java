@@ -22,20 +22,30 @@ import java.nio.ByteOrder;
 import java.util.Arrays;
 
 /**
- * Chunk codec version 2: timestamps use the same delta-of-delta scheme as version 1 (gorilla),
- * values use the Chimp128 scheme (Liakos et al., PVLDB'22): each value XORs against the most
- * similar of the previous 128 values (indexed by the 14 low bits of the raw representation)
- * when that XOR has more than 13 trailing zeros, else against the immediately previous value,
- * with a 2-bit flag tree and 3-bit bucketed leading-zero codes. Same 21-byte header and API
- * contract as {@link GorillaCodec} (exact-span payloads, big-endian, non-mutating cursors;
- * corruption surfaces as IllegalArgumentException / IndexOutOfBoundsException /
- * BufferUnderflowException). See docs/superpowers/specs/2026-07-31-chimp128-codec-design.md.
+ * Chunk codec version 2, the single-column {@code (timestampMillis, double)} format: timestamps use
+ * the delta-of-delta scheme in {@link TimestampCodec}, values use the Chimp128 scheme (Liakos et
+ * al., PVLDB'22): each value XORs against the most similar of the previous 128 values (indexed by
+ * the 14 low bits of the raw representation) when that XOR has more than 13 trailing zeros, else
+ * against the immediately previous value, with a 2-bit flag tree and 3-bit bucketed leading-zero
+ * codes. See docs/superpowers/specs/2026-07-31-chimp128-codec-design.md.
+ *
+ * <p>Contract: {@code payload.position()..payload.limit()} must span EXACTLY one encoded chunk --
+ * the sample count is trusted, so an over-long buffer will decode bytes belonging to whatever
+ * follows in memory. The input buffer is never mutated (all access goes through a duplicate), so
+ * independent cursors/peeks over the same payload are safe to use concurrently. Corruption
+ * surfaces as {@link IllegalArgumentException}, {@link IndexOutOfBoundsException}, or
+ * {@link java.nio.BufferUnderflowException} -- callers must treat all three as "corrupt chunk".
+ * Buffers are read big-endian regardless of the caller's configured byte order.
+ *
+ * <p>The value stream alone ({@link #encodeValues} / {@link ValueDecoder}) is also the only double
+ * codec of the columnar chunk format, {@link ColumnarChunkCodec} (version 3).
  */
 public final class Chimp128Codec
 {
     public static final byte VERSION = 2;
     public static final int HEADER_SIZE = 21;
-    public static final int MAX_SAMPLES = GorillaCodec.MAX_SAMPLES;
+    /** 2^24: keeps {@link BitWriter}'s int bit counter far from overflow (a 1h/1s window is 3600). */
+    public static final int MAX_SAMPLES = 16_777_216;
 
     static final int RING_SIZE = 128;                    // 7-bit ring positions
     static final int INDEX_BITS = 14;                    // key = rawBits & 0x3FFF
@@ -79,7 +89,7 @@ public final class Chimp128Codec
                 throw new IllegalArgumentException("timestamps must be strictly increasing: " +
                                                    timestamp + " after " + previousTimestamp);
             long delta = timestamp - previousTimestamp;
-            GorillaCodec.writeDod(bits, delta - previousDelta);
+            TimestampCodec.writeDod(bits, delta - previousDelta);
             previousTimestamp = timestamp;
             previousDelta = delta;
 
@@ -99,7 +109,7 @@ public final class Chimp128Codec
     /**
      * Encodes only the value stream (ring-XOR deltas) with no timestamps interleaved -- the
      * counterpart to the per-sample loop inside {@link #encode}, minus the
-     * {@link GorillaCodec#writeDod} calls. Used by {@link ColumnarChunkCodec} (chunk format
+     * {@link TimestampCodec#writeDod} calls. Used by {@link ColumnarChunkCodec} (chunk format
      * version 3) to store a DOUBLE_CHIMP column section against the chunk's shared timestamp axis
      * instead of duplicating it per column. See {@link ValueDecoder} for the matching reader.
      */
@@ -170,7 +180,7 @@ public final class Chimp128Codec
                 }
                 else
                 {
-                    delta += GorillaCodec.readDod(bits);
+                    delta += TimestampCodec.readDod(bits);
                     timestamp += delta;
                 }
                 valueBits = valueDecoder.readBits(bits);
@@ -200,7 +210,7 @@ public final class Chimp128Codec
      * the first call emits the raw 64-bit value; later calls XOR against either an explicit ring
      * slot (left branch) or the immediately previous value (right branch), mirroring the inline
      * loop in {@link #encode}. Shared by {@link #encode} (interleaved with per-sample
-     * {@link GorillaCodec#writeDod} calls) and {@link #encodeValues} (value stream only).
+     * {@link TimestampCodec#writeDod} calls) and {@link #encodeValues} (value stream only).
      */
     static final class ValueEncoder
     {

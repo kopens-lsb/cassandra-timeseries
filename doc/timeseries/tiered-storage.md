@@ -18,10 +18,10 @@
 
 # 계층형 저장 (Tiered Storage): 청크 스토어 + 백그라운드 재인코더
 
-시계열 테이블의 오래된(닫힌) 행을 백그라운드에서 Gorilla/Chimp128 청크로 압축해 섀도 테이블
+시계열 테이블의 오래된(닫힌) 행을 백그라운드에서 Chimp128 청크로 압축해 섀도 테이블
 `<테이블>__chunks`로 옮기고, 원본 행은 삭제하는 서버 내장 계층화 엔진입니다. 최근 데이터(핫 구간)는
 행 단위로 그대로 남아 쓰기·조회 모두 기존과 동일하고, 오래된 데이터는 샘플당 수 바이트 수준으로
-압축된 청크로 보관됩니다. 코덱 자체(Gorilla v1 / Chimp128 v2)의 압축 특성은
+압축된 청크로 보관됩니다. 코덱(Chimp128)의 압축 특성은
 [bake-off 결과](codec-bakeoff.md)를 참고하세요.
 
 > **투명 읽기(SP3) 포함**: 베이스 테이블 `SELECT`가 핫 로우와 청크 디코드 로우를 **자동 병합**해
@@ -75,7 +75,6 @@ ALTER TABLE ts.sensor WITH extensions = {
 | `hot_window` | **필수** | — | 이 나이보다 젊은 행은 건드리지 않음 (행 단위 핫 구간). `chunk_window` 이상이어야 함 |
 | `chunk_window` | | `1h` | 재인코딩 창의 고정 길이. 청크 1개 = 태그 1개 × 창 1개 (epoch 정렬) |
 | `cold_window` | | 없음 | 지정 시, 이보다 오래된 청크는 통째로 삭제(보존 기한). `hot_window`보다 커야 함 |
-| `codec` | | `auto` | `auto` \| `gorilla` \| `chimp128` — [2.2](#22-코덱-선택) 참고 |
 | `consistency` | | `LOCAL_QUORUM` | 재인코더의 모든 읽기/쓰기/삭제에 쓰는 CL. **쿼럼 계열만 허용** — [5.3](#53-cl-쿼럼-하한) 참고 |
 | `interval` | | `5m` | 이 테이블의 재인코딩 주기 (전역 스위프는 60초마다 돌며, interval이 지난 테이블만 실행) |
 
@@ -83,15 +82,16 @@ ALTER TABLE ts.sensor WITH extensions = {
 `hot_window < chunk_window`, `cold_window <= hot_window`, 쿼럼 미만 CL 등)은
 `ALTER TABLE`/실행 시점에 거부됩니다.
 
-### 2.2 코덱 선택
+### 2.2 코덱
 
-- **`auto`(기본)**: 창마다 Gorilla와 Chimp128 양쪽으로 인코딩해 **더 작은 쪽**을 저장합니다.
-  청크마다 코덱이 달라질 수 있으며, 페이로드 자체에 버전 바이트가 있어 디코딩은 항상 자동입니다.
-- **`gorilla`**: 상수·저변동 계열(설비 상태값, 정상 운전 구간)에 유리 — 상수 계열 0.25 B/샘플.
-- **`chimp128`**: 양자화된 워크/주기 신호(소수점 잘린 센서값)에서 Gorilla 대비 61~69% 추가 절감.
-  상수 계열에서는 오히려 5배 역행하므로 전 구간 강제는 데이터 특성을 알 때만.
+코덱은 **Chimp128 하나뿐**이라 고를 것이 없습니다. 양자화된 워크/주기 신호(소수점이 잘린 실제
+산업 센서값)에서 1.4~2.5 B/샘플이며, 값이 전혀 변하지 않는 구간은 코덱을 타기 전에 컬럼 지향
+청크의 CONSTANT 플래그가 행 수와 무관하게 O(1) 바이트로 처리합니다. 페이로드에는 여전히 버전
+바이트가 있어 디코딩은 자동입니다.
 
-측정 근거는 [코덱 bake-off](codec-bakeoff.md)에 있습니다.
+> 예전에는 `codec`(`auto`/`gorilla`/`chimp128`) 정책 필드가 있었지만 **제거**됐습니다. 정책 JSON에
+> 아직 `codec`이 남아 있으면 `ALTER TABLE`이 그 키를 지목해 거부하므로, 조용히 무시되는 일은
+> 없습니다. 선택의 근거와 Gorilla를 뺀 이유는 [코덱 bake-off](codec-bakeoff.md) 참고.
 
 ## 3. 청크 직접 조회 — 운영·디버그 용도
 
@@ -109,7 +109,7 @@ ALTER TABLE ts.sensor WITH extensions = {
 | --- | --- | --- |
 | *(베이스 파티션 키)* | 동일 | 베이스 테이블의 파티션 키 컬럼을 이름·타입 그대로 복제 (예: `tag_id text`) |
 | `window_start` | `timestamp` | 청크가 덮는 창의 시작 (클러스터링 키; 창 길이 = `chunk_window`) |
-| `codec` | `tinyint` | 페이로드 코덱 버전 (1 = Gorilla, 2 = Chimp128) |
+| `codec` | `tinyint` | 페이로드 코덱 버전 (2 = Chimp128; 1 = 제거된 Gorilla) |
 | `samples` | `int` | 청크에 인코딩된 샘플 수 |
 | `max_row_writetime` | `bigint` | 청크에 포함된 원본 행들의 최대 writetime (지각 병합 판정 기준) |
 | `payload` | `blob` | 인코딩된 `(timestamp, value)` 샘플들 |
@@ -163,7 +163,7 @@ nodetool tieringstatus               # 정책이 있는 모든 테이블의 상�
 ```sql
 SELECT * FROM system_views.timeseries_tiering;
 -- keyspace_name, table_name, hot_window_ms, chunk_window_ms, cold_window_ms(-1=미설정),
--- interval_ms, codec, last_run_at(-1=실행 전), windows_encoded, rows_encoded,
+-- interval_ms, last_run_at(-1=실행 전), windows_encoded, rows_encoded,
 -- late_merges, chunks_expired
 ```
 

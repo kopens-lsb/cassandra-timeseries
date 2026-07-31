@@ -26,11 +26,10 @@ import org.apache.cassandra.exceptions.ConfigurationException;
 import org.apache.cassandra.schema.KeyspaceMetadata;
 import org.apache.cassandra.schema.Schema;
 import org.apache.cassandra.schema.TableMetadata;
-import org.apache.cassandra.utils.LocalizeString;
 
 /**
  * {@code system_views.timeseries_tiering}: one row per table with a {@code timeseries_tiering} policy
- * (see {@link TieringPolicy}), showing the policy's windows/codec/interval alongside
+ * (see {@link TieringPolicy}), showing the policy's windows/interval alongside
  * {@link TieredStorageService}'s last-completed-run stats for that table.
  */
 final class TimeseriesTieringTable extends AbstractVirtualTable
@@ -41,7 +40,6 @@ final class TimeseriesTieringTable extends AbstractVirtualTable
     private static final String CHUNK_WINDOW_MS = "chunk_window_ms";
     private static final String COLD_WINDOW_MS = "cold_window_ms";
     private static final String INTERVAL_MS = "interval_ms";
-    private static final String CODEC = "codec";
     private static final String LAST_RUN_AT = "last_run_at";
     private static final String WINDOWS_ENCODED = "windows_encoded";
     private static final String ROWS_ENCODED = "rows_encoded";
@@ -60,7 +58,6 @@ final class TimeseriesTieringTable extends AbstractVirtualTable
                            .addRegularColumn(CHUNK_WINDOW_MS, LongType.instance)
                            .addRegularColumn(COLD_WINDOW_MS, LongType.instance)
                            .addRegularColumn(INTERVAL_MS, LongType.instance)
-                           .addRegularColumn(CODEC, UTF8Type.instance)
                            .addRegularColumn(LAST_RUN_AT, LongType.instance)
                            .addRegularColumn(WINDOWS_ENCODED, LongType.instance)
                            .addRegularColumn(ROWS_ENCODED, LongType.instance)
@@ -100,7 +97,6 @@ final class TimeseriesTieringTable extends AbstractVirtualTable
                       .column(CHUNK_WINDOW_MS, policy.chunkWindowMillis)
                       .column(COLD_WINDOW_MS, policy.coldWindowMillis)
                       .column(INTERVAL_MS, policy.intervalMillis)
-                      .column(CODEC, LocalizeString.toLowerCaseLocalized(policy.codec.name()))
                       .column(LAST_RUN_AT, lastRunAt == null ? -1L : lastRunAt)
                       .column(WINDOWS_ENCODED, stats == null ? 0L : stats.windowsEncoded)
                       .column(ROWS_ENCODED, stats == null ? 0L : stats.rowsEncoded)

@@ -67,7 +67,7 @@ public class ChunkReadSupportTest
         valueColumn = metadata.getColumn(ByteBufferUtil.bytes("value"));
     }
 
-    private static ByteBuffer chunk(ChunkCodecs.Codec codec, int count, long stepMs)
+    private static ByteBuffer chunk(int count, long stepMs)
     {
         long[] ts = new long[count];
         double[] vs = new double[count];
@@ -76,7 +76,7 @@ public class ChunkReadSupportTest
             ts[i] = BASE + i * stepMs;
             vs[i] = 20.0 + i * 0.1;
         }
-        return ChunkCodecs.encode(codec, ts, vs, count);
+        return ChunkCodecs.encode(ts, vs, count);
     }
 
     private static void assertRow(Row row, long expectedTsMs, double expectedValue)
@@ -88,9 +88,9 @@ public class ChunkReadSupportTest
     }
 
     @Test
-    public void gorillaRoundTripFullRange()
+    public void roundTripFullRange()
     {
-        ByteBuffer payload = chunk(ChunkCodecs.Codec.GORILLA, 100, 1000);
+        ByteBuffer payload = chunk(100, 1000);
         List<Row> rows = ChunkReadSupport.rowsFromChunk(metadata, payload, WRITETIME, Long.MIN_VALUE, Long.MAX_VALUE, false);
         assertEquals(100, rows.size());
         assertRow(rows.get(0), BASE, 20.0);
@@ -98,9 +98,9 @@ public class ChunkReadSupportTest
     }
 
     @Test
-    public void chimpRoundTripFullRange()
+    public void roundTripHonoursTheChunkStep()
     {
-        ByteBuffer payload = chunk(ChunkCodecs.Codec.CHIMP128, 50, 2000);
+        ByteBuffer payload = chunk(50, 2000);
         List<Row> rows = ChunkReadSupport.rowsFromChunk(metadata, payload, WRITETIME, Long.MIN_VALUE, Long.MAX_VALUE, false);
         assertEquals(50, rows.size());
         assertRow(rows.get(49), BASE + 49 * 2000, 20.0 + 49 * 0.1);
@@ -109,7 +109,7 @@ public class ChunkReadSupportTest
     @Test
     public void rangeFilterIsInclusiveExclusive()
     {
-        ByteBuffer payload = chunk(ChunkCodecs.Codec.GORILLA, 10, 1000);
+        ByteBuffer payload = chunk(10, 1000);
         // [BASE+2000, BASE+5000): expect samples at +2000, +3000, +4000
         List<Row> rows = ChunkReadSupport.rowsFromChunk(metadata, payload, WRITETIME, BASE + 2000, BASE + 5000, false);
         assertEquals(3, rows.size());
@@ -120,14 +120,14 @@ public class ChunkReadSupportTest
     @Test
     public void emptyRangeYieldsNoRows()
     {
-        ByteBuffer payload = chunk(ChunkCodecs.Codec.GORILLA, 10, 1000);
+        ByteBuffer payload = chunk(10, 1000);
         assertTrue(ChunkReadSupport.rowsFromChunk(metadata, payload, WRITETIME, BASE + 100_000, BASE + 200_000, false).isEmpty());
     }
 
     @Test
     public void reversedEmitsDescending()
     {
-        ByteBuffer payload = chunk(ChunkCodecs.Codec.GORILLA, 5, 1000);
+        ByteBuffer payload = chunk(5, 1000);
         List<Row> rows = ChunkReadSupport.rowsFromChunk(metadata, payload, WRITETIME, Long.MIN_VALUE, Long.MAX_VALUE, true);
         assertEquals(5, rows.size());
         assertRow(rows.get(0), BASE + 4000, 20.4);
@@ -137,7 +137,7 @@ public class ChunkReadSupportTest
     @Test
     public void corruptPayloadThrows()
     {
-        ByteBuffer payload = chunk(ChunkCodecs.Codec.GORILLA, 10, 1000);
+        ByteBuffer payload = chunk(10, 1000);
         ByteBuffer corrupt = payload.duplicate();
         corrupt.put(0, (byte) 99);                                   // unknown version byte
         try

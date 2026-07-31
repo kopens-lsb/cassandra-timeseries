@@ -52,7 +52,6 @@ import org.apache.cassandra.db.marshal.LongType;
 import org.apache.cassandra.db.marshal.TimestampType;
 import org.apache.cassandra.db.timeseries.Chimp128Codec;
 import org.apache.cassandra.db.timeseries.ChunkCodecs;
-import org.apache.cassandra.db.timeseries.GorillaCodec;
 import org.apache.cassandra.db.timeseries.SampleCursor;
 import org.apache.cassandra.dht.Range;
 import org.apache.cassandra.dht.Token;
@@ -74,7 +73,7 @@ import org.apache.cassandra.utils.MBeanWrapper;
 import static java.lang.String.format;
 
 /**
- * Background re-encoder that turns closed, hot-window-expired time-series rows into Gorilla/Chimp128
+ * Background re-encoder that turns closed, hot-window-expired time-series rows into Chimp128
  * chunks in a shadow {@code "<table>__chunks"} table (see {@link ChunkTables}), then tombstones the
  * source rows it just encoded.
  * <p>
@@ -585,8 +584,8 @@ public class TieredStorageService implements TieredStorageServiceMBean
                         idx++;
                     }
 
-                    ByteBuffer payload = encode(policy.codec, tsBuf, valBuf, count);
-                    byte codecByte = codecVersionByte(ChunkCodecs.codecOf(payload));
+                    ByteBuffer payload = ChunkCodecs.encode(tsBuf, valBuf, count);
+                    byte codecByte = Chimp128Codec.VERSION;
 
                     // Always write strictly after both the rows just encoded AND the chunk row being
                     // replaced -- guards a crash-then-backfill corner where maxWt+1 could otherwise land
@@ -770,33 +769,6 @@ public class TieredStorageService implements TieredStorageServiceMBean
     {
         for (UntypedResultSet.Row row : pagedSelect(query, cl, values))
             out.add(row.getBytes(tagRaw));
-    }
-
-    private static ByteBuffer encode(TieringPolicy.CodecChoice codec, long[] timestamps, double[] values, int count)
-    {
-        switch (codec)
-        {
-            case GORILLA:
-                return ChunkCodecs.encode(ChunkCodecs.Codec.GORILLA, timestamps, values, count);
-            case CHIMP128:
-                return ChunkCodecs.encode(ChunkCodecs.Codec.CHIMP128, timestamps, values, count);
-            case AUTO:
-            default:
-                return ChunkCodecs.encodeSmallest(timestamps, values, count);
-        }
-    }
-
-    private static byte codecVersionByte(ChunkCodecs.Codec codec)
-    {
-        switch (codec)
-        {
-            case GORILLA:
-                return GorillaCodec.VERSION;
-            case CHIMP128:
-                return Chimp128Codec.VERSION;
-            default:
-                throw new AssertionError("Unhandled codec: " + codec);
-        }
     }
 
     private static String quotedRef(String keyspace, String table)

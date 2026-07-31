@@ -25,6 +25,7 @@ import java.util.concurrent.TimeUnit;
 import java.util.regex.Matcher;
 import java.util.regex.Pattern;
 
+import com.google.common.collect.ImmutableMap;
 import com.google.common.collect.ImmutableSet;
 
 import org.apache.cassandra.db.ConsistencyLevel;
@@ -35,7 +36,6 @@ import org.apache.cassandra.schema.ColumnMetadata;
 import org.apache.cassandra.schema.TableMetadata;
 import org.apache.cassandra.utils.ByteBufferUtil;
 import org.apache.cassandra.utils.JsonUtils;
-import org.apache.cassandra.utils.LocalizeString;
 
 import static java.lang.String.format;
 
@@ -49,11 +49,14 @@ import static java.lang.String.format;
  *     <li>{@code hot_window} (required) - rows younger than this are left alone.</li>
  *     <li>{@code chunk_window} (default {@code "1h"}, max {@code 31d}) - fixed-length re-encoding window.</li>
  *     <li>{@code cold_window} (optional) - once a chunk is older than this, delete it outright.</li>
- *     <li>{@code codec} (default {@code "auto"}) - {@code auto|gorilla|chimp128}.</li>
  *     <li>{@code consistency} (default {@code "LOCAL_QUORUM"}) - a {@link ConsistencyLevel} name.</li>
  *     <li>{@code interval} (default {@code "5m"}) - re-encoder tick period.</li>
  * </ul>
  * Durations use the grammar {@code <positive int><m|h|d>} (minutes/hours/days).
+ *
+ * <p>{@code codec} was removed when chimp128 became the only chunk codec. A policy still carrying
+ * it is rejected by name (see {@link #REMOVED_KEYS}) rather than silently ignored, so an operator
+ * who set it learns that the setting no longer does anything.
  */
 public final class TieringPolicy
 {
@@ -62,17 +65,24 @@ public final class TieringPolicy
     private static final String HOT_WINDOW = "hot_window";
     private static final String CHUNK_WINDOW = "chunk_window";
     private static final String COLD_WINDOW = "cold_window";
-    private static final String CODEC = "codec";
     private static final String CONSISTENCY = "consistency";
     private static final String INTERVAL = "interval";
 
     private static final String DEFAULT_CHUNK_WINDOW = "1h";
-    private static final String DEFAULT_CODEC = "auto";
     private static final String DEFAULT_CONSISTENCY = "LOCAL_QUORUM";
     private static final String DEFAULT_INTERVAL = "5m";
 
     private static final Set<String> KNOWN_KEYS = ImmutableSet.of(HOT_WINDOW, CHUNK_WINDOW, COLD_WINDOW,
-                                                                    CODEC, CONSISTENCY, INTERVAL);
+                                                                    CONSISTENCY, INTERVAL);
+
+    /**
+     * Keys this policy used to accept, mapped to what happened to them. Rejected with a message that
+     * names the key and its fate, instead of falling through to the generic "Unknown key" error: a
+     * stored policy that still sets one was written deliberately, and silently dropping it would let
+     * an operator keep believing the option is in effect.
+     */
+    private static final Map<String, String> REMOVED_KEYS = ImmutableMap.of(
+        "codec", "chimp128 is now the only chunk codec, so there is nothing to choose; remove the key");
 
     /**
      * Consistency levels weaker than a quorum are rejected: at e.g. {@code ONE}, the re-encoder's
@@ -98,30 +108,22 @@ public final class TieringPolicy
     private static final String MAX_CHUNK_WINDOW = "31d";
     private static final long MAX_CHUNK_WINDOW_MILLIS = TimeUnit.DAYS.toMillis(31);
 
-    public enum CodecChoice
-    {
-        AUTO, GORILLA, CHIMP128
-    }
-
     public final long hotWindowMillis;
     public final long chunkWindowMillis;
     public final long coldWindowMillis; // -1 = unset
     public final long intervalMillis;
-    public final CodecChoice codec;
     public final ConsistencyLevel consistency;
 
     private TieringPolicy(long hotWindowMillis,
                            long chunkWindowMillis,
                            long coldWindowMillis,
                            long intervalMillis,
-                           CodecChoice codec,
                            ConsistencyLevel consistency)
     {
         this.hotWindowMillis = hotWindowMillis;
         this.chunkWindowMillis = chunkWindowMillis;
         this.coldWindowMillis = coldWindowMillis;
         this.intervalMillis = intervalMillis;
-        this.codec = codec;
         this.consistency = consistency;
     }
 
@@ -169,6 +171,10 @@ public final class TieringPolicy
 
         for (String key : raw.keySet())
         {
+            String removalNote = REMOVED_KEYS.get(key);
+            if (removalNote != null)
+                throw new ConfigurationException(format("%s.%s is no longer supported: %s",
+                                                          EXTENSION_KEY, key, removalNote));
             if (!KNOWN_KEYS.contains(key))
                 throw new ConfigurationException(format("Unknown %s key '%s'", EXTENSION_KEY, key));
         }
@@ -192,9 +198,6 @@ public final class TieringPolicy
         String coldWindow = requireString(raw, COLD_WINDOW);
         long coldWindowMillis = coldWindow == null ? -1 : parseDurationMillis(COLD_WINDOW, coldWindow);
 
-        String codecStr = requireString(raw, CODEC);
-        CodecChoice codec = parseCodec(codecStr != null ? codecStr : DEFAULT_CODEC);
-
         String consistencyStr = requireString(raw, CONSISTENCY);
         ConsistencyLevel consistency = parseConsistency(consistencyStr != null ? consistencyStr : DEFAULT_CONSISTENCY);
 
@@ -210,7 +213,7 @@ public final class TieringPolicy
             throw new ConfigurationException(format("%s.%s (%s) must be > %s (%s)",
                                                       EXTENSION_KEY, COLD_WINDOW, coldWindow, HOT_WINDOW, hotWindow));
 
-        return new TieringPolicy(hotWindowMillis, chunkWindowMillis, coldWindowMillis, intervalMillis, codec, consistency);
+        return new TieringPolicy(hotWindowMillis, chunkWindowMillis, coldWindowMillis, intervalMillis, consistency);
     }
 
     /** Floors {@code tsMillis} to the start of its {@link #chunkWindowMillis}-wide, epoch-aligned window. */
@@ -254,10 +257,10 @@ public final class TieringPolicy
     @Override
     public String toString()
     {
-        return format("TieringPolicy{hot_window=%dms, chunk_window=%dms, cold_window=%s, codec=%s, consistency=%s, interval=%dms}",
+        return format("TieringPolicy{hot_window=%dms, chunk_window=%dms, cold_window=%s, consistency=%s, interval=%dms}",
                        hotWindowMillis, chunkWindowMillis,
                        coldWindowMillis < 0 ? "unset" : coldWindowMillis + "ms",
-                       codec, consistency, intervalMillis);
+                       consistency, intervalMillis);
     }
 
     private static String requireString(Map<String, Object> raw, String key)
@@ -268,19 +271,6 @@ public final class TieringPolicy
         if (!(value instanceof String))
             throw new ConfigurationException(format("%s.%s must be a string, got '%s'", EXTENSION_KEY, key, value));
         return (String) value;
-    }
-
-    private static CodecChoice parseCodec(String value)
-    {
-        try
-        {
-            return CodecChoice.valueOf(LocalizeString.toUpperCaseLocalized(value));
-        }
-        catch (IllegalArgumentException e)
-        {
-            throw new ConfigurationException(format("%s.%s must be one of auto, gorilla, chimp128, got '%s'",
-                                                      EXTENSION_KEY, CODEC, value));
-        }
     }
 
     private static ConsistencyLevel parseConsistency(String value)

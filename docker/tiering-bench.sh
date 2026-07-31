@@ -63,7 +63,7 @@ done
 
 cql() { $RUNTIME exec "$CONTAINER" cqlsh --request-timeout=3600 -e "$1"; }
 
-json='{"hot_window":"1h","chunk_window":"1h","interval":"7d","codec":"auto"}'
+json='{"hot_window":"1h","chunk_window":"1h","interval":"7d"}'
 hex=$(printf '%s' "$json" | od -A n -t x1 | tr -d ' \n')
 echo "-- installing tiering policy: $json"
 # gc_grace 0 lets the post-retier major compaction actually purge the re-encoder's range
