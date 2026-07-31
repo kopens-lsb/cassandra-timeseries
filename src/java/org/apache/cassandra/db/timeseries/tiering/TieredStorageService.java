@@ -27,10 +27,16 @@ import java.util.List;
 import java.util.Map;
 import java.util.Set;
 import java.util.TreeMap;
+import java.util.concurrent.ConcurrentHashMap;
+import java.util.concurrent.TimeUnit;
+import java.util.concurrent.atomic.AtomicBoolean;
+
+import com.google.common.annotations.VisibleForTesting;
 
 import org.slf4j.Logger;
 import org.slf4j.LoggerFactory;
 
+import org.apache.cassandra.concurrent.ScheduledExecutors;
 import org.apache.cassandra.cql3.CQLStatement;
 import org.apache.cassandra.cql3.ColumnIdentifier;
 import org.apache.cassandra.cql3.QueryOptions;
@@ -51,6 +57,7 @@ import org.apache.cassandra.dht.Range;
 import org.apache.cassandra.dht.Token;
 import org.apache.cassandra.exceptions.ConfigurationException;
 import org.apache.cassandra.schema.ColumnMetadata;
+import org.apache.cassandra.schema.KeyspaceMetadata;
 import org.apache.cassandra.schema.Schema;
 import org.apache.cassandra.schema.TableMetadata;
 import org.apache.cassandra.service.QueryState;
@@ -59,6 +66,7 @@ import org.apache.cassandra.service.pager.PagingState;
 import org.apache.cassandra.transport.Dispatcher;
 import org.apache.cassandra.transport.ProtocolVersion;
 import org.apache.cassandra.transport.messages.ResultMessage;
+import org.apache.cassandra.utils.MBeanWrapper;
 
 import static java.lang.String.format;
 
@@ -69,8 +77,12 @@ import static java.lang.String.format;
  * <p>
  * {@link #runOnce} is the whole cycle for one (keyspace, table) pair, run synchronously and
  * idempotently -- see docs/superpowers/plans/2026-07-31-chunk-store-sp2.md ("재인코딩 사이클") for the
- * normative algorithm this implements. This class has no scheduler yet (see Task 3): callers drive
- * {@link #runOnce} directly.
+ * normative algorithm this implements. {@link #instance} is the process-wide singleton wired up by
+ * {@link org.apache.cassandra.service.CassandraDaemon#setup()} via {@link #setup()}, which registers
+ * the {@link TieredStorageServiceMBean} and schedules a single, global sweep (see {@link #sweep}) that
+ * drives {@link #runOnce} for every policy-bearing table on its own {@code interval}; callers that just
+ * want the core cycle (tests, {@code nodetool retier}) can still call {@link #runOnce} directly, or go
+ * through the per-table overlap guard via {@link #retier}.
  * <p>
  * <b>Invariants (violating either fails review):</b>
  * <ul>
@@ -94,14 +106,22 @@ import static java.lang.String.format;
  * so no window that reaches into the hot region is ever fetched, encoded, or deleted, no matter how
  * densely a tag is being ingested.
  */
-public class TieredStorageService
+public class TieredStorageService implements TieredStorageServiceMBean
 {
     private static final Logger logger = LoggerFactory.getLogger(TieredStorageService.class);
 
     /** Network page size for the paged scans this cycle issues (tag enumeration, per-window row reads, cold-expiry candidates). */
     private static final int PAGE_SIZE = 5000;
 
-    /** Per-{@link #runOnce} call counters, also meant for the (not-yet-built) virtual table / nodetool status. */
+    public static final String MBEAN_NAME = "org.apache.cassandra.db:type=TieredStorage";
+
+    /** Fixed delay between global sweep ticks; each policy-bearing table is still gated by its own {@code interval}. */
+    private static final long SWEEP_DELAY_SECONDS = 60;
+
+    /** Process-wide singleton wired up by {@link org.apache.cassandra.service.CassandraDaemon#setup()} via {@link #setup}. */
+    public static final TieredStorageService instance = new TieredStorageService();
+
+    /** Per-{@link #runOnce} call counters, also surfaced via the virtual table / {@link #statusRows}. */
     public static class TierRunStats
     {
         public long windowsEncoded;
@@ -109,6 +129,185 @@ public class TieredStorageService
         public long lateMerges;
         public long chunksExpired;
         public long bytesWritten;
+    }
+
+    private final AtomicBoolean setupDone = new AtomicBoolean(false);
+
+    /** One entry per table that has ever been run (sweep- or {@link #retier}-triggered); {@code true} while a run is in flight. */
+    private final ConcurrentHashMap<String, AtomicBoolean> runningGates = new ConcurrentHashMap<>();
+    /** {@code "keyspace.table"} -> epoch millis of that table's last *completed* run. */
+    private final ConcurrentHashMap<String, Long> lastRunAtMillisByTable = new ConcurrentHashMap<>();
+    /** {@code "keyspace.table"} -> stats from that table's last *completed* run. */
+    private final ConcurrentHashMap<String, TierRunStats> lastStatsByTable = new ConcurrentHashMap<>();
+
+    /**
+     * Registers the {@value #MBEAN_NAME} MBean and schedules the single, process-wide sweep
+     * ({@link #sweep}) that drives every policy-bearing table's re-encode cycle, on
+     * {@link ScheduledExecutors#optionalTasks} at a fixed {@value #SWEEP_DELAY_SECONDS}s delay.
+     * <p>
+     * Idempotent: guarded by {@link #setupDone}, so a second (or later) call is a silent no-op rather
+     * than double-registering the MBean or scheduling a second sweep loop -- callers (namely
+     * {@link org.apache.cassandra.service.CassandraDaemon#setup()}) do not need to track whether this
+     * has already run.
+     */
+    public void setup()
+    {
+        if (!setupDone.compareAndSet(false, true))
+            return;
+
+        MBeanWrapper.instance.registerMBean(this, MBEAN_NAME);
+        ScheduledExecutors.optionalTasks.scheduleWithFixedDelay(this::sweep, SWEEP_DELAY_SECONDS, SWEEP_DELAY_SECONDS, TimeUnit.SECONDS);
+    }
+
+    /**
+     * One global tick: walks every table of every non-system keyspace ({@link Schema#getUserKeyspaces}),
+     * and for each with a {@link TieringPolicy} whose {@code interval} has elapsed since its last
+     * completed run, invokes the guarded runner ({@link #runGuarded}). A table whose policy fails to
+     * parse is retried every tick too (cheaply -- {@link #runOnce} fails fast and logs the specifics)
+     * rather than being permanently ignored until an operator notices and fixes it.
+     */
+    private void sweep()
+    {
+        long now = System.currentTimeMillis();
+        for (KeyspaceMetadata keyspace : Schema.instance.getUserKeyspaces())
+        {
+            for (TableMetadata table : keyspace.tables)
+            {
+                if (dueForSweep(keyspace.name, table, now))
+                    runGuarded(keyspace.name, table.name, false);
+            }
+        }
+    }
+
+    private boolean dueForSweep(String keyspace, TableMetadata table, long now)
+    {
+        TieringPolicy policy;
+        try
+        {
+            policy = TieringPolicy.fromTable(table);
+        }
+        catch (ConfigurationException e)
+        {
+            return true;
+        }
+        if (policy == null)
+            return false;
+
+        Long lastRun = lastRunAtMillisByTable.get(key(keyspace, table.name));
+        return lastRun == null || now - lastRun >= policy.intervalMillis;
+    }
+
+    /**
+     * Runs one re-encode cycle for {@code keyspace.table} under that table's per-table overlap gate,
+     * recording the result for {@link #statusRows} / the virtual table. If a run for this table is
+     * already in flight: silently skipped when {@code throwIfBusy} is {@code false} (the sweep's own
+     * calls -- the next tick will simply try again), or fails with {@link IllegalStateException} when
+     * {@code true} ({@link #retier}, which is a direct operator request and should say so rather than
+     * silently doing nothing).
+     */
+    private void runGuarded(String keyspace, String table, boolean throwIfBusy)
+    {
+        String key = key(keyspace, table);
+        AtomicBoolean gate = runningGates.computeIfAbsent(key, ignored -> new AtomicBoolean(false));
+        if (!gate.compareAndSet(false, true))
+        {
+            if (throwIfBusy)
+                throw new IllegalStateException(format("Tiered storage run already in flight for %s.%s", keyspace, table));
+
+            logger.debug("Tiered storage sweep: {}.{} is already running -- skipping this tick", keyspace, table);
+            return;
+        }
+
+        try
+        {
+            TierRunStats stats = runOnce(keyspace, table, System.currentTimeMillis());
+            lastRunAtMillisByTable.put(key, System.currentTimeMillis());
+            lastStatsByTable.put(key, stats);
+        }
+        finally
+        {
+            gate.set(false);
+        }
+    }
+
+    @Override
+    public void retier(String keyspace, String table)
+    {
+        runGuarded(keyspace, table, true);
+    }
+
+    @Override
+    public List<String> statusRows()
+    {
+        List<String> rows = new ArrayList<>();
+        for (KeyspaceMetadata keyspace : Schema.instance.getUserKeyspaces())
+        {
+            for (TableMetadata table : keyspace.tables)
+            {
+                TieringPolicy policy;
+                try
+                {
+                    policy = TieringPolicy.fromTable(table);
+                }
+                catch (ConfigurationException e)
+                {
+                    continue;
+                }
+                if (policy == null)
+                    continue;
+
+                String key = key(keyspace.name, table.name);
+                Long lastRun = lastRunAtMillisByTable.get(key);
+                TierRunStats stats = lastStatsByTable.get(key);
+                rows.add(format("%s\t%s\t%d\t%d\t%d\t%d\t%d\t%d",
+                                keyspace.name, table.name, policy.intervalMillis,
+                                lastRun == null ? -1L : lastRun,
+                                stats == null ? 0L : stats.windowsEncoded,
+                                stats == null ? 0L : stats.rowsEncoded,
+                                stats == null ? 0L : stats.lateMerges,
+                                stats == null ? 0L : stats.chunksExpired));
+            }
+        }
+        return rows;
+    }
+
+    /** @return {@code keyspace.table}'s last *completed* run's stats, or {@code null} if it has never run. */
+    public TierRunStats lastStats(String keyspace, String table)
+    {
+        return lastStatsByTable.get(key(keyspace, table));
+    }
+
+    /** @return epoch millis of {@code keyspace.table}'s last *completed* run, or {@code null} if it has never run. */
+    public Long lastRunAtMillis(String keyspace, String table)
+    {
+        return lastRunAtMillisByTable.get(key(keyspace, table));
+    }
+
+    /**
+     * Test-only hook onto the same per-table overlap gate {@link #runGuarded} uses, so a test can hold
+     * it open and assert {@link #retier} throws {@link IllegalStateException} -- without needing a real
+     * concurrent re-encode cycle in flight.
+     *
+     * @return {@code true} if the gate was free and is now held; {@code false} if it was already held
+     */
+    @VisibleForTesting
+    boolean acquireGateForTesting(String keyspace, String table)
+    {
+        AtomicBoolean gate = runningGates.computeIfAbsent(key(keyspace, table), ignored -> new AtomicBoolean(false));
+        return gate.compareAndSet(false, true);
+    }
+
+    @VisibleForTesting
+    void releaseGateForTesting(String keyspace, String table)
+    {
+        AtomicBoolean gate = runningGates.get(key(keyspace, table));
+        if (gate != null)
+            gate.set(false);
+    }
+
+    private static String key(String keyspace, String table)
+    {
+        return keyspace + '.' + table;
     }
 
     /**
