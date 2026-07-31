@@ -142,3 +142,28 @@ memtable+SSTable 병합과 같은 Cassandra 관용구다.
 
 서브프로젝트 2 완료 시 저장량·쓰기·재인코딩 항목을, 서브프로젝트 3 완료 시 읽기 항목을
 측정해 보고서를 단계적으로 채운다.
+
+(2026-07-31 사용자 결정: 벤치마크는 전 구현 완료 후 — SP3 투명 읽기까지 — 최종 읽기
+경로 기준으로 1회만 측정한다.)
+
+## 8. SP2 구현 완료 노트 (2026-07-31) 및 SP3 인계
+
+SP2는 커밋 `8541e06047..be5500363d`(12커밋)로 완료 — 태스크별 리뷰 5회 + 전체 브랜치
+최종 리뷰(APPROVED-WITH-FIXES → 수정 웨이브 → 재리뷰 클린). 두 불변식(지각 데이터
+writetime-경계 레인지 딜리트 생존, 전 데이터 경로 QueryProcessor.process@CL 쿼럼 플로어)은
+엔드투엔드 검증됨. 구성: `db/timeseries/tiering/`(TieringPolicy·ChunkTables·
+TieredStorageService), extensions CQL(TableAttributes hex), 60초 스위퍼+MBean+
+system_views 가상 테이블+nodetool(retier/tieringstatus), 도커 통합 게이트 52건.
+CI: TieringPolicyTest 27 · TieredStorageServiceTest 15 · TieredStorageMockTest 4 ·
+AlterTableExtensionsTest 2. 문서: `doc/timeseries/tiered-storage.md`(제한사항 §6 포함).
+정책 상한: `chunk_window ≤ 31d`(파스 거부) + 인코드 전 MAX_SAMPLES 이중 가드(페이징 중
+중단, 태그 격리 스킵). DESC 클러스터링 지원(ReversedType unwrap + 전 워크 쿼리 ORDER BY ASC).
+
+SP3가 인수할 것 (최종 리뷰 지시):
+- **죽은 태그 청크 만료 공백(최우선 후속)** — 베이스 로우가 전부 사라진 태그는 DISTINCT
+  열거에서 빠져 콜드 청크가 영구 잔존. 만료 열거를 청크 테이블 기준으로 전환해 구조적으로
+  해결할 것 (tiered-storage.md §6.3).
+- 투명 읽기 시 핫 로우+청크 코디네이터 병합 — 명시 조회 패턴(§6) 문서를 대체.
+- 오버플로 웨지 태그는 사이클마다 상한+1페이지 IO 재발(로그 있음) — 운영 문서화 유지.
+- 멀티노드(3노드) 검증 공백은 여전히 이연 상태.
+- 두 번째(병합 카운트) MAX_SAMPLES 가드 전용 테스트 미존재 — SP3 테스트 웨이브에서 보강.
