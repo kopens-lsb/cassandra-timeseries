@@ -62,7 +62,7 @@ opts=(
   -Drat.skip=true
 )
 
-if [ $no_checkstyle ]; then
+if [ "$no_checkstyle" = true ]; then
   ant -Dno-checkstyle=true "${opts[@]}" clean jar "$@" 2>&1 | "$bin"/ant-log-summary.py -
 else
   ant "${opts[@]}" clean jar checkstyle checkstyle-test "$@" 2>&1 | "$bin"/ant-log-summary.py -
