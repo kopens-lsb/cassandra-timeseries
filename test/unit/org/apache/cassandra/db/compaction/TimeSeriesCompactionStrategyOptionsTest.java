@@ -155,6 +155,63 @@ public class TimeSeriesCompactionStrategyOptionsTest
     }
 
     @Test
+    public void maxFutureWindowDefaultsAndParses()
+    {
+        assertEquals(24 * 3_600_000L, new TimeSeriesCompactionStrategyOptions(options()).maxFutureWindowMillis);   // 기본 1d
+        assertEquals(2 * 3_600_000L,
+                     new TimeSeriesCompactionStrategyOptions(options("max_future_window", "2h")).maxFutureWindowMillis);
+    }
+
+    @Test
+    public void currentWindowBoundary()
+    {
+        TimeSeriesCompactionStrategyOptions opts =
+            new TimeSeriesCompactionStrategyOptions(options("window_size", "1h", "freeze_after", "2h"));
+        long now = 1_700_000_000_000L;
+        long currentStart = opts.windowStartFor(now);
+        assertTrue(opts.isCurrentWindow(currentStart, now));
+        // 직전 창: CURRENT는 아니지만 freeze_after 유예 안이므로 여전히 활성(CLOSING 몫)
+        assertFalse(opts.isCurrentWindow(currentStart - opts.windowSizeMillis, now));
+        assertTrue(opts.isActiveWindow(currentStart - opts.windowSizeMillis, now));
+        // 창 시작 시각 자신(windowEnd == now + windowSize)은 CURRENT
+        assertTrue(opts.isCurrentWindow(currentStart, currentStart));
+    }
+
+    @Test
+    public void farFutureClassificationIsOverflowSafe()
+    {
+        TimeSeriesCompactionStrategyOptions opts = new TimeSeriesCompactionStrategyOptions(options());   // max_future_window 기본 1d
+        long now = 1_700_000_000_000L;
+        long day = 24 * 3_600_000L;
+        assertFalse(opts.isFarFutureWindow(opts.windowStartFor(now), now));
+        assertFalse(opts.isFarFutureWindow(opts.windowStartFor(now + day - 3_600_000L), now));   // 한도 이내 미래
+        assertTrue(opts.isFarFutureWindow(opts.windowStartFor(now + 2 * day), now));
+        // 쓰레기 타임스탬프의 창(Long.MAX_VALUE 근처)도 반드시 far-future 판정 — 오버플로로 뒤집히면 안 된다
+        assertTrue(opts.isFarFutureWindow(opts.windowStartFor(Long.MAX_VALUE - 775_000L), now));
+    }
+
+    @Test
+    public void validateRejectsBadMaxFutureWindow()
+    {
+        for (String bad : new String[]{ "0h", "-1d", "1w", "abc", "" })
+            assertThatThrownBy(() -> TimeSeriesCompactionStrategyOptions.validateOptions(
+                                   options("max_future_window", bad), new HashMap<>(options("max_future_window", bad))))
+            .as("max_future_window=" + bad)
+            .isInstanceOf(ConfigurationException.class);
+    }
+
+    @Test
+    public void maxFutureWindowIsConsumedAndStripped()
+    {
+        Map<String, String> map = options("max_future_window", "2d", "scaling_parameters", "T4");
+        Map<String, String> unchecked = TimeSeriesCompactionStrategyOptions.validateOptions(map, new HashMap<>(map));
+        assertFalse(unchecked.containsKey("max_future_window"));
+        assertTrue(unchecked.containsKey("scaling_parameters"));     // UCS 몫은 남긴다
+        TimeSeriesCompactionStrategyOptions opts = new TimeSeriesCompactionStrategyOptions(map);
+        assertFalse(opts.delegateOptions(map).containsKey("max_future_window"));
+    }
+
+    @Test
     public void cqlSurfaceAcceptsAndValidates()
     {
         // 짧은 이름 해석 + 옵션 수용

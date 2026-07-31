@@ -38,9 +38,11 @@ public final class TimeSeriesCompactionStrategyOptions
     public static final String FREEZE_AFTER = "freeze_after";
     public static final String RETENTION = "retention";
     public static final String TIMESTAMP_RESOLUTION = "timestamp_resolution";
+    public static final String MAX_FUTURE_WINDOW = "max_future_window";
 
     static final String DEFAULT_WINDOW_SIZE = "1h";
     static final String DEFAULT_FREEZE_AFTER = "2h";
+    static final String DEFAULT_MAX_FUTURE_WINDOW = "1d";
 
     private static final Pattern DURATION = Pattern.compile("([1-9][0-9]*)([mhd])");
 
@@ -50,6 +52,7 @@ public final class TimeSeriesCompactionStrategyOptions
     public final TimeUnit windowUnit;
     public final int windowSizeInUnits;
     public final TimeUnit timestampResolution;
+    public final long maxFutureWindowMillis;
 
     public TimeSeriesCompactionStrategyOptions(Map<String, String> options)
     {
@@ -70,6 +73,8 @@ public final class TimeSeriesCompactionStrategyOptions
             this.retentionMillis = TimeUnit.MILLISECONDS.convert(parsed.right, parsed.left);
         }
         this.timestampResolution = TimeUnit.valueOf(options.getOrDefault(TIMESTAMP_RESOLUTION, "MICROSECONDS"));
+        Pair<TimeUnit, Integer> future = parseDuration(MAX_FUTURE_WINDOW, options.getOrDefault(MAX_FUTURE_WINDOW, DEFAULT_MAX_FUTURE_WINDOW));
+        this.maxFutureWindowMillis = TimeUnit.MILLISECONDS.convert(future.right, future.left);
     }
 
     public long windowStartFor(long timestampMillis)
@@ -99,6 +104,29 @@ public final class TimeSeriesCompactionStrategyOptions
         return retentionMillis >= 0 && windowStartMillis <= nowMillis - retentionMillis - windowSizeMillis;
     }
 
+    /** See {@link #isActiveWindow} for why sstable-derived operands never have durations added to them. */
+    public boolean isCurrentWindow(long windowStartMillis, long nowMillis)
+    {
+        return windowStartMillis > nowMillis - windowSizeMillis;
+    }
+
+    /**
+     * Far-future guard (design spec section 8): windows whose start lies more than {@code max_future_window}
+     * past the wall clock are treated as garbage/misconfigured-writer input - excluded from the UCS delegate
+     * and from freeze/frozen judgment, and logged at WARN - so bad timestamps can neither spawn unbounded
+     * "current" windows nor trick a window into freezing.
+     * <p>
+     * Overflow discipline mirrors {@link #isActiveWindow} from the other side: the adversarial, sstable-derived
+     * operand ({@code windowStartMillis}, possibly near {@code Long.MAX_VALUE}) stands alone on the left; the
+     * arithmetic happens on {@code nowMillis + maxFutureWindowMillis}, whose operands are a real clock value
+     * and a config-bounded duration (the duration parser caps at {@code Integer.MAX_VALUE} days, ~1.9e17 ms),
+     * so the right-hand sum cannot wrap for any real clock value.
+     */
+    public boolean isFarFutureWindow(long windowStartMillis, long nowMillis)
+    {
+        return windowStartMillis > nowMillis + maxFutureWindowMillis;
+    }
+
     /** A copy of {@code original} without this strategy's own keys - the options handed to the UCS delegate. */
     public Map<String, String> delegateOptions(Map<String, String> original)
     {
@@ -107,6 +135,7 @@ public final class TimeSeriesCompactionStrategyOptions
         copy.remove(FREEZE_AFTER);
         copy.remove(RETENTION);
         copy.remove(TIMESTAMP_RESOLUTION);
+        copy.remove(MAX_FUTURE_WINDOW);
         return copy;
     }
 
@@ -138,11 +167,13 @@ public final class TimeSeriesCompactionStrategyOptions
                 throw new ConfigurationException(TIMESTAMP_RESOLUTION + " must be a java TimeUnit name, got " + resolution);
             }
         }
+        parseDuration(MAX_FUTURE_WINDOW, options.getOrDefault(MAX_FUTURE_WINDOW, DEFAULT_MAX_FUTURE_WINDOW));
 
         uncheckedOptions.remove(WINDOW_SIZE);
         uncheckedOptions.remove(FREEZE_AFTER);
         uncheckedOptions.remove(RETENTION);
         uncheckedOptions.remove(TIMESTAMP_RESOLUTION);
+        uncheckedOptions.remove(MAX_FUTURE_WINDOW);
         return uncheckedOptions;
     }
 
