@@ -92,6 +92,42 @@ memtable+SSTable 병합과 같은 Cassandra 관용구다.
   전체 테이블 스캔형 질의는 v1에서 핫 경계 안쪽만 투명 지원, 걸치면 명확한 에러+힌트.
 - gap-fill·시계열 함수와의 결합 테스트 필수.
 
+#### 3.3.1 SP3 상세 설계 (2026-07-31 정찰 확정 — 구현 규범)
+
+정찰 근거: `scratchpad/sp3-recon-select.md`, `sp3-recon-restrictions.md` (SelectStatement 파이프라인
+file:line 포함). 핵심 결정:
+
+- **병합 지점 = PartitionIterator 레벨(집계 전).** 집계는 `ResultSetBuilder`(process() :1185-1195)
+  안에서 일어나므로, 갭필처럼 ResultSet 후처리(:1198)로는 집계 질의가 투명해지지 않는다.
+  `query.execute(...)`가 돌려준 PartitionIterator를 **ChunkMergePartitionIterator**로 감싸
+  파티션(태그)별로 청크 디코드 로우를 클러스터링 순서로 병합 주입한다. 이후의
+  Selection/GroupMaker/트림/갭필은 무수정으로 정상 동작.
+- **발동 조건**(전부 만족 시에만; 아니면 기존 경로 오버헤드 0): 테이블에 TieringPolicy 존재
+  (TableMetadata는 SelectStatement 필드 :182로 접근, 정책 파싱은 스키마 버전 기준 캐시) ·
+  단일/다중 파티션 키 질의(StatementRestrictions.getPartitionKeys :794) · 클러스터링 슬라이스
+  필터(ClusteringIndexSliceFilter.requestedSlices()의 start/end로 타임스탬프 범위 추출) ·
+  요청 범위가 청크 존재 가능 구간과 겹침.
+- **병합 규칙**: 파티션별로 `<table>__chunks`에서 `window_start ∈ [floor(rangeStart)-chunk_window,
+  rangeEnd]` 청크를 사용자 질의와 **같은 CL**로 조회(QueryProcessor.process — SP2 불변식 B와
+  동일 규율), 디코드 후 요청 범위로 필터, 합성 Row(BTreeRow, value 셀 writetime=청크
+  max_row_writetime)로 변환, 핫 로우와 2-way 정렬 병합. **동일 타임스탬프 충돌은 핫 로우
+  승리**(재인코더의 rows-win 병합 규칙과 일치 — 지각 수정치가 스윕 전까지 항상 보이는 값과
+  동일해야 왕복 일관).
+- **LIMIT 정합성 증명(정찰 Q5)**: 스토리지 측 DataLimits는 클러스터링 최소(ASC)/최대(DESC)
+  N개를 남긴다. 병합 결과의 상위 N개에 포함되는 핫 로우는 반드시 핫 질의 결과의 상위 N개
+  안에 있으므로(부분수열 논증 — 지각 로우 포함) 유실 불가. 최종 사용자 LIMIT은 기존
+  `ResultSet.trim(userLimit)`(:1203)이 병합 후 스트림에 적용.
+- **페이징**: 페이저가 페이지마다 클러스터링 재개 지점으로 슬라이스를 좁히므로, 병합
+  래퍼가 "그 페이지의 요청 슬라이스 범위 안의 청크 로우만" 주입하면 페이지 경계에서
+  중복·누락이 없다(청크 로우는 창·범위에서 결정론적으로 재유도 가능 — 상태 불필요).
+  래핑 지점은 페이지 fetch 경로 안쪽이어야 하며(pager.fetchPage가 주는 이터레이터),
+  구현 계획의 Task 0 정찰로 정확한 결합점(QueryPagers/AggregationQueryPager 경유 시 포함)을
+  확정한다. v1에서 결합점이 페이저 내부라 불가하면: 비페이징+집계 질의 완전 지원, 대용량
+  비집계 페이징 질의는 명확한 에러+힌트(§3.3 원칙 유지).
+- **SP2 인계 항목 소화**: 죽은 태그 청크 만료(§8 최우선 후속)는 SP3 범위에 포함 — 만료
+  열거를 청크 테이블 기준으로 전환. tiered-storage.md의 명시 조회 패턴 문서를 투명 읽기
+  문서로 대체.
+
 ## 4. 서브프로젝트 순서와 이유
 
 | 순서 | 내용 | 독립 가치 | 난이도 |
