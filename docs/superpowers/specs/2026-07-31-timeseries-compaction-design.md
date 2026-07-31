@@ -152,8 +152,56 @@ T1은 커밋 `c6bb636..3cd922e8b9`로 완료(최종 리뷰 + 수정 웨이브 �
 
 T2가 반드시 인수할 것:
 - **far-future 가드(§8) 미구현** — 극단 미래 타임스탬프 SSTable은 활성도 만료도 아니어서 컴팩션에 영원히 안 보임. FROZEN 판정 전에 반드시 구현(쓰레기 타임스탬프가 창을 동결로 오판하지 않게).
-- **닫힌 창 TTL 회수 공백(I2)** — T1은 문서 경고로 처리(retention 필요). T2 동결 컴팩션이 구조적으로 해결하고 경고 문구를 제거할 것.
+- **닫힌 창 TTL 회수 공백(I2)** — T1은 문서 경고로 처리(retention 필요). T2 동결 컴팩션이 구조적으로 해결하고 경고 문구를 제거할 것. — **T2에서 해소**(아래 완료 노트의 `testFreezeReclaimsTTLDataInClosedWindowWithoutRetention` 참고).
 - FROZEN 판정에는 min·max 타임스탬프가 둘 다 필요 — 현재 max만 배관됨.
 - `getMaximalTasks`/`getUserDefinedTask`의 목 수준 커버리지 부재(E2E만 존재) — T2에서 상태기계 재작성 시 보강.
 
 T3 훅: `createSSTableMultiWriter` 미오버라이드(M3) — flush가 UCS 샤드 분할을 잃는 지점이자 창 경계 스플릿(§4 불변식)이 들어갈 자리.
+
+### T2 구현 완료 노트 (2026-07-31)
+
+T2는 커밋 `3c69e831d6..ad50003d80`로 완료. 테스트: Options 16, Strategy 26(Mockito), E2E 4(SchemaLoader),
+WindowFrozenListenersTest 3 — 전부 CI 배선됨(`.gitlab-ci.yml`).
+
+구현 요약: 무상태 창 상태 분류기(CURRENT/CLOSING/FREEZING/FROZEN/EXPIRED, min·max 타임스탬프 유도 —
+T1 인계 항목이던 min 배관 완료), `max_future_window` 옵션(기본 1d)과 far-future/current 창 술어,
+`FreezeCompactionTask`(창 내 전 SSTable → 단일 SSTable 메이저 컴팩션), 커밋 후에만 발화하는
+`WindowFrozenListener`/`WindowFrozenListeners` 훅(신규 패키지 `db.compaction.timeseries`).
+
+동결 시맨틱(코드로 증명됨, `FreezeCompactionTask`/`WindowFrozenListenersTest`/E2E 참고):
+- **커밋 후 발화만**(post-commit-only) — 리스너는 `CompactionTask.finish()`가 `super.finish()`(트랜잭션
+  커밋의 "돌아올 수 없는 지점")를 반환한 *이후*에만 호출된다. 산출물 0개(창 전체가 만료 데이터였던
+  경우)는 이벤트 없음, 1개는 정확히 1회 발화, 2개 이상(발생해선 안 됨)은 발화하지 않고 WARN 로그만.
+  E2E에서 발화 횟수 1(최초 동결)/2(지각 데이터 재동결 — 누적)/0(만료 창 동결로 산출물 없음)으로 증명.
+- **단일 산출물은 평범한 `CompactionTask`/`DefaultCompactionWriter`로 보장** — 별도 신규 writer가
+  아니라 writer를 스위칭하지 않는 기존 `CompactionTask`를 그대로 상속해 얻는다.
+- `shouldReduceScopeForSpace()`를 `false`로 오버라이드 — 디스크 부족 시 가장 큰 입력을 조용히 버리는
+  `CompactionTask` 기본 동작은 "창 전체 → 1 SSTable" 계약을 깨므로, 전량 실패 후 다음 라운드 재시도를
+  택한다(§8과 일치).
+
+스코프 주의(변경 없음): CSM이 전략 인스턴스를 리페어 상태×디스크로 쪼개므로 "창당 1 sstable"·FROZEN
+판정·동결 이벤트는 **인스턴스 슬라이스 단위**다(테이블 전체 아님). 리스너 소비자는 같은 창에 대해
+슬라이스별 이벤트를 여러 번 받을 수 있다 — 멱등 계약(§5)이 이를 흡수한다.
+
+T3가 인수할 것(우선순위 순서 아님):
+- (a) `createSSTableMultiWriter` flush/스트리밍 창-스플릿 훅 — T1 인계 항목 그대로 미착수, 여전히 보류.
+- (b) 닫힌 창 안의 **걸침(SPANNING) SSTable 1개**는 FREEZING으로 분류되지만(포함 실패) 동결 후보
+  선택에서 제외된다(선택 조건이 SSTable 수 ≥ 2) — 스플릿 없이 재작성해도 무의미하기 때문. T3의
+  flush-스플릿이 구조적으로 걸침 SSTable 발생을 앞으로 불가능하게 만들 것이므로, 이미 존재하는
+  레거시 걸침 SSTable을 위한 **국소 재동결 경로**를 T3에서 추가해야 한다.
+- (c) `ALTER window_size` 후 구경계 FROZEN 인정(§8) — 현재는 보수적으로 "미동결(재작성·이벤트 없음)"로만
+  처리. 구경계 정합 허용은 스플릿과 함께 재검토.
+- (d) 동결 동시성 스로틀 설정화(§3 "노드당 동시 1개(설정 가능)") — 현재는 **인스턴스당 라운드당 1개
+  고정**이며 설정 노출 없음. 보류.
+- (e) **`WindowFrozenListener` 소비자는 반드시 큐잉해야 하며 인라인으로 작업해선 안 된다** — 발화가
+  컴팩션 스레드 위에서 실행되므로, 리스너의 예외는 격리되지만(로깅만) 리스너가 블로킹/행(hang)하면
+  컴팩션 스레드 자체가 멈춘다. SP2 재인코더 연동 시 반드시 지켜야 할 구속 지침.
+- (f) `nextFreezeCandidate`의 far-future 필터는 선결조건 위생(precondition hygiene)이다 — far-future
+  SSTable은 애초에 FREEZING으로 분류되지 않으므로 이 필터는 현재 중복(defense-in-depth)이지만,
+  **제거하지 말 것**(분류기 변경 시 안전망).
+- (g) 인수받지 못한 테스트 공백: `previousFreezeCandidate`의 갭-라운드(창 없는 라운드) 리셋이 핀 고정
+  테스트 없음, 재동결 산출물(merge된 SSTable)의 내용·span 어서션 부재(발화 여부만 검증됨).
+- 참고(T1 인계에서 이어짐, 여전히 유효): `getMaximalTasks`(수동 메이저 컴팩션)는 만료 창을
+  `TimeSeriesCompactionTask`로, 그 외 창을 평범한 `CompactionTask`로 라우팅해 창 불변식은 지키지만
+  `FreezeCompactionTask`를 거치지 않으므로 동결 이벤트를 발화하지 않는다 — 계층화 연동 관점에서 재검토.
+- jvm-dtest(3노드 리페어/스트리밍 창 편입)와 스케일 벤치(§9)는 T3 이후 일괄.

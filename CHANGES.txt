@@ -1,7 +1,8 @@
 6.0.0
+ * Add TSCS T2 window freeze: closed windows compact to a single sstable per window (per strategy-instance slice), WindowFrozenListener post-commit event hook, far-future timestamp guard (max_future_window, default 1d), TTL reclamation in closed windows without retention
  * Add tiered storage chunk store (SP2): per-table timeseries_tiering policy, background re-encoder compacting closed windows into Gorilla/Chimp128 chunk shadow tables (<table>__chunks) with late-row merge, cold-window expiry and a consistency quorum floor, plus nodetool retier/tieringstatus and system_views.timeseries_tiering
  * Add chimp128 chunk codec (v2) with version-dispatched decoding and a codec bake-off report
- * Add TimeSeriesCompactionStrategy (T1): time-window classification with in-window UCS delegation and whole-window retention drops (T1: closed-window TTL reclamation requires 'retention' until freeze lands)
+ * Add TimeSeriesCompactionStrategy (T1): time-window classification with in-window UCS delegation and whole-window retention drops
  * Add SAI full-text search: index_analyzer index option (ngram/standard/cjk/keyword presets or JSON config) enabling substring LIKE ('%fragment%', 'prefix%', '%suffix') on text columns, korean included, served by n-gram recall + raw-value precision recheck
  * Add time-series gap-filling: GROUP BY time_bucket_gapfill(width, ts, start, finish) materializes empty buckets, with locf() and interpolate() fill policies
  * Add native time-series CQL functions: time_bucket, first, last, delta, rate, derivative, percentile, time_weighted_average, variance, stddev, histogram, approx_count_distinct, counter_delta, counter_rate, corr, covar_pop, covar_samp, regr_slope, regr_intercept, regr_r2 and integral

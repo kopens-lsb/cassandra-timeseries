@@ -68,10 +68,11 @@ timeseries-tests:
     - ant testsome -Dtest.name=org.apache.cassandra.db.timeseries.tiering.TieredStorageServiceTest
     - ant testsome -Dtest.name=org.apache.cassandra.tools.nodetool.mock.TieredStorageMockTest
     - ant testsome -Dtest.name=org.apache.cassandra.cql3.validation.operations.AlterTableExtensionsTest
-    # time-series compaction strategy (TSCS T1)
+    # time-series compaction strategy (TSCS T1 window classification + T2 freeze state machine)
     - ant testsome -Dtest.name=org.apache.cassandra.db.compaction.TimeSeriesCompactionStrategyOptionsTest
     - ant testsome -Dtest.name=org.apache.cassandra.db.compaction.TimeSeriesCompactionStrategyTest
     - ant testsome -Dtest.name=org.apache.cassandra.db.compaction.TimeSeriesCompactionStrategyE2ETest
+    - ant testsome -Dtest.name=org.apache.cassandra.db.compaction.timeseries.WindowFrozenListenersTest
 
 # Build the Testcontainers-compatible Docker image (see docker/) and publish it as a loadable tarball to
 # the GitLab GENERIC PACKAGE registry — this instance has no container registry configured (no
