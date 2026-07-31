@@ -25,6 +25,7 @@ import ch.qos.logback.classic.Level;
 import ch.qos.logback.classic.Logger;
 import ch.qos.logback.classic.spi.ILoggingEvent;
 import ch.qos.logback.core.read.ListAppender;
+import org.junit.BeforeClass;
 import org.junit.Test;
 import org.slf4j.LoggerFactory;
 
@@ -43,6 +44,7 @@ import static org.junit.Assert.assertEquals;
 import static org.junit.Assert.assertFalse;
 import static org.junit.Assert.assertNull;
 import static org.junit.Assert.assertTrue;
+import static org.junit.Assert.fail;
 
 /**
  * Integration tests for {@link TieredStorageService#runOnce}, exercising the whole re-encode cycle
@@ -52,6 +54,15 @@ import static org.junit.Assert.assertTrue;
 public class TieredStorageServiceTest extends CQLTester
 {
     private static final long HOUR = 3_600_000L;
+
+    // NOT named setUpClass(): that exact name would shadow CQLTester's own @BeforeClass setUpClass()
+    // (same name+signature in the hierarchy -- only the most-derived one runs), skipping the server/
+    // schema setup it performs and breaking every test in this class, not just the ones added here.
+    @BeforeClass
+    public static void setUpVirtualKeyspace()
+    {
+        addVirtualKeyspace(); // registers system_views, for virtualTableShowsPolicyAndStats
+    }
 
     @Test
     public void encodeClosedWindowsAndDeleteRows() throws Throwable
@@ -412,6 +423,63 @@ public class TieredStorageServiceTest extends CQLTester
 
         assertEquals(1, stats.windowsEncoded); // only "good"'s window succeeded
         assertEquals(1, execute(chunkSelectQuery(), "good", new Date(0L)).size());
+    }
+
+    @Test
+    public void virtualTableShowsPolicyAndStats() throws Throwable
+    {
+        createTable("CREATE TABLE %s (tag text, ts timestamp, value double, PRIMARY KEY (tag, ts))");
+        setPolicy("{\"hot_window\":\"2h\",\"chunk_window\":\"1h\"}");
+
+        // retier() (unlike runOnce() in the other tests here) drives the cycle off real wall-clock
+        // time, so use a window safely in the past -- hour-aligned, a few hours ago -- rather than a
+        // synthetic small timestamp, so it is unambiguously closed no matter when the test runs.
+        long windowStart = (System.currentTimeMillis() / HOUR - 3) * HOUR;
+        insertRow("v", windowStart, 1.0, 1);
+
+        String table = currentTable();
+        TieredStorageService.instance.retier(KEYSPACE, table);
+
+        UntypedResultSet rows = execute("SELECT * FROM system_views.timeseries_tiering WHERE keyspace_name = ? AND table_name = ?",
+                                        KEYSPACE, table);
+        assertEquals(1, rows.size());
+        UntypedResultSet.Row row = rows.one();
+        assertEquals(2 * HOUR, row.getLong("hot_window_ms"));
+        assertEquals(HOUR, row.getLong("chunk_window_ms"));
+        assertEquals(1, row.getLong("windows_encoded"));
+        assertEquals(1, row.getLong("rows_encoded"));
+        assertEquals(0, row.getLong("late_merges"));
+        assertEquals(0, row.getLong("chunks_expired"));
+        assertTrue("last_run_at should be a real timestamp once retier has run", row.getLong("last_run_at") > 0);
+    }
+
+    @Test
+    public void reentryGuardRejectsConcurrentRun() throws Throwable
+    {
+        createTable("CREATE TABLE %s (tag text, ts timestamp, value double, PRIMARY KEY (tag, ts))");
+        setPolicy("{\"hot_window\":\"2h\",\"chunk_window\":\"1h\"}");
+
+        String table = currentTable();
+        TieredStorageService service = TieredStorageService.instance;
+
+        assertTrue("expected the gate to be free before this test acquires it",
+                   service.acquireGateForTesting(KEYSPACE, table));
+        try
+        {
+            service.retier(KEYSPACE, table);
+            fail("expected retier to throw IllegalStateException while the gate is held");
+        }
+        catch (IllegalStateException expected)
+        {
+            // expected -- a run for this table is (fictitiously) already in flight
+        }
+        finally
+        {
+            service.releaseGateForTesting(KEYSPACE, table);
+        }
+
+        // Gate released -- a normal retier now runs to completion instead of throwing.
+        service.retier(KEYSPACE, table);
     }
 
     private void insertRow(String tag, long tsMillis, double value, long writetime) throws Throwable
