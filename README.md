@@ -1,8 +1,13 @@
 # cassandra-timeseries
 
-**Apache Cassandra 6.0.0 + 네이티브 시계열 함수 — 분산 시계열 데이터베이스.**
+**Apache Cassandra for Industrial Timeseries Workload**
+— 산업 현장의 센서·태그 데이터를 위한 분산 시계열 데이터베이스.
 
-[apache/cassandra](https://github.com/apache/cassandra)(`cassandra-6.0` 브랜치)의 포크로, 서버 사이드에서 동작하는 시계열 CQL 함수를 추가했습니다. Spark 연동은 짝이 되는 포크 [cassandra-spark-connector](https://dev.kopens.io/common/cassandra-spark-connector)(Spark 4.1.2)로 제공됩니다.
+공장·플랜트의 시계열 데이터는 몇 가지 고유한 성질을 가집니다: 태그(시리즈)마다 초 단위로 끝없이 쌓이고, 몇 년치를 규정상 보관해야 하며, 엣지 장비가 통신 두절 뒤 며칠치를 한꺼번에 밀어 넣고(지각 백필), 조회는 거의 항상 "이 태그의 이 기간"입니다. 범용 Cassandra는 이 워크로드를 감당하지만, 압축·보존·집계는 전부 애플리케이션 몫으로 남습니다.
+
+이 포크는 그 부분을 **데이터베이스 안으로 가져옵니다** — 시계열 연산을 서버에서 끝내고(21종 CQL 함수 + gap-fill), 오래된 데이터를 자동으로 압축·보존하며(계층형 저장 + 시계열 전용 컴팩션), 그러면서도 **CQL은 그대로**입니다. 압축된 과거 데이터도 평범한 `SELECT`로 읽힙니다(투명 읽기). 애플리케이션은 데이터가 압축돼 있는지 알 필요가 없습니다.
+
+[apache/cassandra](https://github.com/apache/cassandra)(`cassandra-6.0` 브랜치)의 포크이며, 온디스크 포맷·CQL 문법은 업스트림 그대로라 **기존 6.0 데이터를 그대로 읽습니다**(새 기능은 전부 옵트인). Spark 연동은 짝이 되는 포크 [cassandra-spark-connector](https://dev.kopens.io/common/cassandra-spark-connector)(Spark 4.1.2)로 제공됩니다.
 
 ## 🎯 핵심 — 무엇이 좋아지나 (업스트림 Cassandra 6.0.0 대비)
 
