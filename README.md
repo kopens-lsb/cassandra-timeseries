@@ -439,24 +439,77 @@ CREATE TABLE ts.sensor (
 
 오래된 창을 Gorilla/Chimp128 청크로 압축해 `<테이블>__chunks`로 옮기고, **SELECT는 그대로**(투명 읽기가 핫+콜드 자동 병합) 쓰는 기능입니다. 테이블 `extensions`에 JSON 정책을 hex로 넣습니다:
 
+### 12.1 대상 스키마 (필수)
+
+압축 대상은 **정준 시계열 테이블**만입니다 — 그 외 형태에 정책을 걸면 60초마다 ERROR 로그만 남고 아무 일도 하지 않습니다.
+
 ```sql
--- 정책 JSON: {"hot_window":"7d","chunk_window":"1h","cold_window":"365d","interval":"1h","codec":"auto"}
--- hex 인코딩: echo -n '<JSON>' | xxd -p | tr -d '\n'
+CREATE TABLE ts.sensor (
+    tag_id    text,        -- 파티션 키 1개 (이름 자유)
+    timestamp timestamp,   -- 클러스터링 1개, timestamp 타입 (ASC/DESC 모두 가능)
+    value     double,      -- 일반 컬럼은 이 하나뿐 (이름 자유)
+    PRIMARY KEY (tag_id, timestamp)
+);
+```
+
+### 12.2 압축 켜기 (3단계)
+
+정책은 테이블 `extensions`에 JSON을 hex로 넣습니다. **hex는 아래 한 줄로 만드세요**:
+
+```bash
+# 1) 정책 JSON → hex
+echo -n '{"hot_window":"7d","chunk_window":"1h","cold_window":"365d","interval":"1h","codec":"auto"}' \
+  | xxd -p | tr -d '\n'
+# → 7b22686f745f77696e646f77223a223764222c...
+```
+
+```sql
+-- 2) 테이블에 적용 (위 출력 앞에 0x 를 붙여 그대로 사용)
 ALTER TABLE ts.sensor WITH extensions = {
   'timeseries_tiering': 0x7b22686f745f77696e646f77223a223764222c226368756e6b5f77696e646f77223a223168222c22636f6c645f77696e646f77223a2233363564222c22696e74657276616c223a223168222c22636f646563223a226175746f227d
 };
+
+-- 3) 적용 확인 (정책과 실행 통계가 함께 보입니다)
+SELECT * FROM system_views.timeseries_tiering;
 ```
+
+적용 후에는 60초 스위퍼가 `interval` 주기로 알아서 압축합니다. **바로 확인하고 싶으면** 수동으로 한 사이클 실행:
+
+```bash
+nodetool retier ts sensor      # 1회 재인코딩 (동기 실행)
+nodetool tieringstatus         # 테이블별 정책·마지막 실행·누적 통계
+```
+
+```sql
+-- 압축 결과 확인: 청크가 생기고, SELECT 결과는 그대로 (투명 읽기)
+SELECT count(*) FROM ts.sensor__chunks WHERE tag_id='pump-01';
+SELECT count(*) FROM ts.sensor        WHERE tag_id='pump-01';   -- 압축 전과 동일한 값
+```
+
+### 12.3 정책 필드
 
 | 필드 | 의미 |
 | --- | --- |
-| `hot_window` | 이 기간 안의 데이터는 행 그대로 유지 (예: `7d`) |
-| `chunk_window` | 청크 1개가 담는 창 폭 (최대 `31d`, TSCS `window_size`와 정렬 권장) |
-| `cold_window` | 선택 — 이 기간을 지난 청크는 통째 삭제 (미지정 시 영구 보관) |
-| `interval` | 백그라운드 재인코딩 주기 (60초 스위퍼가 주기 도래 테이블만 처리) |
-| `codec` | `auto`(창마다 작은 쪽 선택) \| `gorilla` \| `chimp128` |
-| `consistency` | 재인코더 CL — `LOCAL_QUORUM`(기본)/`QUORUM`/`EACH_QUORUM`/`ALL`만 허용 |
+| `hot_window` | **이 기간 안의 데이터는 건드리지 않습니다**(행 그대로). 실시간 조회·수정이 잦은 구간보다 넉넉히 잡으세요 (예: `7d`) |
+| `chunk_window` | 청크 1개가 담는 시간 폭 (최대 `31d`). TSCS `window_size`와 맞추길 권장. 1초 주기 데이터면 `1h`(=3,600샘플)가 무난 |
+| `cold_window` | 선택 — 이 기간을 지난 청크는 통째 삭제(보존 정책). 미지정(`-1`)이면 영구 보관 |
+| `interval` | 백그라운드 재인코딩 주기 (예: `1h`). 60초 스위퍼가 주기 도래 테이블만 처리 |
+| `codec` | `auto`(기본, 창마다 두 코덱을 다 인코딩해 작은 쪽 저장) \| `gorilla` \| `chimp128` |
+| `consistency` | 재인코더 CL — `LOCAL_QUORUM`(기본) / `QUORUM` / `EACH_QUORUM` / `ALL`만 허용 (약한 CL은 데이터 유실 위험이라 차단) |
 
-운영: `nodetool retier <ks> <table>`(수동 1사이클), `nodetool tieringstatus`, `system_views.timeseries_tiering`. 지각 데이터는 이미 청크화된 창에 들어와도 다음 사이클에 병합됩니다(rows-win). 상세·제한사항: [tiered-storage.md](doc/timeseries/tiered-storage.md) · 실측: [벤치마크](doc/timeseries/tiering-benchmark.md)
+**코덱 선택**: 그냥 `auto`를 쓰세요 — 창 단위로 더 작은 쪽이 자동 선택됩니다. 참고로 [실측](doc/timeseries/codec-bakeoff.md)상 값이 양자화된(0.1 단위 등) 산업 데이터는 Chimp128이 60~69% 더 작고, 값이 거의 변하지 않는 상수 계열은 Gorilla가 5배 유리합니다(0.25 B/샘플).
+
+### 12.4 끄기·바꾸기
+
+```sql
+-- 정책 변경: 같은 방식으로 새 JSON을 넣으면 다음 사이클부터 적용
+-- 완전히 끄기: 확장에서 키 제거 (이미 만들어진 청크는 그대로 남습니다)
+ALTER TABLE ts.sensor WITH extensions = {};
+```
+
+끈 뒤에도 **투명 읽기는 정책이 있어야 동작**하므로, 청크가 남은 상태에서 정책만 제거하면 과거 데이터가 조회되지 않습니다. 되돌리려면 정책을 다시 넣으세요(청크는 그대로 재사용됩니다).
+
+운영 참고: 지각 데이터는 이미 청크화된 창에 들어와도 다음 사이클에 자동 병합됩니다(같은 타임스탬프면 나중에 들어온 행이 이김). 상세·제한사항(범위 스캔·페이징 등): [tiered-storage.md](doc/timeseries/tiered-storage.md) · 실측: [벤치마크](doc/timeseries/tiering-benchmark.md)
 
 ## 13. 운영 팁
 
