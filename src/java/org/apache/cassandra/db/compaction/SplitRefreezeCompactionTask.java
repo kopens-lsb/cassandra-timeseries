@@ -113,7 +113,7 @@ public class SplitRefreezeCompactionTask extends AbstractCompactionTask
                 {
                     try (UnfilteredRowIterator partition = ci.next())
                     {
-                        for (var entry : WindowRoutingIterator.slices(partition, windowStartOfMillis, tableResolution).entrySet())
+                        for (Map.Entry<Long, UnfilteredRowIterator> entry : WindowRoutingIterator.slices(partition, windowStartOfMillis, tableResolution).entrySet())
                             rewriterFor(rewriters, entry.getKey(), shared, maxDataAge, originals).append(entry.getValue());
                     }
                 }

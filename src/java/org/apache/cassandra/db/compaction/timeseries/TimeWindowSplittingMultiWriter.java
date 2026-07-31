@@ -21,6 +21,7 @@ package org.apache.cassandra.db.compaction.timeseries;
 import java.util.ArrayList;
 import java.util.Collection;
 import java.util.List;
+import java.util.Map;
 import java.util.NavigableMap;
 import java.util.TreeMap;
 import java.util.concurrent.TimeUnit;
@@ -104,7 +105,7 @@ public class TimeWindowSplittingMultiWriter implements SSTableMultiWriter
 
         // Header placement (deletion/static once, in its own window) is WindowRoutingIterator's
         // contract - see slices() for the rationale (plan D3, revised).
-        for (var entry : WindowRoutingIterator.slices(partition, windowStartOfMillis, tableResolution).entrySet())
+        for (Map.Entry<Long, UnfilteredRowIterator> entry : WindowRoutingIterator.slices(partition, windowStartOfMillis, tableResolution).entrySet())
             writerFor(entry.getKey()).append(entry.getValue());
     }
 

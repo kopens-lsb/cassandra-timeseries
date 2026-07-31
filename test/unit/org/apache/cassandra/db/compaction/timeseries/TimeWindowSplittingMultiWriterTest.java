@@ -19,9 +19,9 @@
 package org.apache.cassandra.db.compaction.timeseries;
 
 import java.nio.ByteBuffer;
-import java.util.concurrent.TimeUnit;
 
 import com.google.common.collect.ImmutableMap;
+
 import org.junit.BeforeClass;
 import org.junit.Test;
 
@@ -33,8 +33,8 @@ import org.apache.cassandra.db.DecoratedKey;
 import org.apache.cassandra.db.Keyspace;
 import org.apache.cassandra.db.Mutation;
 import org.apache.cassandra.db.RowUpdateBuilder;
-import org.apache.cassandra.db.partitions.PartitionUpdate;
 import org.apache.cassandra.db.compaction.TimeSeriesCompactionStrategy;
+import org.apache.cassandra.db.partitions.PartitionUpdate;
 import org.apache.cassandra.exceptions.ConfigurationException;
 import org.apache.cassandra.io.sstable.format.SSTableReader;
 import org.apache.cassandra.schema.CompactionParams;

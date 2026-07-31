@@ -21,6 +21,7 @@ package org.apache.cassandra.db.compaction.timeseries;
 import java.util.ArrayList;
 import java.util.Iterator;
 import java.util.List;
+import java.util.Map;
 import java.util.NavigableMap;
 import java.util.TreeMap;
 import java.util.concurrent.TimeUnit;
@@ -146,7 +147,7 @@ public final class WindowRoutingIterator
         }
 
         NavigableMap<Long, UnfilteredRowIterator> slices = new TreeMap<>();
-        for (var entry : routed.entrySet())
+        for (Map.Entry<Long, List<Unfiltered>> entry : routed.entrySet())
         {
             boolean carriesHeader = entry.getKey() == headerWindow;
             slices.put(entry.getKey(), new WindowSlice(partition,
