@@ -445,16 +445,19 @@ public class ColumnarChunkCodecTest
         assertEquals("dictCount before corruption", 2, bytes[dictCountPos] & 0xFF);
         assertEquals("marker's own length prefix", markerBytes.length, bytes[markerPos - 1] & 0xFF);
 
-        // overwrite the (originally single-byte) dictCount varint with a multi-byte huge-value
-        // varint (continuation bits set); if this reached `new byte[dictCount][]` unguarded, a
-        // ~2^35-entry array would OOM well before this test could complete, so completing at all
-        // -- let alone quickly, with a clean IllegalArgumentException -- is the proof
+        // Overwrite the (originally single-byte) dictCount varint with a multi-byte varint
+        // encoding a large but int-POSITIVE value (~536M, same magnitude as
+        // corruptRowCountThrowsWithoutAllocating). This matters: the earlier FF FF FF FF 7F
+        // pattern here encoded 2^35-1, which truncates to -1 under the `(int)` cast in the
+        // pre-fix code -- `new byte[-1]` throws NegativeArraySizeException, which cursor()'s
+        // pre-existing generic RuntimeException wrapper already converted to
+        // IllegalArgumentException *before this guard existed*, so that pattern did not actually
+        // discriminate fixed from unfixed code (verified by mutation -- see class javadoc note /
+        // fix-round-2 report). A value that survives the cast as a large positive int is required
+        // so only the new dictCount <= MAX_DICTIONARY_SIZE check can stop it before the
+        // `new byte[dictCount][]` allocation.
         byte[] corrupted = bytes.clone();
-        corrupted[dictCountPos] = (byte) 0xFF;
-        corrupted[dictCountPos + 1] = (byte) 0xFF;
-        corrupted[dictCountPos + 2] = (byte) 0xFF;
-        corrupted[dictCountPos + 3] = (byte) 0xFF;
-        corrupted[dictCountPos + 4] = (byte) 0x7F;
+        System.arraycopy(varLongBytes(0x20000000L), 0, corrupted, dictCountPos, 5);
 
         assertThatThrownBy(() -> ColumnarChunkCodec.cursor(ByteBuffer.wrap(corrupted), null))
             .isInstanceOf(IllegalArgumentException.class);
@@ -485,12 +488,10 @@ public class ColumnarChunkCodecTest
         assertEquals("row 0's own length prefix", markerBytes.length, bytes[lenPos] & 0xFF);
         assertEquals("mode byte", 1, bytes[lenPos - 1] & 0xFF);
 
+        // large but int-positive value (~536M), not the sign-flipping 2^35-1 pattern -- see the
+        // comment in corruptDictionaryCountThrowsWithoutAllocating for why that distinction matters
         byte[] corrupted = bytes.clone();
-        corrupted[lenPos] = (byte) 0xFF;
-        corrupted[lenPos + 1] = (byte) 0xFF;
-        corrupted[lenPos + 2] = (byte) 0xFF;
-        corrupted[lenPos + 3] = (byte) 0xFF;
-        corrupted[lenPos + 4] = (byte) 0x7F;
+        System.arraycopy(varLongBytes(0x20000000L), 0, corrupted, lenPos, 5);
 
         assertThatThrownBy(() -> ColumnarChunkCodec.cursor(ByteBuffer.wrap(corrupted), null))
             .isInstanceOf(IllegalArgumentException.class);
@@ -517,12 +518,10 @@ public class ColumnarChunkCodecTest
         int constLenPos = ColumnarChunkCodec.HEADER_SIZE + 5;
         assertEquals("int32's canonical form is 4 bytes", 4, bytes[constLenPos] & 0xFF);
 
+        // large but int-positive value (~536M), not the sign-flipping 2^35-1 pattern -- see the
+        // comment in corruptDictionaryCountThrowsWithoutAllocating for why that distinction matters
         byte[] corrupted = bytes.clone();
-        corrupted[constLenPos] = (byte) 0xFF;
-        corrupted[constLenPos + 1] = (byte) 0xFF;
-        corrupted[constLenPos + 2] = (byte) 0xFF;
-        corrupted[constLenPos + 3] = (byte) 0xFF;
-        corrupted[constLenPos + 4] = (byte) 0x7F;
+        System.arraycopy(varLongBytes(0x20000000L), 0, corrupted, constLenPos, 5);
 
         assertThatThrownBy(() -> ColumnarChunkCodec.cursor(ByteBuffer.wrap(corrupted), null))
             .isInstanceOf(IllegalArgumentException.class);
@@ -553,6 +552,23 @@ public class ColumnarChunkCodecTest
         assertThatThrownBy(() -> ColumnarChunkCodec.rowCount(truncated)).isInstanceOf(IllegalArgumentException.class);
         assertThatThrownBy(() -> ColumnarChunkCodec.firstTimestamp(truncated)).isInstanceOf(IllegalArgumentException.class);
         assertThatThrownBy(() -> ColumnarChunkCodec.lastTimestamp(truncated)).isInstanceOf(IllegalArgumentException.class);
+    }
+
+    /** LEB128 unsigned varint encoding, mirroring ColumnarChunkCodec's private writeVarLong. */
+    private static byte[] varLongBytes(long value)
+    {
+        java.io.ByteArrayOutputStream out = new java.io.ByteArrayOutputStream();
+        while (true)
+        {
+            int low7 = (int) (value & 0x7F);
+            value >>>= 7;
+            if (value == 0)
+            {
+                out.write(low7);
+                return out.toByteArray();
+            }
+            out.write(low7 | 0x80);
+        }
     }
 
     private static int indexOf(byte[] haystack, byte[] needle)

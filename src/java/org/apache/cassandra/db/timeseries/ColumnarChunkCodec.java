@@ -478,9 +478,10 @@ public final class ColumnarChunkCodec
         int dirSize = buffer.getShort() & 0xFFFF;
 
         int dirStart = buffer.position();
+        int dirEnd = dirStart + dirSize;
         List<ColumnMeta> metas = new ArrayList<>(columnCount);
         for (int i = 0; i < columnCount; i++)
-            metas.add(readColumnMeta(buffer));
+            metas.add(readColumnMeta(buffer, dirEnd));
         int dirConsumed = buffer.position() - dirStart;
         if (dirConsumed != dirSize)
             throw new IllegalArgumentException("Corrupt columnar chunk: directory size mismatch (header says " +
@@ -536,7 +537,7 @@ public final class ColumnarChunkCodec
         return new ColumnarCursorImpl(rowCount, timestamps, columnsView, decoded);
     }
 
-    private static ColumnMeta readColumnMeta(ByteBuffer buffer)
+    private static ColumnMeta readColumnMeta(ByteBuffer buffer, int dirEnd)
     {
         byte typeCode = buffer.get();
         byte flags = buffer.get();
@@ -548,7 +549,14 @@ public final class ColumnarChunkCodec
         byte[] constBytes = null;
         if ((flags & FLAG_CONSTANT) != 0)
         {
-            int constLen = checkedLength("constBytes", readVarLong(buffer), buffer.remaining());
+            long constLenRaw = readVarLong(buffer);
+            // bound against what is actually left in the DIRECTORY (not the whole remaining
+            // payload): constBytes lives in the directory, so the directory's own end is the
+            // correct, tighter limit -- bounding against the whole payload would still be memory
+            // safe (the dirConsumed != dirSize check downstream catches an overrun either way) but
+            // would let an implausible constLen slip past this check when the rest of the payload
+            // (timestamps, column data) happens to be large.
+            int constLen = checkedLength("constBytes", constLenRaw, dirEnd - buffer.position());
             constBytes = new byte[constLen];
             buffer.get(constBytes);
         }
