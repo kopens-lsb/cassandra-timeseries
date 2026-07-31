@@ -487,7 +487,11 @@ public class TimeSeriesCompactionStrategyTest
     @Test
     public void farFutureWindowNeverCountsTowardFreeze()
     {
-        // far-future 가드는 분류기 경로에서도 참조된다(스펙 §8): far-future 창은 sstable이 몇 개든 동결 후보가 아니다
+        // Pins end-to-end behavior (spec section 8): a far-future window is never a freeze candidate and
+        // never counts toward the backlog, however many sstables it has. Note this cannot distinguish the
+        // explicit far-future filter in nextFreezeCandidate from the classifier's verdict (any future
+        // window classifies CURRENT under today's predicates, which also skips it) - it pins the
+        // behavior, not the filter; see the precondition-hygiene comment at the filter site.
         TimeSeriesCompactionStrategy tscs = strategy(mock(UnifiedCompactionStrategy.class));
         tscs.addSSTable(sstableAt(NOW + 3L * 24 * HOUR));
         tscs.addSSTable(sstableAt(NOW + 3L * 24 * HOUR + 60_000));

@@ -32,6 +32,10 @@ import org.apache.cassandra.schema.TableMetadata;
  */
 public interface WindowFrozenListener
 {
-    /** 창이 단일 SSTable로 동결(또는 재동결)될 때마다 호출. 멱등해야 한다. */
+    /**
+     * Called every time a window is frozen (or re-frozen) into a single sstable, after the compaction
+     * has committed. Implementations must be idempotent (the same window may be reported more than once)
+     * and must not block: this runs on the compaction thread, so long-running consumers should enqueue.
+     */
     void onWindowFrozen(TableMetadata table, long windowStartMillis, SSTableReader frozen);
 }

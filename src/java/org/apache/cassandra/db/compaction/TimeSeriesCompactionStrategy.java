@@ -138,6 +138,7 @@ public class TimeSeriesCompactionStrategy extends AbstractCompactionStrategy
         }
 
         Map.Entry<Long, Set<SSTableReader>> freeze = nextFreezeCandidate(nowMillis);
+        boolean freezeAttempted = false;
         if (freeze != null)
         {
             // Same zombie filter as the expired branch: only live, non-suspect sstables.
@@ -145,6 +146,7 @@ public class TimeSeriesCompactionStrategy extends AbstractCompactionStrategy
             toFreeze.retainAll(cfs.getLiveSSTables());
             if (toFreeze.size() > 1)                      // a single survivor is already "frozen enough"; self-heals next round
             {
+                freezeAttempted = true;
                 LifecycleTransaction txn = cfs.getTracker().tryModify(toFreeze, OperationType.COMPACTION);
                 if (txn != null)
                 {
@@ -163,6 +165,12 @@ public class TimeSeriesCompactionStrategy extends AbstractCompactionStrategy
                                  freeze.getKey(), cfs.getTableName());
                 previousFreezeCandidate = toFreeze;
             }
+        }
+        if (!freezeAttempted)
+        {
+            // Rounds with no freeze attempt (no candidate, or a lone survivor) break the "consecutive
+            // failures" chain: the repeat-WARN above must mean two attempts in a row on the same set.
+            previousFreezeCandidate = Set.of();
         }
 
         return delegate.getNextBackgroundTasks(gcBefore);
@@ -288,8 +296,13 @@ public class TimeSeriesCompactionStrategy extends AbstractCompactionStrategy
         int backlog = 0;
         for (Map.Entry<Long, Set<SSTableReader>> window : windows().entrySet())
         {
+            // Precondition hygiene for classify's documented contract (callers filter far-future windows
+            // first; spec section 8). Currently redundant defense-in-depth: isCurrentWindow also holds for
+            // any future window, so classify would report CURRENT and the window would be skipped anyway -
+            // but that is a property of today's predicates, not a guarantee. Keep the explicit filter so a
+            // future predicate change cannot silently start freeze-judging garbage timestamps.
             if (tsOptions.isFarFutureWindow(window.getKey(), nowMillis))
-                continue;                                 // far-future guard: never judged for freezing (spec section 8)
+                continue;
             if (window.getValue().size() < 2)
                 continue;
             if (classify(window.getKey(), window.getValue(), nowMillis) != WindowState.FREEZING)
