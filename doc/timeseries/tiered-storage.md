@@ -52,17 +52,18 @@ CREATE TABLE ts.sensor (
 
 ## 2. 정책 설정 — `timeseries_tiering` 테이블 확장
 
-정책은 테이블의 `extensions` 맵에 `timeseries_tiering` 키로 저장된 JSON 문서입니다. `extensions`
-값은 CQL blob 리터럴이므로 JSON을 **hex로 인코딩**해서 넣습니다:
+정책은 테이블의 `extensions` 맵에 `timeseries_tiering` 키로 저장된 JSON 문서입니다. JSON을
+**그대로 문자열로** 넣으면 됩니다 — CQL 한 줄이면 끝입니다:
 
 ```sql
--- JSON: {"hot_window":"1h","chunk_window":"1h","interval":"5m"}
--- hex 생성: printf '%s' '<json>' | od -An -v -tx1 | tr -d ' \n'
 ALTER TABLE ts.sensor WITH extensions = {
-  'timeseries_tiering':
-  0x7b22686f745f77696e646f77223a223168222c226368756e6b5f77696e646f77223a223168222c22696e74657276616c223a22356d227d
+  'timeseries_tiering': '{"hot_window":"1h","chunk_window":"1h","interval":"5m"}'
 };
 ```
+
+`extensions`는 스키마상 blob 맵이라 원래는 hex 리터럴만 받지만, 이 포크는 평문 문자열을 UTF-8
+바이트로 저장한다(`TableAttributes.parseExtensionValue`). `0x`로 시작하는 값만 hex 블롭으로
+해석하므로 기존 hex 표기(`0x7b22...`)도 그대로 유효하다.
 
 정책 해제는 `extensions = {}`로 맵을 비우면 됩니다. 설정된 값은
 `SELECT extensions FROM system_schema.tables WHERE keyspace_name=? AND table_name=?`로 확인합니다.

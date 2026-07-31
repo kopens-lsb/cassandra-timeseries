@@ -59,11 +59,33 @@ public class AlterTableExtensionsTest extends CQLTester
     }
 
     @Test
-    public void testNonHexExtensionValueRejected() throws Throwable
+    public void testPlainStringExtensionStoredAsUtf8() throws Throwable
+    {
+        // Writing a tiering policy as a hex blob by hand is miserable; a plain string is accepted
+        // and stored as its UTF-8 bytes, so one CQL statement is enough.
+        createTable("CREATE TABLE %s (tag text, ts timestamp, value double, PRIMARY KEY (tag, ts));");
+
+        String json = "{\"hot_window\":\"1d\",\"chunk_window\":\"6h\",\"cold_window\":\"365d\"}";
+        alterTable("ALTER TABLE %s WITH extensions = {'" + TieringPolicy.EXTENSION_KEY + "': '" + json + "'};");
+
+        assertEquals(ByteBufferUtil.bytes(json),
+                     getCurrentColumnFamilyStore().metadata().params.extensions.get(TieringPolicy.EXTENSION_KEY));
+
+        TieringPolicy policy = TieringPolicy.fromTable(getCurrentColumnFamilyStore().metadata());
+        assertNotNull(policy);
+        assertEquals(TimeUnit.DAYS.toMillis(1), policy.hotWindowMillis);
+        assertEquals(TimeUnit.HOURS.toMillis(6), policy.chunkWindowMillis);
+        assertEquals(TimeUnit.DAYS.toMillis(365), policy.coldWindowMillis);
+    }
+
+    @Test
+    public void testMalformedHexExtensionValueRejected() throws Throwable
     {
         createTable("CREATE TABLE %s (tag text, ts timestamp, value double, PRIMARY KEY (tag, ts));");
 
+        // A leading 0x still selects hex decoding, so a broken hex literal must fail loudly rather
+        // than being silently stored as the text "0xnothex".
         assertInvalidThrow(InvalidRequestException.class,
-                            "ALTER TABLE %s WITH extensions = {'" + TieringPolicy.EXTENSION_KEY + "': 'not-hex'};");
+                            "ALTER TABLE %s WITH extensions = {'" + TieringPolicy.EXTENSION_KEY + "': '0xnothex'};");
     }
 }

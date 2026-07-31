@@ -216,10 +216,19 @@ public final class TableAttributes extends PropertyDefinitions
         return builder.build();
     }
 
+    /**
+     * Extension values are blobs, but hand-writing a hex literal for what is really a text payload
+     * (the time-series tiering policy is JSON) is miserable, so a plain string is accepted too and
+     * stored as its UTF-8 bytes. Only a leading "0x" selects hex decoding, which keeps every value
+     * expressible: a literal string that must start with "0x" can still be written in hex.
+     */
     private static ByteBuffer parseExtensionValue(String key, String value)
     {
-        if (value == null || !value.startsWith("0x"))
-            throw new InvalidRequestException(format("Invalid value for extension '%s': expected a blob literal (0x...)", key));
+        if (value == null)
+            throw new InvalidRequestException(format("Invalid value for extension '%s': null", key));
+
+        if (!value.startsWith("0x"))
+            return ByteBufferUtil.bytes(value);
 
         try
         {

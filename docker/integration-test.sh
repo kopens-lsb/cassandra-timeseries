@@ -424,10 +424,9 @@ CREATE TABLE IF NOT EXISTS it.sensor (
 " > /dev/null
 
 # Policy: hot_window 1h / chunk_window 1h, so the rows inserted 4 hours in the past below are
-# already closed. The extension value is the policy JSON as a hex blob literal — this constant is
-# hex of exactly (regenerate with: printf '%s' '<json>' | od -An -v -tx1 | tr -d ' \n'):
-#   {"hot_window":"1h","chunk_window":"1h","interval":"5m"}
-TIERING_HEX=7b22686f745f77696e646f77223a223168222c226368756e6b5f77696e646f77223a223168222c22696e74657276616c223a22356d227d
+# already closed. The policy JSON goes in as a plain string (this fork stores non-0x extension
+# values as their UTF-8 bytes), so no hex encoding step is needed.
+TIERING_JSON='{"hot_window":"1h","chunk_window":"1h","interval":"5m"}'
 
 # Hour-aligned chunk window 4 hours in the past (epoch-millis CQL timestamp literals throughout,
 # so the assertions do not depend on any date-formatting tool).
@@ -435,8 +434,8 @@ NOW_MS=$(date +%s%3N)
 WIN_MS=$(( (NOW_MS / 3600000 - 4) * 3600000 ))
 WIN_END_MS=$(( WIN_MS + 3600000 ))
 
-check "ALTER TABLE installs the tiering policy (hex JSON)" \
-    "ALTER TABLE it.sensor WITH extensions = {'timeseries_tiering': 0x$TIERING_HEX};
+check "ALTER TABLE installs the tiering policy (plain JSON string)" \
+    "ALTER TABLE it.sensor WITH extensions = {'timeseries_tiering': '$TIERING_JSON'};
      SELECT extensions FROM system_schema.tables WHERE keyspace_name='it' AND table_name='sensor';" \
     'timeseries_tiering'
 

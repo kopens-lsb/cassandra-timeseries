@@ -60,6 +60,7 @@ FROM ts.metrics WHERE series='cpu' GROUP BY series, time_bucket_gapfill(1h, ts, 
 | [Continuous Aggregates 설계 (continuous-aggregates-design.md)](doc/timeseries/continuous-aggregates-design.md) | 시간 버킷 롤업(연속 집계) 설계안 — 진행 중 |
 | **[풀텍스트 검색 (fulltext-search.md)](doc/timeseries/fulltext-search.md)** | SAI `LIKE` + `index_analyzer` — 로그/메시지 본문 부분문자열 검색 (한글 포함) |
 | **[계층화 벤치마크 (tiering-benchmark.md)](doc/timeseries/tiering-benchmark.md)** | 1억 건 전/후 실측 — 저장 2.1×↓(풀정밀 최악 케이스), 재인코딩 265k rows/s, 동일 결과로 질의 5~8× 가속 |
+| **[운영 튜닝 가이드 (operations-tuning.md)](doc/timeseries/operations-tuning.md)** | 장기 보존(5년) 전환 실전 가이드 — 용량 산수, 적용 순서, 원본·**청크 테이블** 튜닝값과 근거, TTL과 계층화의 관계, 점검 목록 |
 | **[계층형 저장 (tiered-storage.md)](doc/timeseries/tiered-storage.md)** | `timeseries_tiering` 정책·청크 재인코더 — 설정, 청크 조회 패턴, 운영(nodetool/가상 테이블), 불변식과 제한사항 |
 | [통합 테스트 보고서](doc/timeseries/integration-test-report.md) | 실제 컨테이너에서 실행한 52개 검증의 CQL·결과·소요 시간 |
 | [스케일 테스트 보고서 (1억 건)](doc/timeseries/scale-test-report.md) | 1억 행 적재 후 측정한 쿼리별 CQL 실행 시간 |
@@ -457,26 +458,21 @@ CREATE TABLE ts.sensor (
 );
 ```
 
-### 12.2 압축 켜기 (3단계)
+### 12.2 압축 켜기 — CQL 한 줄
 
-정책은 테이블 `extensions`에 JSON을 hex로 넣습니다. **hex는 아래 한 줄로 만드세요**:
-
-```bash
-# 1) 정책 JSON → hex
-echo -n '{"hot_window":"7d","chunk_window":"1h","cold_window":"365d","interval":"1h","codec":"auto"}' \
-  | xxd -p | tr -d '\n'
-# → 7b22686f745f77696e646f77223a223764222c...
-```
+정책 JSON을 테이블 `extensions`에 그대로 넣으면 끝입니다 (hex 변환 불필요):
 
 ```sql
--- 2) 테이블에 적용 (위 출력 앞에 0x 를 붙여 그대로 사용)
 ALTER TABLE ts.sensor WITH extensions = {
-  'timeseries_tiering': 0x7b22686f745f77696e646f77223a223764222c226368756e6b5f77696e646f77223a223168222c22636f6c645f77696e646f77223a2233363564222c22696e74657276616c223a223168222c22636f646563223a226175746f227d
+  'timeseries_tiering': '{"hot_window":"1d","chunk_window":"6h","cold_window":"365d","interval":"1h","codec":"auto"}'
 };
 
--- 3) 적용 확인 (정책과 실행 통계가 함께 보입니다)
+-- 적용 확인 (정책과 실행 통계가 함께 보입니다)
 SELECT * FROM system_views.timeseries_tiering;
 ```
+
+> `extensions`는 스키마상 blob 맵이지만, 이 포크는 **평문 문자열을 UTF-8 바이트로 저장**합니다.
+> `0x`로 시작하는 값만 hex 블롭으로 해석하므로 기존 hex 표기(`0x7b22...`)도 그대로 동작합니다.
 
 적용 후에는 60초 스위퍼가 `interval` 주기로 알아서 압축합니다. **바로 확인하고 싶으면** 수동으로 한 사이클 실행:
 
