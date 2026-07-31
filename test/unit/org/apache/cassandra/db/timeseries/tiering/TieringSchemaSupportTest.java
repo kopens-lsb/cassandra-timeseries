@@ -233,25 +233,44 @@ public class TieringSchemaSupportTest extends CQLTester
     {
         // The whole reason static columns need no rules: the re-encoder deletes a clustering RANGE,
         // and static cells live outside every clustering range, so they are untouched by construction.
+        // Shape mirrors the production table: several statics of mixed type alongside several regular
+        // columns, so this also proves the many-column delete does not reach the statics.
         createTable("CREATE TABLE %s (tag text, ts timestamp, site_id text static, unit text static, " +
-                    "value double, PRIMARY KEY (tag, ts))");
+                    "installed_at timestamp static, channels int static, " +
+                    "value double, quality int, note text, PRIMARY KEY (tag, ts))");
         setPolicy("{\"hot_window\":\"2h\",\"chunk_window\":\"1h\"}");
 
-        execute("INSERT INTO %s (tag, site_id, unit) VALUES ('t1', 'seoul', 'celsius') USING TIMESTAMP 100");
-        execute("INSERT INTO %s (tag, ts, value) VALUES ('t1', ?, 1.0) USING TIMESTAMP 101", new Date(10 * 60_000L));
-        execute("INSERT INTO %s (tag, ts, value) VALUES ('t1', ?, 2.0) USING TIMESTAMP 102", new Date(20 * 60_000L));
+        execute("INSERT INTO %s (tag, site_id, unit, installed_at, channels) " +
+                "VALUES ('t1', 'seoul', 'celsius', ?, 4) USING TIMESTAMP 100", new Date(1_000_000L));
+        execute("INSERT INTO %s (tag, ts, value, quality, note) VALUES ('t1', ?, 1.0, 192, 'ok') " +
+                "USING TIMESTAMP 101", new Date(10 * 60_000L));
+        execute("INSERT INTO %s (tag, ts, value, quality, note) VALUES ('t1', ?, 2.0, 192, 'ok') " +
+                "USING TIMESTAMP 102", new Date(20 * 60_000L));
 
         assertEquals(1, new TieredStorageService().runOnce(KEYSPACE, currentTable(), 5 * HOUR).windowsEncoded);
 
         // Every base row of the encoded window is gone...
         assertEquals(0, raw("SELECT ts FROM %s WHERE tag = 't1' AND ts < ?", new Date(HOUR)).size());
 
-        // ...and the static cells are still there, at their original writetime.
-        UntypedResultSet statics = raw("SELECT site_id, unit, WRITETIME(site_id) AS wt FROM %s WHERE tag = 't1'");
+        // ...and every static cell is still there, at its original writetime.
+        UntypedResultSet statics = raw("SELECT site_id, unit, installed_at, channels, WRITETIME(site_id) AS wt " +
+                                       "FROM %s WHERE tag = 't1'");
         assertEquals(1, statics.size());
         assertEquals("seoul", statics.one().getString("site_id"));
         assertEquals("celsius", statics.one().getString("unit"));
+        assertEquals(new Date(1_000_000L), statics.one().getTimestamp("installed_at"));
+        assertEquals(4, statics.one().getInt("channels"));
         assertEquals(100L, statics.one().getLong("wt"));
+
+        // ...and every regular column of the chunked rows still reads back through the merge.
+        UntypedResultSet merged = execute("SELECT ts, value, quality, note FROM %s WHERE tag = 't1' AND ts < ?",
+                                          new Date(HOUR));
+        assertEquals(2, merged.size());
+        for (UntypedResultSet.Row row : merged)
+        {
+            assertEquals(192, row.getInt("quality"));
+            assertEquals("ok", row.getString("note"));
+        }
     }
 
     // ---- default_time_to_live vs hot_window ----

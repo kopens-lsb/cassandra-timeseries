@@ -64,6 +64,15 @@ public final class ColumnarChunkCodec
     public static final int HEADER_SIZE = 25;
 
     /**
+     * Hard per-chunk row limit. The format itself would take any positive {@code int}, but a chunk
+     * is decoded whole (every projected column materialises one {@code ByteBuffer[rowCount]}), so an
+     * unbounded row count is an unbounded allocation on the read path. Callers that assemble chunks
+     * from live data (the tiering re-encoder) pre-check against this while still paging, so an
+     * over-dense window is reported as a configuration problem instead of failing here.
+     */
+    public static final int MAX_ROWS = 16_777_216;
+
+    /**
      * Type code {@code 0x00} was DOUBLE_GORILLA, dropped when chimp128 became the only double
      * codec. It is permanently reserved -- never reassigned to another type -- and rejected on
      * read by {@link #readColumnMeta} with a message naming it, so a v3 chunk written by the
@@ -113,6 +122,8 @@ public final class ColumnarChunkCodec
     {
         if (count < 1)
             throw new IllegalArgumentException("count must be >= 1, got " + count);
+        if (count > MAX_ROWS)
+            throw new IllegalArgumentException("count " + count + " exceeds MAX_ROWS " + MAX_ROWS);
         if (timestamps.length < count)
             throw new IllegalArgumentException("timestamps array shorter than count " + count);
         for (int i = 1; i < count; i++)

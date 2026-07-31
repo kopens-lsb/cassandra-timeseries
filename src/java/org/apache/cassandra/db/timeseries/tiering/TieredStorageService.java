@@ -22,10 +22,12 @@ import java.util.ArrayList;
 import java.util.Arrays;
 import java.util.Collection;
 import java.util.Collections;
+import java.util.HashSet;
 import java.util.LinkedHashSet;
 import java.util.List;
 import java.util.Map;
 import java.util.Set;
+import java.util.SortedMap;
 import java.util.TreeMap;
 import java.util.concurrent.ConcurrentHashMap;
 import java.util.concurrent.TimeUnit;
@@ -47,12 +49,11 @@ import org.apache.cassandra.cql3.UntypedResultSet;
 import org.apache.cassandra.db.ConsistencyLevel;
 import org.apache.cassandra.db.marshal.AbstractType;
 import org.apache.cassandra.db.marshal.ByteType;
-import org.apache.cassandra.db.marshal.DoubleType;
 import org.apache.cassandra.db.marshal.Int32Type;
 import org.apache.cassandra.db.marshal.LongType;
 import org.apache.cassandra.db.marshal.TimestampType;
-import org.apache.cassandra.db.timeseries.ChunkCodecs;
-import org.apache.cassandra.db.timeseries.SampleCursor;
+import org.apache.cassandra.db.timeseries.ColumnarChunkCodec;
+import org.apache.cassandra.db.timeseries.ColumnarCursor;
 import org.apache.cassandra.db.timeseries.UnsupportedChunkFormatException;
 import org.apache.cassandra.dht.Range;
 import org.apache.cassandra.dht.Token;
@@ -75,9 +76,16 @@ import org.apache.cassandra.utils.NoSpamLogger;
 import static java.lang.String.format;
 
 /**
- * Background re-encoder that turns closed, hot-window-expired time-series rows into Chimp128
- * chunks in a shadow {@code "<table>__chunks"} table (see {@link ChunkTables}), then tombstones the
- * source rows it just encoded.
+ * Background re-encoder that turns closed, hot-window-expired time-series rows into columnar
+ * chunks ({@link ColumnarChunkCodec}, format version 3) in a shadow {@code "<table>__chunks"} table
+ * (see {@link ChunkTables}), then tombstones the source rows it just encoded.
+ * <p>
+ * <b>Every regular column is encoded</b>, not a designated value column: one chunk per (partition
+ * key, window) carries the window's shared timestamp axis plus one independently-compressed section
+ * per regular column, each column's values being the exact serialized bytes Cassandra stored (see
+ * {@link ChunkColumnTypes}). A null cell round-trips as null, never as a default. Static columns are
+ * not chunked and are untouched: the source-row delete is a clustering-range delete, and static cells
+ * live outside every clustering range.
  * <p>
  * {@link #runOnce} is the whole cycle for one (keyspace, table) pair, run synchronously and
  * idempotently -- see docs/superpowers/plans/2026-07-31-chunk-store-sp2.md ("재인코딩 사이클") for the
@@ -96,7 +104,10 @@ import static java.lang.String.format;
  *     <li>The range delete of source rows for a re-encoded window always uses
  *     {@code USING TIMESTAMP <maxWritetimeOfRowsEncodedIntoTheChunk>}, so a row written after this
  *     cycle read the window (a "late" row) has a newer write timestamp than the tombstone and
- *     survives it -- to be merged into the chunk on a subsequent cycle.</li>
+ *     survives it -- to be merged into the chunk on a subsequent cycle. With many columns that
+ *     maximum is taken over <b>every column's cell writetime of every row read</b>, plus the
+ *     writetime the chunk being replaced was built from; a window that yields no cell writetime at
+ *     all is left completely untouched rather than deleted at a guessed timestamp.</li>
  * </ul>
  * <p>
  * Per-tag work is memory-bounded: rather than reading every closed row for a tag into one list,
@@ -156,14 +167,14 @@ public class TieredStorageService implements TieredStorageServiceMBean
 
     /**
      * Hard cap on the samples a single (tag, window) may accumulate in one cycle -- the codec's
-     * per-chunk limit ({@link ChunkCodecs#MAX_SAMPLES}), pre-checked here so an over-dense window is
-     * aborted while still paging (memory stays bounded) with an actionable error, instead of being
-     * fully materialized and then blowing up in {@code ChunkCodecs.encode} every cycle forever.
+     * per-chunk limit ({@link ColumnarChunkCodec#MAX_ROWS}), pre-checked here so an over-dense window
+     * is aborted while still paging (memory stays bounded) with an actionable error, instead of being
+     * fully materialized and then blowing up in {@code ColumnarChunkCodec.encode} every cycle forever.
      * Non-final only as a test seam: shrinking it lets a test trigger the abort with a handful of
      * rows; production code must never write it.
      */
     @VisibleForTesting
-    volatile int maxSamplesPerWindow = ChunkCodecs.MAX_SAMPLES;
+    volatile int maxSamplesPerWindow = ColumnarChunkCodec.MAX_ROWS;
 
     /**
      * Registers the {@value #MBEAN_NAME} MBean and schedules the single, process-wide sweep
@@ -410,18 +421,17 @@ public class TieredStorageService implements TieredStorageServiceMBean
             return stats;
         }
 
-        // TEMPORARY (deleted when the re-encoder moves to the columnar chunk format): the encoder below
-        // still writes a single-column chunk, so it can only carry one double regular column even though
-        // the schema check above now accepts arbitrary shapes. Encoding one column and range-deleting
-        // the row would destroy every other column, so refuse instead.
-        if (base.regularColumns().size() != 1 || !base.regularColumns().iterator().next().type.equals(DoubleType.instance))
+        if (base.regularColumns().isEmpty())
         {
-            logger.error("Tiered storage runOnce skipped: {}.{} is a supported time-series schema, but the " +
-                         "re-encoder still writes single-column chunks and can only encode exactly one double " +
-                         "regular column; this table's regular columns are [{}]. Multi-column encoding lands " +
-                         "with the columnar chunk format",
-                         keyspace, table, columnList(base.regularColumns()));
-            return stats;
+            // Accepted by the schema check (the timestamp axis is itself data), but unencodable in
+            // practice: with no regular column there is no cell writetime anywhere in the table, and
+            // the range delete has no timestamp it could safely use. Every window is therefore left
+            // untouched below; say so once rather than letting tiering look like it is working.
+            NoSpamLogger.log(logger, NoSpamLogger.Level.WARN, key(keyspace, table) + ":no-regular-columns",
+                             1, TimeUnit.HOURS,
+                             "Tiered storage: {}.{} has no regular columns, so no cell writetime exists to bound " +
+                             "the re-encoder's range delete with -- no window will ever be encoded or deleted. " +
+                             "Tiering is a no-op for this table (cold-chunk expiry still runs).", keyspace, table);
         }
 
         String ttlWarning = TieringPolicy.ttlShadowsHotWindowWarning(base, policy);
@@ -438,7 +448,24 @@ public class TieredStorageService implements TieredStorageServiceMBean
 
         List<ColumnMetadata> tagColumns = base.partitionKeyColumns();
         ColumnMetadata tsColumn = base.clusteringColumns().get(0);
-        ColumnMetadata valueColumn = base.regularColumns().iterator().next();
+        // EVERY regular column is chunked. Columns iterates in name order (BTree-backed and
+        // deterministic -- Columns.java), which is also the order ColumnarChunkCodec writes its
+        // directory in, so the encoded payload is byte-stable across runs, nodes and JVMs. That
+        // stability is what lets a re-run recognise it has nothing new to write (see chunkUnchanged).
+        List<ColumnMetadata> valueColumns = new ArrayList<>();
+        for (ColumnMetadata column : base.regularColumns())
+            valueColumns.add(column);
+        int valueCount = valueColumns.size();
+        String[] valueRawNames = new String[valueCount];
+        String[] writetimeAliases = new String[valueCount];
+        byte[] valueTypeCodes = new byte[valueCount];
+        String writetimePrefix = writetimeAliasPrefix(base, valueCount);
+        for (int c = 0; c < valueCount; c++)
+        {
+            valueRawNames[c] = valueColumns.get(c).name.toString();
+            writetimeAliases[c] = writetimePrefix + c;
+            valueTypeCodes[c] = ChunkColumnTypes.typeCodeFor(valueColumns.get(c).type);
+        }
 
         // Every chunk-table query names the base table's WHOLE partition key: `tagCqlList` for select/
         // insert column lists, `tagPredicate` for the single-partition restriction. With a one-column
@@ -446,10 +473,8 @@ public class TieredStorageService implements TieredStorageServiceMBean
         String tagCqlList = columnList(tagColumns);
         String tagPredicate = equalityPredicate(tagColumns);
         String tsCql = tsColumn.name.toCQLString();
-        String valueCql = valueColumn.name.toCQLString();
         List<String> tagRawNames = rawNames(tagColumns);
         String tsRaw = tsColumn.name.toString();
-        String valueRaw = valueColumn.name.toString();
         String baseRef = base.toString();
 
         ConsistencyLevel cl = policy.consistency;
@@ -457,11 +482,10 @@ public class TieredStorageService implements TieredStorageServiceMBean
 
         // Reused/grown across every window of every tag this call -- not reallocated per window.
         long[] tsBuf = new long[1024];
-        double[] valBuf = new double[1024];
-        // Rows with a null value/writetime cell are common (e.g. a bare tag+ts insert, or a
-        // TTL-expired value) and expected, not exceptional -- summarized once at the end of the run
-        // rather than logged per row.
-        long[] nullCellsSkipped = { 0 };
+        // A window whose rows carry no cell writetime at all cannot be tombstoned safely, so it is
+        // left untouched. Expected (a window holding only bare primary-key inserts) rather than
+        // exceptional -- summarized once at the end of the run rather than logged per window.
+        long[] windowsWithoutWritetime = { 0 };
 
         // Bounded, per-window queries -- see the class javadoc. "oldest"/"next" only ever return the
         // single row needed to locate the next window with work; the row scan itself is restricted to
@@ -475,9 +499,18 @@ public class TieredStorageService implements TieredStorageServiceMBean
         // leap over every window between here and the cutoff instead of landing on the next one.
         String nextRowQuery = format("SELECT %s FROM %s WHERE %s AND %s >= ? AND %s < ? ORDER BY %s ASC LIMIT 1",
                                      tsCql, baseRef, tagPredicate, tsCql, tsCql, tsCql);
-        String windowRowsQuery = format("SELECT %s, %s, WRITETIME(%s) AS wt FROM %s WHERE %s AND %s >= ? " +
-                                        "AND %s < ? ORDER BY %s ASC",
-                                        tsCql, valueCql, valueCql, baseRef, tagPredicate, tsCql, tsCql, tsCql);
+        // The timestamp axis, then every regular column, then every regular column's cell writetime
+        // under an alias. WRITETIME is per COLUMN, so a multi-column row has one per column and the
+        // delete timestamp has to be the maximum over all of them (a row updated column-by-column has
+        // as many distinct writetimes as it has columns).
+        StringBuilder windowSelection = new StringBuilder(tsCql);
+        for (ColumnMetadata column : valueColumns)
+            windowSelection.append(", ").append(column.name.toCQLString());
+        for (int c = 0; c < valueCount; c++)
+            windowSelection.append(", WRITETIME(").append(valueColumns.get(c).name.toCQLString())
+                           .append(") AS ").append(writetimeAliases[c]);
+        String windowRowsQuery = format("SELECT %s FROM %s WHERE %s AND %s >= ? AND %s < ? ORDER BY %s ASC",
+                                        windowSelection, baseRef, tagPredicate, tsCql, tsCql, tsCql);
         String existingChunkQuery = format("SELECT payload, max_row_writetime, WRITETIME(payload) AS chunk_wt " +
                                            "FROM %s WHERE %s AND window_start = ?", chunkRef, tagPredicate);
         String insertChunkQuery = format("INSERT INTO %s (%s, window_start, codec, samples, max_row_writetime, payload) " +
@@ -546,41 +579,79 @@ public class TieredStorageService implements TieredStorageServiceMBean
                             boundTo(tag, TimestampType.instance.fromTimeInMillis(windowStart)));
                     UntypedResultSet.Row existingRow = (existingRs == null || existingRs.isEmpty()) ? null : existingRs.one();
 
-                    TreeMap<Long, Double> merged = new TreeMap<>();
+                    // ts -> one slot per regular column, in valueColumns order; a null slot is a null
+                    // cell and stays null all the way into the chunk (v3 encodes presence per column).
+                    TreeMap<Long, ByteBuffer[]> merged = new TreeMap<>();
                     long maxWt = Long.MIN_VALUE;
                     long existingChunkWt = Long.MIN_VALUE;
+                    ByteBuffer existingPayload = null;
+                    // Whether maxWt is a real writetime rather than the Long.MIN_VALUE sentinel. It is
+                    // the precondition for issuing the range delete at all.
+                    boolean haveWritetime = false;
                     if (existingRow != null)
                     {
-                        SampleCursor cursor = ChunkCodecs.cursor(existingRow.getBytes("payload"));
+                        existingPayload = existingRow.getBytes("payload");
+                        ColumnarCursor cursor = ColumnarChunkCodec.cursor(existingPayload, null);
                         while (cursor.advance())
-                            merged.put(cursor.timestamp(), cursor.value());
+                        {
+                            ByteBuffer[] values = new ByteBuffer[valueCount];
+                            for (int c = 0; c < valueCount; c++)
+                                // null for a column this chunk does not carry (ADDed to the table after
+                                // the chunk was written); a column the chunk carries but the table has
+                                // since DROPped is simply never asked for, so it drops out here.
+                                values[c] = cursor.getBytes(valueRawNames[c]);
+                            merged.put(cursor.timestamp(), values);
+                        }
                         maxWt = existingRow.getLong("max_row_writetime");
                         existingChunkWt = existingRow.getLong("chunk_wt");
+                        haveWritetime = true;
                     }
 
                     int rowsThisWindow = 0;
                     for (UntypedResultSet.Row row : windowRows)
                     {
-                        // A row with no live value cell (bare tag+ts insert, an explicit `DELETE value`,
-                        // an expired TTL, ...) has nothing to encode and no writetime to trust for the
-                        // delete below -- skip it rather than NPE-ing on getDouble/getLong(null).
-                        if (!row.has(valueRaw) || !row.has("wt"))
+                        long rowTs = row.getTimestamp(tsRaw).getTime();
+                        // PER-COLUMN merge, not row-level replace: a base row that reappears at a
+                        // timestamp the chunk already holds is a partial update of that stored row
+                        // (`UPDATE t SET quality = ? WHERE ...` writes ONE cell and leaves the others
+                        // alone -- exactly Cassandra's own per-cell last-write-wins). Replacing the
+                        // whole row would blank every column the update did not mention.
+                        ByteBuffer[] values = merged.get(rowTs);
+                        if (values == null)
                         {
-                            nullCellsSkipped[0]++;
-                            continue;
+                            values = new ByteBuffer[valueCount];
+                            merged.put(rowTs, values);
                         }
-                        // Rows always win over the previously-encoded chunk on a ts collision -- they are
-                        // by definition a rewrite of that timestamp with a newer write time.
-                        merged.put(row.getTimestamp(tsRaw).getTime(), row.getDouble(valueRaw));
-                        maxWt = Math.max(maxWt, row.getLong("wt"));
+                        for (int c = 0; c < valueCount; c++)
+                        {
+                            // A live cell wins over whatever the chunk held; a null one leaves the
+                            // chunk's value in place (see above). row.has() is "the cell is present",
+                            // and an empty-but-present value (e.g. text '') counts as present.
+                            if (row.has(valueRawNames[c]))
+                                values[c] = row.getBytes(valueRawNames[c]);
+                            // Every column's writetime feeds the maximum -- the delete below must not
+                            // outrun the newest cell of any column of any row it is about to destroy.
+                            if (row.has(writetimeAliases[c]))
+                            {
+                                maxWt = Math.max(maxWt, row.getLong(writetimeAliases[c]));
+                                haveWritetime = true;
+                            }
+                        }
+                        // Rows with every regular column null (a bare primary-key insert, or a row whose
+                        // cells were all deleted/TTL'd) are ENCODED, not skipped: the row exists, the
+                        // range delete would take it, and a chunk that omitted it would be silent data
+                        // loss. It contributes no writetime, which is why haveWritetime is tracked
+                        // separately from "the window had rows".
                         rowsThisWindow++;
                     }
 
-                    if (merged.isEmpty())
+                    if (!haveWritetime)
                     {
-                        // Every row in the window was null-valued and there was no prior chunk to carry
-                        // forward -- nothing to encode, and no trustworthy writetime to tombstone with, so
-                        // leave the window untouched; it is retried (cheaply) on every future cycle.
+                        // Not one cell writetime anywhere in this window, and no prior chunk to inherit
+                        // one from: there is no timestamp the range delete could use that is provably
+                        // not newer than some row it would destroy. Leave the window entirely alone --
+                        // nothing encoded, nothing deleted -- and retry (cheaply) on a future cycle.
+                        windowsWithoutWritetime[0]++;
                         windowStart = windowEnd;
                         continue;
                     }
@@ -604,35 +675,54 @@ public class TieredStorageService implements TieredStorageServiceMBean
                         while (newLength < count)
                             newLength *= 2;
                         tsBuf = Arrays.copyOf(tsBuf, newLength);
-                        valBuf = Arrays.copyOf(valBuf, newLength);
                     }
+                    ByteBuffer[][] columnValues = new ByteBuffer[valueCount][count];
                     int idx = 0;
-                    for (Map.Entry<Long, Double> sample : merged.entrySet())
+                    for (Map.Entry<Long, ByteBuffer[]> sample : merged.entrySet())
                     {
                         tsBuf[idx] = sample.getKey();
-                        valBuf[idx] = sample.getValue();
+                        ByteBuffer[] values = sample.getValue();
+                        for (int c = 0; c < valueCount; c++)
+                            columnValues[c][idx] = values[c];
                         idx++;
                     }
+                    SortedMap<String, ColumnarChunkCodec.ColumnInput> columns = new TreeMap<>();
+                    for (int c = 0; c < valueCount; c++)
+                        columns.put(valueRawNames[c],
+                                    new ColumnarChunkCodec.ColumnInput(valueTypeCodes[c], columnValues[c]));
 
-                    ByteBuffer payload = ChunkCodecs.encode(tsBuf, valBuf, count);
+                    ByteBuffer payload = ColumnarChunkCodec.encode(tsBuf, count, columns);
                     // Read the version byte back out of the payload rather than naming a codec
                     // constant here: the `codec` column must describe what was actually written, so
                     // it stays honest if the encode path ever changes underneath this call.
                     byte codecByte = payload.get(payload.position());
 
-                    // Always write strictly after both the rows just encoded AND the chunk row being
-                    // replaced -- guards a crash-then-backfill corner where maxWt+1 could otherwise land
-                    // exactly on the existing chunk's own write timestamp and tie (same-timestamp writes
-                    // to different columns of the same row can resolve per-column, tearing the chunk).
-                    long insertTs = Math.max(maxWt + 1, existingChunkWt + 1);
+                    // The encoding is deterministic, so identical content encodes to identical bytes:
+                    // if the stored chunk already IS what we just built, and it was built from the same
+                    // maximum writetime, re-writing it would only bump its own write timestamp. Skip the
+                    // write (the delete below still runs -- this is also what completes an interrupted
+                    // cycle that wrote the chunk and died before the delete).
+                    boolean chunkUnchanged = existingPayload != null
+                                             && maxWt == existingRow.getLong("max_row_writetime")
+                                             && payload.equals(existingPayload);
 
-                    QueryProcessor.process(insertChunkQuery, cl, boundTo(tag,
-                            TimestampType.instance.fromTimeInMillis(windowStart),
-                            ByteType.instance.decompose(codecByte),
-                            Int32Type.instance.decompose(count),
-                            LongType.instance.decompose(maxWt),
-                            payload,
-                            LongType.instance.decompose(insertTs)));
+                    if (!chunkUnchanged)
+                    {
+                        // Always write strictly after both the rows just encoded AND the chunk row being
+                        // replaced -- guards a crash-then-backfill corner where maxWt+1 could otherwise
+                        // land exactly on the existing chunk's own write timestamp and tie (same-timestamp
+                        // writes to different columns of the same row can resolve per-column, tearing the
+                        // chunk).
+                        long insertTs = Math.max(maxWt + 1, existingChunkWt + 1);
+
+                        QueryProcessor.process(insertChunkQuery, cl, boundTo(tag,
+                                TimestampType.instance.fromTimeInMillis(windowStart),
+                                ByteType.instance.decompose(codecByte),
+                                Int32Type.instance.decompose(count),
+                                LongType.instance.decompose(maxWt),
+                                payload,
+                                LongType.instance.decompose(insertTs)));
+                    }
 
                     // The USING TIMESTAMP marker precedes the WHERE clause, so this is the one query
                     // whose tag values are not the leading binds.
@@ -643,11 +733,16 @@ public class TieredStorageService implements TieredStorageServiceMBean
                     deleteValues.add(TimestampType.instance.fromTimeInMillis(readEnd));
                     QueryProcessor.process(deleteRowsQuery, cl, deleteValues);
 
-                    stats.windowsEncoded++;
-                    stats.rowsEncoded += rowsThisWindow;
-                    if (existingRow != null)
-                        stats.lateMerges++;
-                    stats.bytesWritten += payload.remaining();
+                    // Counted only when a chunk was actually written -- a suppressed re-write encoded
+                    // nothing new, and reporting it would make an idle table look like it is churning.
+                    if (!chunkUnchanged)
+                    {
+                        stats.windowsEncoded++;
+                        stats.rowsEncoded += rowsThisWindow;
+                        if (existingRow != null)
+                            stats.lateMerges++;
+                        stats.bytesWritten += payload.remaining();
+                    }
 
                     windowStart = windowEnd;
                 }
@@ -674,10 +769,12 @@ public class TieredStorageService implements TieredStorageServiceMBean
             }
         }
 
-        if (nullCellsSkipped[0] > 0)
+        if (windowsWithoutWritetime[0] > 0)
         {
-            logger.warn("Tiered storage runOnce: {}.{} skipped {} row(s) with no live value cell to encode " +
-                        "(bare key insert, deleted value, or expired TTL)", keyspace, table, nullCellsSkipped[0]);
+            logger.warn("Tiered storage runOnce: {}.{} left {} closed window(s) untouched: no row in them carries a " +
+                        "cell writetime (every regular column is null on every row -- bare key inserts, deleted " +
+                        "values, or expired TTLs), so there is no timestamp the source-row delete could safely use",
+                        keyspace, table, windowsWithoutWritetime[0]);
         }
 
         // Cold expiry enumerates tags from the CHUNK table, not the base table (SP3 R6): a tag whose
@@ -712,6 +809,33 @@ public class TieredStorageService implements TieredStorageServiceMBean
         }
 
         return stats;
+    }
+
+    /**
+     * Picks the prefix for the {@code WRITETIME(col) AS <prefix><i>} aliases the window-rows query
+     * uses, such that none of the {@code count} aliases collides with a real column name of
+     * {@code base} -- a collision would make {@code UntypedResultSet.Row} lookups by name ambiguous
+     * and silently mix a column's value up with a writetime. Grows the prefix (rather than the index)
+     * so the aliases stay a contiguous {@code prefix0..prefixN-1} block.
+     */
+    private static String writetimeAliasPrefix(TableMetadata base, int count)
+    {
+        Set<String> taken = new HashSet<>();
+        for (ColumnMetadata column : base.columnsInFixedOrder())
+            taken.add(column.name.toString());
+
+        String prefix = "wt_";
+        while (collides(prefix, count, taken))
+            prefix = '_' + prefix;
+        return prefix;
+    }
+
+    private static boolean collides(String prefix, int count, Set<String> taken)
+    {
+        for (int i = 0; i < count; i++)
+            if (taken.contains(prefix + i))
+                return true;
+        return false;
     }
 
     /** @return {@code "a, b, c"} -- the columns' CQL names, for a select/insert column list. */

@@ -28,6 +28,12 @@ import java.nio.ByteOrder;
  * throw {@link IllegalArgumentException}, matching the per-codec behaviour these methods delegate
  * to; version 1 (the removed gorilla codec) is just another unrecognised version.
  * <p>
+ * <b>Nothing in the tiering path uses the single-column format any more</b>: the re-encoder writes
+ * and transparent reads decode {@link ColumnarChunkCodec} (version 3) exclusively, so the methods
+ * below have no production callers left and survive only as the still-tested library the removed
+ * path was built on. {@link #unsupportedVersion} is the exception -- {@link ColumnarChunkCodec}
+ * shares it so that "which version bytes are a format vs. corruption" is decided in one place.
+ * <p>
  * Version 3 ({@link ColumnarChunkCodec}, the many-columns-per-chunk format) is a different shape
  * entirely -- many named columns instead of one {@link SampleCursor}-style value stream -- so it is
  * out of scope for the methods here, which assume a single value per timestamp. {@link #cursor}

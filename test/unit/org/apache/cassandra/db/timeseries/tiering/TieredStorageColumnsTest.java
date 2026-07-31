@@ -1,0 +1,476 @@
+/*
+ * Licensed to the Apache Software Foundation (ASF) under one
+ * or more contributor license agreements.  See the NOTICE file
+ * distributed with this work for additional information
+ * regarding copyright ownership.  The ASF licenses this file
+ * to you under the Apache License, Version 2.0 (the
+ * "License"); you may not use this file except in compliance
+ * with the License.  You may obtain a copy of the License at
+ *
+ *     http://www.apache.org/licenses/LICENSE-2.0
+ *
+ * Unless required by applicable law or agreed to in writing, software
+ * distributed under the License is distributed on an "AS IS" BASIS,
+ * WITHOUT WARRANTIES OR CONDITIONS OF ANY KIND, either express or implied.
+ * See the License for the specific language governing permissions and
+ * limitations under the License.
+ */
+package org.apache.cassandra.db.timeseries.tiering;
+
+import java.nio.ByteBuffer;
+import java.util.Date;
+import java.util.LinkedHashMap;
+import java.util.List;
+import java.util.Map;
+
+import org.junit.Test;
+
+import org.apache.cassandra.cql3.CQLTester;
+import org.apache.cassandra.cql3.UntypedResultSet;
+import org.apache.cassandra.db.marshal.BooleanType;
+import org.apache.cassandra.db.marshal.DoubleType;
+import org.apache.cassandra.db.marshal.Int32Type;
+import org.apache.cassandra.db.marshal.MapType;
+import org.apache.cassandra.db.marshal.UTF8Type;
+import org.apache.cassandra.db.timeseries.ColumnarChunkCodec;
+import org.apache.cassandra.db.timeseries.ColumnarCursor;
+import org.apache.cassandra.db.timeseries.tiering.TieredStorageService.TierRunStats;
+import org.apache.cassandra.utils.ByteBufferUtil;
+
+import static org.junit.Assert.assertEquals;
+import static org.junit.Assert.assertFalse;
+import static org.junit.Assert.assertTrue;
+
+/**
+ * SP4 Task 3: the re-encoder chunks <b>every</b> regular column, not a designated value column.
+ * <p>
+ * These are the correctness tests for the code that deletes production rows after encoding them, so
+ * they assert on the physical chunk (every column of every row, nulls included), on the physical
+ * base table (what the range delete actually removed), and on the merged SELECT (what a client sees
+ * afterwards) -- not on any one of the three alone.
+ */
+public class TieredStorageColumnsTest extends CQLTester
+{
+    private static final long HOUR = 3_600_000L;
+    private static final MapType<String, String> ATTRIBUTE_TYPE =
+        MapType.getInstance(UTF8Type.instance, UTF8Type.instance, false);
+
+    // ---- the production shape: tm_tag_point ----
+
+    /**
+     * pp.tm_tag_point's shape, with pp's measured sparsity: a column that is always null
+     * ({@code value_numeric}), columns that are constant ({@code quality}, {@code error_code}), a
+     * high-entropy one ({@code latency}), a low-cardinality opaque one (the frozen map
+     * {@code attribute}), and text/boolean columns with holes in them.
+     */
+    private String createProductionShapedTable() throws Throwable
+    {
+        String table = createTable("CREATE TABLE %s (" +
+                                   "tag_id text, timestamp timestamp, " +
+                                   "area_id text static, asset_id text static, line_id text static, " +
+                                   "opc_id text static, site_id text static, tag_name text static, type text static, " +
+                                   "attribute frozen<map<text,text>>, error_code int, latency int, quality int, " +
+                                   "value text, value_boolean boolean, value_numeric double, " +
+                                   "PRIMARY KEY (tag_id, timestamp)) " +
+                                   "WITH CLUSTERING ORDER BY (timestamp DESC) AND default_time_to_live = 5356800");
+        setPolicy("{\"hot_window\":\"2h\",\"chunk_window\":\"1h\"}");
+        return table;
+    }
+
+    private static final long[] TS = { 0L, 600_000L, 1_200_000L, 1_800_000L, 2_400_000L, 3_000_000L };
+    private static final Integer[] LATENCY = { 12, 40, 7, 999, 3, 12 };
+    private static final String[] VALUE = { "a", "b", "a", "c", null, "e" };
+    private static final Boolean[] VALUE_BOOLEAN = { true, false, null, true, true, false };
+    private static final String[] UNIT = { "C", "C", "F", "C", "F", "C" };
+
+    private void loadProductionShapedRows() throws Throwable
+    {
+        execute("INSERT INTO %s (tag_id, area_id, asset_id, line_id, opc_id, site_id, tag_name, type) " +
+                "VALUES ('t1', 'a', 'as', 'l', 'o', 's', 'tn', 'ty') USING TIMESTAMP 100");
+        for (int i = 0; i < TS.length; i++)
+            execute("INSERT INTO %s (tag_id, timestamp, attribute, error_code, latency, quality, " +
+                    "value, value_boolean) VALUES (?, ?, ?, 0, ?, 192, ?, ?) USING TIMESTAMP ?",
+                    "t1", new Date(TS[i]), attribute(UNIT[i]), LATENCY[i], VALUE[i], VALUE_BOOLEAN[i], 101L + i);
+        // Hot row (window [4h,5h) against the synthetic now = 5h): must survive untouched.
+        execute("INSERT INTO %s (tag_id, timestamp, latency) VALUES ('t1', ?, 1) USING TIMESTAMP 200",
+                new Date(4 * HOUR));
+    }
+
+    @Test
+    public void everyColumnOfEveryRowRoundTripsThroughTheChunk() throws Throwable
+    {
+        createProductionShapedTable();
+        loadProductionShapedRows();
+
+        TierRunStats stats = new TieredStorageService().runOnce(KEYSPACE, currentTable(), 5 * HOUR);
+        assertEquals(1, stats.windowsEncoded);
+        assertEquals(TS.length, stats.rowsEncoded);
+
+        UntypedResultSet.Row chunkRow = execute(chunkSelectQuery(), "t1", new Date(0L)).one();
+        assertEquals(TS.length, chunkRow.getInt("samples"));
+        assertEquals(ColumnarChunkCodec.VERSION, chunkRow.getByte("codec"));
+
+        // 1) the physical chunk carries every column of every row, nulls included
+        ColumnarCursor cursor = ColumnarChunkCodec.cursor(chunkRow.getBytes("payload"), null);
+        for (int i = 0; i < TS.length; i++)
+        {
+            assertTrue("expected sample " + i, cursor.advance());
+            assertEquals(TS[i], cursor.timestamp());
+            assertEquals(attribute(UNIT[i]), cursor.getBytes("attribute"));
+            assertEquals(0, (int) Int32Type.instance.compose(cursor.getBytes("error_code")));
+            assertEquals(192, (int) Int32Type.instance.compose(cursor.getBytes("quality")));
+            assertEquals((int) LATENCY[i], (int) Int32Type.instance.compose(cursor.getBytes("latency")));
+            if (VALUE[i] == null)
+                assertTrue("value must stay null at sample " + i, cursor.isNull("value"));
+            else
+                assertEquals(VALUE[i], UTF8Type.instance.compose(cursor.getBytes("value")));
+            if (VALUE_BOOLEAN[i] == null)
+                assertTrue("value_boolean must stay null at sample " + i, cursor.isNull("value_boolean"));
+            else
+                assertEquals(VALUE_BOOLEAN[i], BooleanType.instance.compose(cursor.getBytes("value_boolean")));
+            // Never written by anyone: an all-null column must not materialise a default.
+            assertTrue("value_numeric must stay null at sample " + i, cursor.isNull("value_numeric"));
+        }
+        assertFalse(cursor.advance());
+
+        // 2) the source rows are physically gone, but the statics are not
+        assertEquals(0, raw("SELECT timestamp FROM %s WHERE tag_id = 't1' AND timestamp < ?", new Date(HOUR)).size());
+        UntypedResultSet statics = raw("SELECT area_id, asset_id, line_id, opc_id, site_id, tag_name, type, " +
+                                       "WRITETIME(site_id) AS wt FROM %s WHERE tag_id = 't1'");
+        assertEquals(1, statics.size());
+        assertEquals("s", statics.one().getString("site_id"));
+        assertEquals("ty", statics.one().getString("type"));
+        assertEquals(100L, statics.one().getLong("wt"));
+
+        // 3) a plain SELECT returns every row again, every column exactly as written
+        UntypedResultSet merged = execute("SELECT timestamp, attribute, error_code, latency, quality, value, " +
+                                          "value_boolean, value_numeric FROM %s WHERE tag_id = 't1' " +
+                                          "AND timestamp < ? ORDER BY timestamp ASC", new Date(HOUR));
+        assertEquals(TS.length, merged.size());
+        int i = 0;
+        for (UntypedResultSet.Row row : merged)
+        {
+            assertEquals(new Date(TS[i]), row.getTimestamp("timestamp"));
+            assertEquals(attribute(UNIT[i]), row.getBytes("attribute"));
+            assertEquals(0, row.getInt("error_code"));
+            assertEquals(192, row.getInt("quality"));
+            assertEquals((int) LATENCY[i], row.getInt("latency"));
+            assertEquals(VALUE[i], VALUE[i] == null ? null : row.getString("value"));
+            assertEquals(VALUE[i] != null, row.has("value"));
+            assertEquals(VALUE_BOOLEAN[i] != null, row.has("value_boolean"));
+            if (VALUE_BOOLEAN[i] != null)
+                assertEquals(VALUE_BOOLEAN[i], (Boolean) row.getBoolean("value_boolean"));
+            assertFalse("value_numeric was never written and must read back as null",
+                        row.has("value_numeric"));
+            i++;
+        }
+
+        // 4) the hot row is untouched
+        assertEquals(1, raw("SELECT timestamp FROM %s WHERE tag_id = 't1' AND timestamp = ?",
+                            new Date(4 * HOUR)).size());
+    }
+
+    @Test
+    public void descClusteredMergedReadsAreCompleteAndInOrder() throws Throwable
+    {
+        // Regression: on a table declared WITH CLUSTERING ORDER BY (ts DESC) -- the shape the
+        // production table uses -- Slices arrive in DESCENDING timestamp order, so the comparator's
+        // start bound is the range's UPPER time bound. Reading them as if ascending turned
+        // `WHERE timestamp < X` into `[X+1, +inf)` and served ZERO cold rows, silently.
+        createProductionShapedTable();
+        loadProductionShapedRows();
+        assertEquals(1, new TieredStorageService().runOnce(KEYSPACE, currentTable(), 5 * HOUR).windowsEncoded);
+
+        // Natural (DESC) order over everything: 6 cold rows + the hot one, newest first.
+        UntypedResultSet all = execute("SELECT timestamp FROM %s WHERE tag_id = 't1'");
+        assertEquals(TS.length + 1, all.size());
+        long previous = Long.MAX_VALUE;
+        for (UntypedResultSet.Row row : all)
+        {
+            long ts = row.getTimestamp("timestamp").getTime();
+            assertTrue("DESC table must return newest first, got " + ts + " after " + previous, ts < previous);
+            previous = ts;
+        }
+
+        // A bounded slice: the half-open upper bound must land on the right side of the range.
+        assertEquals(3, execute("SELECT timestamp FROM %s WHERE tag_id = 't1' AND timestamp < ?",
+                                new Date(1_800_000L)).size());
+        assertEquals(4, execute("SELECT timestamp FROM %s WHERE tag_id = 't1' AND timestamp <= ?",
+                                new Date(1_800_000L)).size());
+        assertEquals(3, execute("SELECT timestamp FROM %s WHERE tag_id = 't1' AND timestamp > ? AND timestamp < ?",
+                                new Date(0L), new Date(2_400_000L)).size());
+
+        // ORDER BY ASC on a DESC table (the "reversed" read) must come back oldest first.
+        UntypedResultSet ascending = execute("SELECT timestamp FROM %s WHERE tag_id = 't1' " +
+                                             "AND timestamp < ? ORDER BY timestamp ASC", new Date(HOUR));
+        assertEquals(TS.length, ascending.size());
+        int i = 0;
+        for (UntypedResultSet.Row row : ascending)
+            assertEquals(new Date(TS[i++]), row.getTimestamp("timestamp"));
+
+        // A point lookup (names filter, not a slice) on a cold timestamp.
+        assertEquals(1, execute("SELECT timestamp FROM %s WHERE tag_id = 't1' AND timestamp = ?",
+                                new Date(1_200_000L)).size());
+    }
+
+    @Test
+    public void aSecondCycleIsAByteIdenticalNoOp() throws Throwable
+    {
+        createProductionShapedTable();
+        loadProductionShapedRows();
+
+        TieredStorageService service = new TieredStorageService();
+        assertEquals(1, service.runOnce(KEYSPACE, currentTable(), 5 * HOUR).windowsEncoded);
+
+        UntypedResultSet.Row before = execute(chunkPayloadQuery(), "t1", new Date(0L)).one();
+        ByteBuffer firstPayload = ByteBufferUtil.clone(before.getBytes("payload"));
+        long firstWritetime = before.getLong("chunk_wt");
+
+        TierRunStats second = service.runOnce(KEYSPACE, currentTable(), 5 * HOUR);
+        assertEquals(0, second.windowsEncoded);
+        assertEquals(0, second.rowsEncoded);
+        assertEquals(0, second.lateMerges);
+        assertEquals(0, second.bytesWritten);
+
+        UntypedResultSet.Row after = execute(chunkPayloadQuery(), "t1", new Date(0L)).one();
+        assertEquals("the chunk payload must be byte-identical after a second cycle",
+                     firstPayload, after.getBytes("payload"));
+        assertEquals("the chunk row must not even be rewritten", firstWritetime, after.getLong("chunk_wt"));
+    }
+
+    // ---- late-row merge semantics ----
+
+    @Test
+    public void aLateUpdateOfOneColumnKeepsTheOtherColumnsOfThatRow() throws Throwable
+    {
+        // `UPDATE t SET quality = ? WHERE ...` writes ONE cell. Merging must be PER COLUMN: the
+        // columns the update did not mention keep the values already in the chunk. Replacing the
+        // whole chunked row with the (mostly-null) base row would blank them.
+        createTable("CREATE TABLE %s (tag text, ts timestamp, value double, quality int, note text, " +
+                    "PRIMARY KEY (tag, ts))");
+        setPolicy("{\"hot_window\":\"2h\",\"chunk_window\":\"1h\"}");
+
+        execute("INSERT INTO %s (tag, ts, value, quality, note) VALUES ('t', ?, 1.5, 192, 'ok') " +
+                "USING TIMESTAMP 100", new Date(0L));
+        execute("INSERT INTO %s (tag, ts, value, quality, note) VALUES ('t', ?, 2.5, 192, 'ok') " +
+                "USING TIMESTAMP 101", new Date(600_000L));
+        execute("INSERT INTO %s (tag, ts, value) VALUES ('t', ?, 9.0) USING TIMESTAMP 150", new Date(4 * HOUR));
+
+        TieredStorageService service = new TieredStorageService();
+        assertEquals(1, service.runOnce(KEYSPACE, currentTable(), 5 * HOUR).windowsEncoded);
+        assertEquals(0, raw("SELECT ts FROM %s WHERE tag = 't' AND ts < ?", new Date(HOUR)).size());
+
+        // Late correction touching ONLY quality, on a row that now exists only inside the chunk.
+        execute("UPDATE %s USING TIMESTAMP 300 SET quality = 7 WHERE tag = 't' AND ts = ?", new Date(600_000L));
+
+        TierRunStats second = service.runOnce(KEYSPACE, currentTable(), 5 * HOUR);
+        assertEquals(1, second.windowsEncoded);
+        assertEquals(1, second.lateMerges);
+
+        UntypedResultSet.Row chunkRow = execute(chunkSelectQuery(), "t", new Date(0L)).one();
+        assertEquals(2, chunkRow.getInt("samples"));         // merged, not appended
+        assertEquals(300L, chunkRow.getLong("max_row_writetime"));
+
+        ColumnarCursor cursor = ColumnarChunkCodec.cursor(chunkRow.getBytes("payload"), null);
+        assertTrue(cursor.advance());
+        assertEquals(0L, cursor.timestamp());
+        assertEquals(1.5, DoubleType.instance.compose(cursor.getBytes("value")), 0.0);
+        assertEquals(192, (int) Int32Type.instance.compose(cursor.getBytes("quality")));
+        assertEquals("ok", UTF8Type.instance.compose(cursor.getBytes("note")));
+        assertTrue(cursor.advance());
+        assertEquals(600_000L, cursor.timestamp());
+        assertEquals("the update must win on the column it touched",
+                     7, (int) Int32Type.instance.compose(cursor.getBytes("quality")));
+        assertEquals("an untouched column must keep the value the chunk already held",
+                     2.5, DoubleType.instance.compose(cursor.getBytes("value")), 0.0);
+        assertEquals("ok", UTF8Type.instance.compose(cursor.getBytes("note")));
+        assertFalse(cursor.advance());
+
+        // ...and the same through a plain SELECT.
+        UntypedResultSet merged = execute("SELECT value, quality, note FROM %s WHERE tag = 't' AND ts = ?",
+                                          new Date(600_000L));
+        assertEquals(1, merged.size());
+        assertEquals(2.5, merged.one().getDouble("value"), 0.0);
+        assertEquals(7, merged.one().getInt("quality"));
+        assertEquals("ok", merged.one().getString("note"));
+    }
+
+    @Test
+    public void aLateRowAtANewTimestampAddsAWholeRow() throws Throwable
+    {
+        // The other half of the merge rule: a late row at a timestamp the chunk does NOT hold is a
+        // new row, and the columns it leaves out are null (there is nothing to inherit).
+        createTable("CREATE TABLE %s (tag text, ts timestamp, value double, quality int, PRIMARY KEY (tag, ts))");
+        setPolicy("{\"hot_window\":\"2h\",\"chunk_window\":\"1h\"}");
+
+        execute("INSERT INTO %s (tag, ts, value, quality) VALUES ('t', ?, 1.5, 192) USING TIMESTAMP 100",
+                new Date(0L));
+        execute("INSERT INTO %s (tag, ts, value) VALUES ('t', ?, 9.0) USING TIMESTAMP 150", new Date(4 * HOUR));
+
+        TieredStorageService service = new TieredStorageService();
+        assertEquals(1, service.runOnce(KEYSPACE, currentTable(), 5 * HOUR).windowsEncoded);
+
+        execute("INSERT INTO %s (tag, ts, quality) VALUES ('t', ?, 5) USING TIMESTAMP 300", new Date(600_000L));
+        assertEquals(1, service.runOnce(KEYSPACE, currentTable(), 5 * HOUR).windowsEncoded);
+
+        ColumnarCursor cursor = ColumnarChunkCodec.cursor(execute(chunkSelectQuery(), "t", new Date(0L))
+                                                          .one().getBytes("payload"), null);
+        assertTrue(cursor.advance());
+        assertEquals(0L, cursor.timestamp());
+        assertEquals(1.5, DoubleType.instance.compose(cursor.getBytes("value")), 0.0);
+        assertTrue(cursor.advance());
+        assertEquals(600_000L, cursor.timestamp());
+        assertEquals(5, (int) Int32Type.instance.compose(cursor.getBytes("quality")));
+        assertTrue("a brand-new row's unwritten column must be null, not inherited from another row",
+                   cursor.isNull("value"));
+        assertFalse(cursor.advance());
+    }
+
+    // ---- the writetime invariant, across columns ----
+
+    @Test
+    public void theDeleteTimestampIsTheMaximumWritetimeAcrossEveryColumn() throws Throwable
+    {
+        // One row whose three columns were written at three different timestamps. Taking any single
+        // column's writetime (say the first column's, 100) would tombstone at 100 and leave the
+        // cells written at 200/300 alive -- a half-deleted row that is re-encoded forever.
+        createTable("CREATE TABLE %s (tag text, ts timestamp, a double, b int, c text, PRIMARY KEY (tag, ts))");
+        setPolicy("{\"hot_window\":\"2h\",\"chunk_window\":\"1h\"}");
+
+        execute("INSERT INTO %s (tag, ts, a) VALUES ('t', ?, 1.0) USING TIMESTAMP 100", new Date(0L));
+        execute("UPDATE %s USING TIMESTAMP 300 SET b = 5 WHERE tag = 't' AND ts = ?", new Date(0L));
+        execute("UPDATE %s USING TIMESTAMP 200 SET c = 'z' WHERE tag = 't' AND ts = ?", new Date(0L));
+        execute("INSERT INTO %s (tag, ts, a) VALUES ('t', ?, 9.0) USING TIMESTAMP 150", new Date(4 * HOUR));
+
+        assertEquals(1, new TieredStorageService().runOnce(KEYSPACE, currentTable(), 5 * HOUR).windowsEncoded);
+
+        UntypedResultSet.Row chunkRow = execute(chunkSelectQuery(), "t", new Date(0L)).one();
+        assertEquals("max_row_writetime must be the maximum over ALL columns",
+                     300L, chunkRow.getLong("max_row_writetime"));
+
+        // Nothing of the row is left: had the delete used 100 (or 200), b (and c) would still be here.
+        assertEquals(0, raw("SELECT ts, a, b, c FROM %s WHERE tag = 't' AND ts < ?", new Date(HOUR)).size());
+
+        // A row written after the cycle read the window is newer than the tombstone and survives it.
+        execute("INSERT INTO %s (tag, ts, a) VALUES ('t', ?, 4.0) USING TIMESTAMP 301", new Date(600_000L));
+        UntypedResultSet late = raw("SELECT a FROM %s WHERE tag = 't' AND ts = ?", new Date(600_000L));
+        assertEquals(1, late.size());
+        assertEquals(4.0, late.one().getDouble("a"), 0.0);
+    }
+
+    // ---- composite partition keys, many columns ----
+
+    @Test
+    public void compositePartitionKeyRoundTripsEveryColumn() throws Throwable
+    {
+        createTable("CREATE TABLE %s (asset_id text, date text, hour int, ts timestamp, " +
+                    "value double, quality int, note text, flag boolean, PRIMARY KEY ((asset_id, date, hour), ts))");
+        setPolicy("{\"hot_window\":\"2h\",\"chunk_window\":\"1h\"}");
+
+        execute("INSERT INTO %s (asset_id, date, hour, ts, value, quality, note, flag) " +
+                "VALUES ('a1', '2026-08-01', 0, ?, 1.0, 192, 'x', true) USING TIMESTAMP 101", new Date(600_000L));
+        execute("INSERT INTO %s (asset_id, date, hour, ts, value, quality, flag) " +
+                "VALUES ('a1', '2026-08-01', 0, ?, 2.0, 192, false) USING TIMESTAMP 102", new Date(1_200_000L));
+        // A different partition differing only in the last key column -- must not be conflated.
+        execute("INSERT INTO %s (asset_id, date, hour, ts, value, quality, note, flag) " +
+                "VALUES ('a1', '2026-08-01', 1, ?, 3.0, 7, 'y', true) USING TIMESTAMP 103", new Date(600_000L));
+        execute("INSERT INTO %s (asset_id, date, hour, ts, value) " +
+                "VALUES ('a1', '2026-08-01', 0, ?, 9.0) USING TIMESTAMP 110", new Date(4 * HOUR));
+        execute("INSERT INTO %s (asset_id, date, hour, ts, value) " +
+                "VALUES ('a1', '2026-08-01', 1, ?, 9.0) USING TIMESTAMP 111", new Date(4 * HOUR));
+
+        TierRunStats stats = new TieredStorageService().runOnce(KEYSPACE, currentTable(), 5 * HOUR);
+        assertEquals(2, stats.windowsEncoded);
+        assertEquals(3, stats.rowsEncoded);
+
+        String chunkRef = KEYSPACE + '.' + ChunkTables.chunkTableName(currentTable());
+        UntypedResultSet.Row firstChunk =
+            execute("SELECT samples, payload FROM " + chunkRef +
+                    " WHERE asset_id = ? AND date = ? AND hour = ? AND window_start = ?",
+                    "a1", "2026-08-01", 0, new Date(0L)).one();
+        assertEquals(2, firstChunk.getInt("samples"));
+
+        ColumnarCursor cursor = ColumnarChunkCodec.cursor(firstChunk.getBytes("payload"), null);
+        assertTrue(cursor.advance());
+        assertEquals(600_000L, cursor.timestamp());
+        assertEquals(1.0, DoubleType.instance.compose(cursor.getBytes("value")), 0.0);
+        assertEquals("x", UTF8Type.instance.compose(cursor.getBytes("note")));
+        assertTrue(Boolean.TRUE.equals(BooleanType.instance.compose(cursor.getBytes("flag"))));
+        assertTrue(cursor.advance());
+        assertEquals(1_200_000L, cursor.timestamp());
+        assertEquals(2.0, DoubleType.instance.compose(cursor.getBytes("value")), 0.0);
+        assertTrue("note was never written on this row", cursor.isNull("note"));
+        assertFalse(cursor.advance());
+
+        // The other partition kept its own values.
+        UntypedResultSet.Row secondChunk =
+            execute("SELECT samples, payload FROM " + chunkRef +
+                    " WHERE asset_id = ? AND date = ? AND hour = ? AND window_start = ?",
+                    "a1", "2026-08-01", 1, new Date(0L)).one();
+        assertEquals(1, secondChunk.getInt("samples"));
+        ColumnarCursor other = ColumnarChunkCodec.cursor(secondChunk.getBytes("payload"), null);
+        assertTrue(other.advance());
+        assertEquals(7, (int) Int32Type.instance.compose(other.getBytes("quality")));
+        assertEquals("y", UTF8Type.instance.compose(other.getBytes("note")));
+
+        // ...and both partitions read back completely through the merge.
+        UntypedResultSet merged = execute("SELECT ts, value, quality, note, flag FROM %s " +
+                                          "WHERE asset_id = ? AND date = ? AND hour = ?", "a1", "2026-08-01", 0);
+        assertEquals(3, merged.size());
+        List<UntypedResultSet.Row> rows = List.of(merged.stream().toArray(UntypedResultSet.Row[]::new));
+        assertEquals(1.0, rows.get(0).getDouble("value"), 0.0);
+        assertEquals("x", rows.get(0).getString("note"));
+        assertFalse(rows.get(1).has("note"));
+        assertEquals(9.0, rows.get(2).getDouble("value"), 0.0);
+    }
+
+    // ---- helpers ----
+
+    private static ByteBuffer attribute(String unit)
+    {
+        Map<String, String> map = new LinkedHashMap<>();
+        map.put("unit", unit);
+        return ATTRIBUTE_TYPE.decompose(map);
+    }
+
+    /** Reads the PHYSICAL base rows, bypassing SP3's transparent hot+chunk merge. */
+    private UntypedResultSet raw(String query, Object... values) throws Throwable
+    {
+        TransparentReads.enterInternalBypass();
+        try
+        {
+            return execute(query, values);
+        }
+        finally
+        {
+            TransparentReads.exitInternalBypass();
+        }
+    }
+
+    private void setPolicy(String json) throws Throwable
+    {
+        String hex = ByteBufferUtil.bytesToHex(ByteBufferUtil.bytes(json));
+        alterTable("ALTER TABLE %s WITH extensions = {'" + TieringPolicy.EXTENSION_KEY + "': 0x" + hex + "};");
+    }
+
+    private String chunkTableRef()
+    {
+        return KEYSPACE + '.' + ChunkTables.chunkTableName(currentTable());
+    }
+
+    private String chunkSelectQuery()
+    {
+        return "SELECT * FROM " + chunkTableRef() + " WHERE " + partitionKeyName() + " = ? AND window_start = ?";
+    }
+
+    private String chunkPayloadQuery()
+    {
+        return "SELECT payload, WRITETIME(payload) AS chunk_wt FROM " + chunkTableRef() +
+               " WHERE " + partitionKeyName() + " = ? AND window_start = ?";
+    }
+
+    private String partitionKeyName()
+    {
+        return getCurrentColumnFamilyStore().metadata().partitionKeyColumns().get(0).name.toCQLString();
+    }
+}

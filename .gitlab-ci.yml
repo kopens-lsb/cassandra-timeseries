@@ -80,6 +80,10 @@ timeseries-tests:
     # supported schemas (SP4): accept/reject matrix on real CQL schemas (indexes, views, counters,
     # collections), composite partition key mirroring, static-column survival, TTL vs hot_window
     - ant testsome -Dtest.name=org.apache.cassandra.db.timeseries.tiering.TieringSchemaSupportTest
+    # multi-column re-encoding (SP4): every regular column into one columnar chunk — production
+    # (tm_tag_point) shape round trip incl. nulls, per-column late merge, max writetime across all
+    # columns, DESC-clustered merged reads, composite key, byte-identical idempotency
+    - ant testsome -Dtest.name=org.apache.cassandra.db.timeseries.tiering.TieredStorageColumnsTest
     # transparent reads (SP3): chunk decode, coordinator merge, end-to-end SELECT matrix
     - ant testsome -Dtest.name=org.apache.cassandra.db.timeseries.tiering.ChunkReadSupportTest
     - ant testsome -Dtest.name=org.apache.cassandra.db.timeseries.tiering.ChunkMergeIteratorTest

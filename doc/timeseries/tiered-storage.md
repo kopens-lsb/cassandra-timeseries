@@ -18,10 +18,11 @@
 
 # 계층형 저장 (Tiered Storage): 청크 스토어 + 백그라운드 재인코더
 
-시계열 테이블의 오래된(닫힌) 행을 백그라운드에서 Chimp128 청크로 압축해 섀도 테이블
+시계열 테이블의 오래된(닫힌) 행을 백그라운드에서 **컬럼 지향 청크**로 압축해 섀도 테이블
 `<테이블>__chunks`로 옮기고, 원본 행은 삭제하는 서버 내장 계층화 엔진입니다. 최근 데이터(핫 구간)는
-행 단위로 그대로 남아 쓰기·조회 모두 기존과 동일하고, 오래된 데이터는 샘플당 수 바이트 수준으로
-압축된 청크로 보관됩니다. 코덱(Chimp128)의 압축 특성은
+행 단위로 그대로 남아 쓰기·조회 모두 기존과 동일하고, 오래된 데이터는 행당 수 바이트 수준으로
+압축된 청크로 보관됩니다. 청크 1개는 한 창의 타임스탬프 축 하나에 **일반 컬럼 전부**를 컬럼별 독립
+섹션으로 담습니다(§3.1.1). `double` 컬럼에 쓰이는 Chimp128의 압축 특성은
 [bake-off 결과](codec-bakeoff.md)를 참고하세요.
 
 > **투명 읽기(SP3) 포함**: 베이스 테이블 `SELECT`가 핫 로우와 청크 디코드 로우를 **자동 병합**해
@@ -81,10 +82,11 @@ CREATE TABLE ts.tag_point (
 ) WITH CLUSTERING ORDER BY (timestamp DESC);
 ```
 
-> **진행 중(SP4)**: 스키마 수용은 위와 같이 일반화됐지만, 재인코더 자체는 아직 `double` 일반 컬럼
-> **1개**짜리 청크만 씁니다. 그 외 형태는 수용된 뒤에도 "아직 다중 컬럼 인코딩 전"이라는 ERROR와
-> 함께 건너뜁니다 — 한 컬럼만 인코딩하고 나머지를 지우는 일은 절대 하지 않습니다. 다중 컬럼
-> 인코딩은 컬럼 지향 청크 포맷 전환과 함께 들어옵니다.
+재인코더는 **일반 컬럼 전부**를 청크 1개에 담습니다 — 창의 타임스탬프 축을 한 번만 저장하고, 컬럼마다
+독립 섹션에 그 컬럼의 **직렬화 바이트 그대로** 넣습니다. `null` 셀은 `null`로 그대로 왕복하며(기본값으로
+바뀌지 않습니다), 어떤 타입이든 담깁니다 (아래 §3.1.1 코덱 표). 일반 컬럼이 **하나도 없는** 테이블은
+수용은 되지만 실제로는 아무것도 인코딩되지 않습니다 — 셀 writetime이 존재하지 않아 원본 삭제에 쓸
+타임스탬프가 없기 때문이며, 이 경우 그 사실을 밝힌 WARN을 남깁니다(§5.1).
 
 ### 1.1 `default_time_to_live`와 `hot_window`
 
@@ -130,10 +132,10 @@ ALTER TABLE ts.sensor WITH extensions = {
 
 ### 2.2 코덱
 
-코덱은 **Chimp128 하나뿐**이라 고를 것이 없습니다. 양자화된 워크/주기 신호(소수점이 잘린 실제
-산업 센서값)에서 1.4~2.5 B/샘플이며, 값이 전혀 변하지 않는 구간은 코덱을 타기 전에 컬럼 지향
-청크의 CONSTANT 플래그가 행 수와 무관하게 O(1) 바이트로 처리합니다. 페이로드에는 여전히 버전
-바이트가 있어 디코딩은 자동입니다.
+고를 것이 없습니다. 컬럼 타입이 인코딩을 결정하고(§3.1.1), `double` 컬럼의 값 코덱은 **Chimp128
+하나뿐**입니다 — 양자화된 워크/주기 신호(소수점이 잘린 실제 산업 센서값)에서 1.4~2.5 B/샘플이며,
+값이 전혀 변하지 않는 컬럼은 코덱을 타기 전에 CONSTANT 플래그가 행 수와 무관하게 O(1) 바이트로
+처리합니다. 페이로드에는 여전히 버전 바이트가 있어 디코딩은 자동입니다.
 
 > 예전에는 `codec`(`auto`/`gorilla`/`chimp128`) 정책 필드가 있었지만 **제거**됐습니다. 정책 JSON에
 > 아직 `codec`이 남아 있으면 `ALTER TABLE`이 그 키를 지목해 거부하므로, 조용히 무시되는 일은
@@ -160,10 +162,31 @@ ALTER TABLE ts.sensor WITH extensions = {
 | --- | --- | --- |
 | *(베이스 파티션 키 전체)* | 동일 | 베이스 테이블의 파티션 키 컬럼 **전부**를 이름·타입·순서 그대로 복제 (예: `tag_id text`, 또는 복합 키면 `(asset_id text, date text, hour int)` 세 컬럼 모두) |
 | `window_start` | `timestamp` | 청크가 덮는 창의 시작 (클러스터링 키; 창 길이 = `chunk_window`) |
-| `codec` | `tinyint` | 페이로드 코덱 버전 (2 = Chimp128; 1 = 제거된 Gorilla) |
-| `samples` | `int` | 청크에 인코딩된 샘플 수 |
-| `max_row_writetime` | `bigint` | 청크에 포함된 원본 행들의 최대 writetime (지각 병합 판정 기준) |
-| `payload` | `blob` | 인코딩된 `(timestamp, value)` 샘플들 |
+| `codec` | `tinyint` | 페이로드의 **첫 바이트(포맷 버전)를 그대로 복사한 값**. 현재 쓰이는 값은 `3`(컬럼 지향)뿐입니다 — 인코딩 후 페이로드에서 읽어 넣으므로 항상 실제 저장된 포맷을 가리킵니다. `1`(제거된 Gorilla)·`2`(제거된 단일 컬럼 Chimp128)는 더 이상 쓰이지도 읽히지도 않습니다 |
+| `samples` | `int` | 청크에 인코딩된 **행 수** (값 개수가 아닙니다 — 행 1개가 컬럼 N개를 가집니다) |
+| `max_row_writetime` | `bigint` | 청크에 포함된 원본 행들의 **모든 컬럼**을 통틀어 최대 writetime (원본 삭제 타임스탬프이자 지각 병합 판정 기준) |
+| `payload` | `blob` | 창 1개의 인코딩 결과: 공유 타임스탬프 축 + 베이스 테이블 **일반 컬럼별 독립 섹션** |
+
+#### 3.1.1 컬럼 타입별 인코딩
+
+타입 코드는 **직렬화된 바이트를 어떤 방식으로 압축할지**만 고릅니다 — 바이트 자체는 바꾸지 않으므로
+디코딩 결과는 원본 셀과 바이트 단위로 동일합니다.
+
+| 베이스 컬럼 타입 | 청크 인코딩 |
+| --- | --- |
+| `double` | Chimp128 값 스트림 |
+| `boolean` | 1비트 팩 |
+| `int`, `date` | 4바이트 고정폭 + zigzag varint 델타 (`date`는 부호 없는 일수지만 4바이트 그대로 왕복) |
+| `bigint`, `timestamp`, `time` | 8바이트 고정폭 + zigzag varint 델타 (정규화 없음: 각각 원값·epoch millis·자정 이후 나노초) |
+| `text`, `varchar`, `ascii` | 사전(서로 다른 값 256개 이하) / 아니면 길이 접두 raw |
+| **그 외 전부** | **불투명 바이트**(직렬화 그대로) + 사전/RLE — `blob`, `uuid`, `timeuuid`, `decimal`, `varint`, `inet`, `smallint`, `tinyint`, `float`, `duration`, frozen 컬렉션·UDT·튜플 |
+
+`smallint`(2바이트)·`tinyint`(1바이트)·`float`(4바이트)를 굳이 불투명으로 두는 이유는, 고정폭 코드가
+자기 폭으로 다시 직렬화하기 때문에(그리고 `boolean` 코드는 값을 0/1 비트로 접기 때문에) 폭이 다르면
+왕복이 조용히 깨지기 때문입니다.
+
+값이 전부 같은 컬럼은 디렉토리에 **한 번만** 저장되고 데이터 섹션이 0바이트가 되며(CONSTANT), 전부
+`null`인 컬럼은 아무것도 저장하지 않습니다(ALL_NULL) — 행 수와 무관하게 O(1)입니다.
 
 ### 3.2 조회 CQL
 
@@ -179,17 +202,27 @@ WHERE  tag_id = 'pump-01'
 
 ### 3.3 페이로드 디코딩 (JVM 클라이언트)
 
-`payload`는 이 포크의 jar에 있는 버전 디스패처로 디코딩합니다 (첫 바이트가 코덱 버전이므로 호출
-쪽에서 코덱을 구분할 필요가 없습니다):
+`payload`는 이 포크의 jar에 있는 컬럼 지향 디코더로 읽습니다. 두 번째 인자는 **프로젝션**입니다 —
+`null`이면 전체 컬럼, 집합을 주면 그 컬럼들의 데이터 섹션만 디코딩하고 나머지는 건너뜁니다:
 
 ```java
-import org.apache.cassandra.db.timeseries.ChunkCodecs;
-import org.apache.cassandra.db.timeseries.SampleCursor;
+import org.apache.cassandra.db.timeseries.ColumnarChunkCodec;
+import org.apache.cassandra.db.timeseries.ColumnarCursor;
 
-SampleCursor cursor = ChunkCodecs.cursor(payload);   // payload: ByteBuffer
+ColumnarCursor cursor = ColumnarChunkCodec.cursor(payload, Set.of("value_numeric", "quality"));
 while (cursor.advance())
-    handle(cursor.timestamp(), cursor.value());       // epoch millis, double
+{
+    long ts = cursor.timestamp();                       // epoch millis
+    ByteBuffer v = cursor.getBytes("value_numeric");    // null = 그 행에서 null인 셀
+    if (v != null)
+        handle(ts, DoubleType.instance.compose(v));     // 베이스 컬럼 타입으로 compose
+}
 ```
+
+`getBytes`가 돌려주는 것은 **베이스 컬럼 타입의 직렬화 바이트 그대로**이므로, 그 컬럼의
+`AbstractType.compose(...)`로 그대로 복원하면 됩니다. `hasColumn`은 그 컬럼이 이 청크(그리고 프로젝션)에
+있는지, `isNull`은 현재 행에서 값이 없는지를 알려줍니다 — 청크가 쓰인 뒤 `ALTER TABLE ADD`된 컬럼은
+없는 컬럼으로, `DROP`된 컬럼은 남아 있는 채로 보일 수 있습니다.
 
 창 경계에 걸친 요청이라면 디코딩 후 `timestamp`로 한 번 더 필터하세요. 집계 대시보드용이라면
 `samples`·`window_start`만으로도 창 단위 카운트/커버리지 확인이 가능합니다.
@@ -239,6 +272,28 @@ JMX `org.apache.cassandra.db:type=TieredStorage` — `retier(keyspace, table)`,
 가지므로 이 톰스톤보다 새롭고, 따라서 살아남습니다. 다음 사이클이 그 행을 발견해 기존 청크와
 **병합 재인코딩**하고(`samples` 증가, `late_merges` 카운트), 그때의 새 maxWt로 다시 지웁니다.
 즉 "인코딩 안 된 행이 지워지는" 시점은 존재하지 않습니다.
+
+`WRITETIME`은 **컬럼 단위**이므로, 여기서 말하는 최대치는 그 창에서 읽은 **모든 행 × 모든 일반 컬럼**의
+셀 writetime을 통틀어 취한 값입니다(교체 대상 청크의 `max_row_writetime`도 함께 고려). 한 컬럼만
+보고 지우면 다른 컬럼이 더 나중에 갱신된 행이 반쯤 남습니다.
+
+**셀 writetime이 하나도 없는 창은 통째로 건드리지 않습니다.** 일반 컬럼이 전부 `null`인 행(키만 넣은
+`INSERT`, 셀이 전부 삭제·TTL 만료된 행)만 있는 창에는 안전하게 쓸 톰스톤 타임스탬프가 존재하지
+않기 때문입니다 — 인코딩도, 삭제도 하지 않고 다음 사이클에 다시 시도하며, 실행 끝에 그 사실을 요약한
+WARN을 남깁니다. 반대로 **일부** 컬럼만 `null`인 행은 정상이며 그대로 인코딩되고, 같은 창에 writetime을
+가진 행이 하나라도 있으면 전부-`null` 행도 (존재 자체를 잃지 않도록) 함께 인코딩됩니다.
+
+### 5.1.1 지각 행 병합은 **컬럼 단위**입니다
+
+이미 청크에 들어간 타임스탬프에 대해 베이스 행이 다시 나타나면(`UPDATE t SET quality = ? WHERE ...`),
+그 행이 **실제로 셀을 가진 컬럼만** 청크 값을 덮어씁니다. 나머지 컬럼은 청크에 있던 값을 그대로
+유지합니다 — CQL의 셀 단위 last-write-wins와 같은 규칙이며, 행 단위로 통째 교체하면 `UPDATE`가
+언급하지 않은 컬럼이 전부 지워집니다.
+
+> **한계**: 그래서 이미 청크화된 행에 대한 `DELETE`(셀 단위든 행 단위든)는 청크에 반영되지 않습니다.
+> 읽기 시점에는 톰스톤이 청크의 `max_row_writetime`보다 새로우므로 여전히 삭제된 것으로 보이지만,
+> 청크 자체는 옛 값을 계속 들고 있습니다. **콜드(청크화된) 구간의 데이터를 지우려면** 행 삭제가 아니라
+> `cold_window` 만료를 쓰십시오.
 
 ### 5.2 청크 INSERT 타임스탬프 규칙
 

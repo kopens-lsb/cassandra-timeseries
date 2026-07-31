@@ -186,9 +186,10 @@ public class TransparentReadTest extends CQLTester
     {
         loadTwoWindowsAndReencode();
 
-        // Version byte 2 (supported), but a header claiming 0 samples: corrupt CONTENT, not a format
-        // this build cannot read. Availability wins here -- skip the one bad chunk, serve the rest.
-        overwriteFirstChunkPayload("0x02" + "0".repeat(40));
+        // Version byte 3 (the format this build writes), but a header claiming 0 rows: corrupt
+        // CONTENT, not a format this build cannot read. Availability wins here -- skip the one bad
+        // chunk, serve the rest.
+        overwriteFirstChunkPayload("0x03" + "0".repeat(40));
 
         assertOnlySecondWindowAndHotRowServed();
     }
@@ -198,10 +199,11 @@ public class TransparentReadTest extends CQLTester
     {
         loadTwoWindowsAndReencode();
 
-        // Version byte 1 = the removed gorilla format. Unlike corruption this is systematic (every
-        // chunk the old build wrote carries it), so skipping would make this SELECT -- and every
-        // future one -- succeed while silently omitting the [0,1h) window's history.
-        overwriteFirstChunkPayload("0x01" + "0".repeat(40));
+        // Version byte 2 = the removed single-column (chimp128) format; byte 1 was gorilla. Unlike
+        // corruption this is systematic (every chunk an older build wrote carries it), so skipping
+        // would make this SELECT -- and every future one -- succeed while silently omitting the
+        // [0,1h) window's history.
+        overwriteFirstChunkPayload("0x02" + "0".repeat(40));
 
         try
         {

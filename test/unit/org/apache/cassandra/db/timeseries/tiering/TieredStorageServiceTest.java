@@ -20,6 +20,8 @@ package org.apache.cassandra.db.timeseries.tiering;
 import java.nio.ByteBuffer;
 import java.util.Date;
 import java.util.Random;
+import java.util.SortedMap;
+import java.util.TreeMap;
 
 import org.junit.BeforeClass;
 import org.junit.Test;
@@ -27,9 +29,9 @@ import org.slf4j.LoggerFactory;
 
 import org.apache.cassandra.cql3.CQLTester;
 import org.apache.cassandra.cql3.UntypedResultSet;
-import org.apache.cassandra.db.timeseries.Chimp128Codec;
-import org.apache.cassandra.db.timeseries.ChunkCodecs;
-import org.apache.cassandra.db.timeseries.SampleCursor;
+import org.apache.cassandra.db.marshal.DoubleType;
+import org.apache.cassandra.db.timeseries.ColumnarChunkCodec;
+import org.apache.cassandra.db.timeseries.ColumnarCursor;
 import org.apache.cassandra.db.timeseries.tiering.TieredStorageService.TierRunStats;
 import org.apache.cassandra.schema.Schema;
 import org.apache.cassandra.schema.TableMetadata;
@@ -102,7 +104,7 @@ public class TieredStorageServiceTest extends CQLTester
                 assertEquals(1, chunkRows.size());
                 UntypedResultSet.Row chunkRow = chunkRows.one();
                 assertEquals(4, chunkRow.getInt("samples"));
-                assertEquals(Chimp128Codec.VERSION, chunkRow.getByte("codec"));
+                assertEquals(ColumnarChunkCodec.VERSION, chunkRow.getByte("codec"));
 
                 assertEquals(0, raw("SELECT * FROM %s WHERE tag = ? AND ts >= ? AND ts < ?",
                                         tag, new Date(windowStart), new Date(windowStart + HOUR)).size());
@@ -173,12 +175,12 @@ public class TieredStorageServiceTest extends CQLTester
         new TieredStorageService().runOnce(KEYSPACE, currentTable(), 5 * HOUR);
 
         UntypedResultSet.Row chunkRow = execute(chunkSelectQuery(), "solo", new Date(0L)).one();
-        SampleCursor cursor = ChunkCodecs.cursor(chunkRow.getBytes("payload"));
+        ColumnarCursor cursor = ColumnarChunkCodec.cursor(chunkRow.getBytes("payload"), null);
         for (int i = 0; i < tsValues.length; i++)
         {
             assertTrue(cursor.advance());
             assertEquals(tsValues[i], cursor.timestamp());
-            assertEquals(values[i], cursor.value(), 0.0);
+            assertEquals(values[i], doubleAt(cursor, "value"), 0.0);
         }
         assertFalse(cursor.advance());
     }
@@ -218,14 +220,14 @@ public class TieredStorageServiceTest extends CQLTester
         UntypedResultSet.Row chunkRow = execute(chunkSelectQuery(), "t", new Date(0L)).one();
         assertEquals(5, chunkRow.getInt("samples"));
 
-        SampleCursor cursor = ChunkCodecs.cursor(chunkRow.getBytes("payload"));
+        ColumnarCursor cursor = ColumnarChunkCodec.cursor(chunkRow.getBytes("payload"), null);
         boolean foundLate = false;
         while (cursor.advance())
         {
             if (cursor.timestamp() == lateTs)
             {
                 foundLate = true;
-                assertEquals(42.0, cursor.value(), 0.0);
+                assertEquals(42.0, doubleAt(cursor, "value"), 0.0);
             }
         }
         assertTrue("expected the late sample to be present in the merged chunk", foundLate);
@@ -253,34 +255,74 @@ public class TieredStorageServiceTest extends CQLTester
         // have used -- NOT the wall-clock timestamp a plain execute() would default to (which, being
         // far larger than anything runOnce ever writes, would make every cell of this pre-written row
         // permanently win over runOnce's re-merge and pass the assertions below vacuously).
-        ByteBuffer payload = ChunkCodecs.encode(tsValues, values, tsValues.length);
+        ByteBuffer payload = encodeDoubleChunk(tsValues, values, tsValues.length);
         execute(chunkInsertQuery(), "i", new Date(0L), tsValues.length, 300L, payload, 301L);
 
         assertEquals(4, raw("SELECT * FROM %s WHERE tag = ? AND ts >= ? AND ts < ?",
                                 "i", new Date(0L), new Date(HOUR)).size());
 
+        // The re-encode is deterministic, so the resumed cycle rebuilds byte-for-byte what is already
+        // stored and recognises it has nothing new to write: it writes NO chunk (all stats zero) but
+        // still issues the delete the crashed cycle never got to.
         TierRunStats stats = new TieredStorageService().runOnce(KEYSPACE, currentTable(), 5 * HOUR);
-        assertEquals(1, stats.windowsEncoded);
-        assertEquals(1, stats.lateMerges);
-        assertEquals(4, stats.rowsEncoded);
+        assertEquals(0, stats.windowsEncoded);
+        assertEquals(0, stats.lateMerges);
+        assertEquals(0, stats.rowsEncoded);
+        assertEquals(0, stats.bytesWritten);
 
-        UntypedResultSet.Row chunkRow = execute(chunkSelectQuery(), "i", new Date(0L)).one();
+        UntypedResultSet.Row chunkRow = execute("SELECT samples, payload, WRITETIME(payload) AS chunk_wt FROM " +
+                                                chunkTableRef() + " WHERE tag = ? AND window_start = ?",
+                                                "i", new Date(0L)).one();
         assertEquals(4, chunkRow.getInt("samples")); // converged, not duplicated
+        // Untouched, not rewritten: the chunk row still carries the pre-written cycle's timestamp.
+        assertEquals(301L, chunkRow.getLong("chunk_wt"));
 
-        // Decode and check the actual (ts, value) content, not just the sample count -- proves the
-        // merge that runOnce performed (not a stale pre-written row) produced this chunk.
-        SampleCursor cursor = ChunkCodecs.cursor(chunkRow.getBytes("payload"));
+        // Decode and check the actual (ts, value) content, not just the sample count.
+        ColumnarCursor cursor = ColumnarChunkCodec.cursor(chunkRow.getBytes("payload"), null);
         for (int i = 0; i < tsValues.length; i++)
         {
             assertTrue(cursor.advance());
             assertEquals(tsValues[i], cursor.timestamp());
-            assertEquals(values[i], cursor.value(), 0.0);
+            assertEquals(values[i], doubleAt(cursor, "value"), 0.0);
         }
         assertFalse(cursor.advance());
 
         // The interrupted cycle's delete now completes.
         assertEquals(0, raw("SELECT * FROM %s WHERE tag = ? AND ts >= ? AND ts < ?",
                                 "i", new Date(0L), new Date(HOUR)).size());
+    }
+
+    @Test
+    public void runningTheSameCycleTwiceIsANoOp() throws Throwable
+    {
+        createTable("CREATE TABLE %s (tag text, ts timestamp, value double, extra int, PRIMARY KEY (tag, ts))");
+        setPolicy("{\"hot_window\":\"2h\",\"chunk_window\":\"1h\"}");
+
+        for (int i = 0; i < 4; i++)
+            execute("INSERT INTO %s (tag, ts, value, extra) VALUES (?, ?, ?, ?) USING TIMESTAMP ?",
+                    "t", new Date(i * 600_000L), i * 1.5, i, 100L + i);
+        insertRow("t", 4 * HOUR, 999.0, 200); // hot row -- keeps the tag enumerated
+
+        TieredStorageService service = new TieredStorageService();
+        assertEquals(1, service.runOnce(KEYSPACE, currentTable(), 5 * HOUR).windowsEncoded);
+
+        UntypedResultSet.Row first = execute("SELECT payload, WRITETIME(payload) AS chunk_wt FROM " +
+                                             chunkTableRef() + " WHERE tag = ? AND window_start = ?",
+                                             "t", new Date(0L)).one();
+        ByteBuffer firstPayload = ByteBufferUtil.clone(first.getBytes("payload"));
+        long firstWritetime = first.getLong("chunk_wt");
+
+        TierRunStats second = service.runOnce(KEYSPACE, currentTable(), 5 * HOUR);
+        assertEquals(0, second.windowsEncoded);
+        assertEquals(0, second.rowsEncoded);
+        assertEquals(0, second.lateMerges);
+        assertEquals(0, second.bytesWritten);
+
+        UntypedResultSet.Row after = execute("SELECT payload, WRITETIME(payload) AS chunk_wt FROM " +
+                                             chunkTableRef() + " WHERE tag = ? AND window_start = ?",
+                                             "t", new Date(0L)).one();
+        assertEquals("the chunk must be byte-identical after a second cycle", firstPayload, after.getBytes("payload"));
+        assertEquals(firstWritetime, after.getLong("chunk_wt"));
     }
 
     @Test
@@ -295,10 +337,10 @@ public class TieredStorageServiceTest extends CQLTester
         long now = 10 * HOUR;
         insertRow("cold", now - 100_000L, 1.0, 1); // hot row -- keeps the tag enumerated
 
-        ByteBuffer expiring = ChunkCodecs.encode(new long[]{ 0L }, new double[]{ 1.0 }, 1);
+        ByteBuffer expiring = encodeDoubleChunk(new long[]{ 0L }, new double[]{ 1.0 }, 1);
         execute(chunkInsertQuery(), "cold", new Date(0L), 1, 500L, expiring, 1L);
 
-        ByteBuffer surviving = ChunkCodecs.encode(new long[]{ 9 * HOUR }, new double[]{ 2.0 }, 1);
+        ByteBuffer surviving = encodeDoubleChunk(new long[]{ 9 * HOUR }, new double[]{ 2.0 }, 1);
         execute(chunkInsertQuery(), "cold", new Date(9 * HOUR), 1, 600L, surviving, 2L);
 
         TierRunStats stats = new TieredStorageService().runOnce(KEYSPACE, currentTable(), now);
@@ -320,7 +362,7 @@ public class TieredStorageServiceTest extends CQLTester
         // SP3 R6: this tag has NO base rows at all (fully re-encoded, then the base rows aged away) -
         // it exists only in the chunk table. Chunk-table-driven expiry enumeration must still find
         // and expire its cold chunk; the old base-DISTINCT enumeration never would have.
-        ByteBuffer expiring = ChunkCodecs.encode(new long[]{ 0L }, new double[]{ 1.0 }, 1);
+        ByteBuffer expiring = encodeDoubleChunk(new long[]{ 0L }, new double[]{ 1.0 }, 1);
         execute(chunkInsertQuery(), "dead", new Date(0L), 1, 500L, expiring, 1L);
 
         TierRunStats stats = new TieredStorageService().runOnce(KEYSPACE, currentTable(), 10 * HOUR);
@@ -337,20 +379,6 @@ public class TieredStorageServiceTest extends CQLTester
         setPolicy("{\"hot_window\":\"2h\",\"chunk_window\":\"1h\"}");
 
         assertSkippedWithError("clustering column");
-    }
-
-    @Test
-    public void multiColumnTableIsAcceptedButNotYetReEncoded() throws Throwable
-    {
-        // TEMPORARY, alongside the guard in TieredStorageService: the schema check now accepts this
-        // table, but the re-encoder still writes single-column chunks, so it must refuse rather than
-        // encode `value` and range-delete `extra` along with it. Delete both when the re-encoder
-        // moves to the columnar chunk format.
-        createTable("CREATE TABLE %s (tag text, ts timestamp, value double, extra int, PRIMARY KEY (tag, ts))");
-        setPolicy("{\"hot_window\":\"2h\",\"chunk_window\":\"1h\"}");
-        assertNull("the schema itself is supported now", TieringPolicy.unsupportedSchemaError(getCurrentColumnFamilyStore().metadata()));
-
-        assertSkippedWithError("one double regular column");
     }
 
     /** Runs one cycle and asserts it did nothing but log an ERROR containing {@code expectedInMessage}. */
@@ -382,11 +410,11 @@ public class TieredStorageServiceTest extends CQLTester
     }
 
     @Test
-    public void everyChunkIsWrittenWithTheChimpCodecVersion() throws Throwable
+    public void everyChunkIsWrittenWithTheColumnarCodecVersion() throws Throwable
     {
-        // Chimp128 is the only codec, so the chunk row's `codec` column is a fixed 2 for every
-        // pattern -- constant series and quantized walks alike. (This replaces the per-window
-        // gorilla/chimp bake-off that used to make this column vary.)
+        // The columnar format is the only chunk format written, so the chunk row's `codec` column is
+        // a fixed 3 for every pattern -- constant series and quantized walks alike. (This replaces
+        // the per-window gorilla/chimp bake-off that used to make this column vary.)
         createTable("CREATE TABLE %s (tag text, ts timestamp, value double, PRIMARY KEY (tag, ts))");
         setPolicy("{\"hot_window\":\"2h\",\"chunk_window\":\"1h\"}");
 
@@ -412,13 +440,16 @@ public class TieredStorageServiceTest extends CQLTester
         byte constCodec = execute(chunkSelectQuery(), "const", new Date(0L)).one().getByte("codec");
         byte quantCodec = execute(chunkSelectQuery(), "quant", new Date(0L)).one().getByte("codec");
 
-        assertEquals(Chimp128Codec.VERSION, constCodec);
-        assertEquals(Chimp128Codec.VERSION, quantCodec);
+        assertEquals(ColumnarChunkCodec.VERSION, constCodec);
+        assertEquals(ColumnarChunkCodec.VERSION, quantCodec);
     }
 
     @Test
-    public void nullValueCellSkippedWithoutAborting() throws Throwable
+    public void rowWithNoLiveCellIsEncodedRatherThanDeletedUnencoded() throws Throwable
     {
+        // A row whose every regular column is null still EXISTS, and the range delete would take it,
+        // so it must go into the chunk (as a timestamp with all columns null) rather than be skipped.
+        // Skipping it -- what the single-column re-encoder did -- silently destroyed the row.
         createTable("CREATE TABLE %s (tag text, ts timestamp, value double, PRIMARY KEY (tag, ts))");
         setPolicy("{\"hot_window\":\"2h\",\"chunk_window\":\"1h\"}");
 
@@ -430,19 +461,52 @@ public class TieredStorageServiceTest extends CQLTester
         TierRunStats stats = new TieredStorageService().runOnce(KEYSPACE, currentTable(), 5 * HOUR);
 
         assertEquals(1, stats.windowsEncoded);
-        assertEquals(1, stats.rowsEncoded); // the null-cell row is skipped, not counted or NPE'd on
+        assertEquals(2, stats.rowsEncoded); // BOTH rows, the value-less one included
 
         UntypedResultSet.Row chunkRow = execute(chunkSelectQuery(), "n", new Date(0L)).one();
-        assertEquals(1, chunkRow.getInt("samples"));
-        SampleCursor cursor = ChunkCodecs.cursor(chunkRow.getBytes("payload"));
+        assertEquals(2, chunkRow.getInt("samples"));
+        ColumnarCursor cursor = ColumnarChunkCodec.cursor(chunkRow.getBytes("payload"), null);
         assertTrue(cursor.advance());
         assertEquals(0L, cursor.timestamp());
-        assertEquals(7.5, cursor.value(), 0.0);
+        assertEquals(7.5, doubleAt(cursor, "value"), 0.0);
+        assertTrue(cursor.advance());
+        assertEquals(600_000L, cursor.timestamp());
+        assertTrue("the value-less row must round-trip as null, not as 0.0", cursor.isNull("value"));
         assertFalse(cursor.advance());
 
         // The range delete covers the whole window regardless of which individual rows had a value.
         assertEquals(0, raw("SELECT * FROM %s WHERE tag = ? AND ts >= ? AND ts < ?",
                                 "n", new Date(0L), new Date(HOUR)).size());
+
+        // ...and a plain (merged) SELECT still sees both rows, the second with a null value.
+        UntypedResultSet merged = execute("SELECT ts, value FROM %s WHERE tag = ? AND ts >= ? AND ts < ?",
+                                          "n", new Date(0L), new Date(HOUR));
+        assertEquals(2, merged.size());
+        UntypedResultSet.Row[] rows = merged.stream().toArray(UntypedResultSet.Row[]::new);
+        assertEquals(7.5, rows[0].getDouble("value"), 0.0);
+        assertFalse("the reconstructed row must have no value cell", rows[1].has("value"));
+    }
+
+    @Test
+    public void windowWithNoCellWritetimeIsLeftCompletelyUntouched() throws Throwable
+    {
+        // Every row in the window is a bare primary-key insert, so no WRITETIME exists anywhere in
+        // it. There is then no timestamp the range delete could use that is provably not newer than
+        // some row it would destroy, so the cycle must leave the window entirely alone -- not encode
+        // it and delete at a guessed timestamp.
+        createTable("CREATE TABLE %s (tag text, ts timestamp, value double, PRIMARY KEY (tag, ts))");
+        setPolicy("{\"hot_window\":\"2h\",\"chunk_window\":\"1h\"}");
+
+        execute("INSERT INTO %s (tag, ts) VALUES (?, ?) USING TIMESTAMP 10", "n", new Date(0L));
+        execute("INSERT INTO %s (tag, ts) VALUES (?, ?) USING TIMESTAMP 11", "n", new Date(600_000L));
+        insertRow("n", 4 * HOUR, 999.0, 200); // hot row -- keeps the tag enumerated
+
+        TierRunStats stats = new TieredStorageService().runOnce(KEYSPACE, currentTable(), 5 * HOUR);
+
+        assertEquals(0, stats.windowsEncoded);
+        assertEquals(0, execute(chunkSelectQuery(), "n", new Date(0L)).size());
+        assertEquals(2, raw("SELECT ts FROM %s WHERE tag = ? AND ts >= ? AND ts < ?",
+                            "n", new Date(0L), new Date(HOUR)).size());
     }
 
     @Test
@@ -673,6 +737,23 @@ public class TieredStorageServiceTest extends CQLTester
                 tag, new Date(tsMillis), value, writetime);
     }
 
+    /** The current row's {@code name} column, decoded as a double. */
+    private static double doubleAt(ColumnarCursor cursor, String name)
+    {
+        return DoubleType.instance.compose(cursor.getBytes(name));
+    }
+
+    /** A v3 payload holding one {@code double} column called {@code value} -- what the re-encoder writes. */
+    private static ByteBuffer encodeDoubleChunk(long[] timestamps, double[] values, int count)
+    {
+        ByteBuffer[] cells = new ByteBuffer[count];
+        for (int i = 0; i < count; i++)
+            cells[i] = DoubleType.instance.decompose(values[i]);
+        SortedMap<String, ColumnarChunkCodec.ColumnInput> columns = new TreeMap<>();
+        columns.put("value", new ColumnarChunkCodec.ColumnInput(ColumnarChunkCodec.TYPE_DOUBLE_CHIMP, cells));
+        return ColumnarChunkCodec.encode(timestamps, count, columns);
+    }
+
     /**
      * Base-table verification reads must see the PHYSICAL rows, not SP3's transparent hot+chunk
      * merge - these tests assert that the re-encoder actually deleted/kept raw rows. Logical
@@ -711,7 +792,7 @@ public class TieredStorageServiceTest extends CQLTester
     private String chunkInsertQuery()
     {
         return "INSERT INTO " + chunkTableRef() +
-               " (tag, window_start, codec, samples, max_row_writetime, payload) VALUES (?, ?, 1, ?, ?, ?) " +
+               " (tag, window_start, codec, samples, max_row_writetime, payload) VALUES (?, ?, 3, ?, ?, ?) " +
                "USING TIMESTAMP ?";
     }
 }

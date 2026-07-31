@@ -124,9 +124,26 @@ public final class TransparentReads
         if (group.queries.isEmpty())
             return hot;
 
+        // Every timestamp read below assumes exactly one timestamp clustering column -- what
+        // TieringPolicy.unsupportedSchemaError enforces before anything is ever chunked. A table
+        // carrying the extension but not that shape has no chunks to merge, and must not have its
+        // ordinary SELECTs broken by this code path.
+        if (metadata.clusteringColumns().size() != 1)
+            return hot;
+
         SinglePartitionReadCommand first = group.queries.get(0);
         ClusteringIndexFilter filter = first.clusteringIndexFilter();
-        boolean reversed = filter.isReversed();
+        // WITH CLUSTERING ORDER BY (ts DESC) wraps the clustering type in ReversedType, so both
+        // Slices and the names filter's NavigableSet are ordered by DESCENDING timestamp: the
+        // comparator-order start bound is then the range's UPPER time bound, and the comparator-order
+        // end bound its LOWER one. Reading them as if ascending produces a nonsensical (usually
+        // empty) time range and silently serves no cold rows at all -- on exactly the DESC shape that
+        // is the dominant time-series idiom.
+        boolean clusteringDescending = metadata.clusteringColumns().get(0).isReversedType();
+        // The order rows must be EMITTED in, expressed as timestamps: the hot iterator runs in
+        // clustering-comparator order unless the filter reverses it, and comparator order is already
+        // descending-by-timestamp on a DESC table.
+        boolean emitDescending = clusteringDescending != filter.isReversed();
 
         long startMs;
         long endMsExcl;
@@ -136,16 +153,20 @@ public final class TransparentReads
             Slices slices = ((ClusteringIndexSliceFilter) filter).requestedSlices();
             if (slices.isEmpty())
                 return hot;
-            startMs = lowerBoundMs(slices.get(0).start());
-            endMsExcl = upperBoundMsExclusive(slices.get(slices.size() - 1).end());
+            ClusteringBound<?> comparatorStart = slices.get(0).start();
+            ClusteringBound<?> comparatorEnd = slices.get(slices.size() - 1).end();
+            startMs = lowerBoundMs(clusteringDescending ? comparatorEnd : comparatorStart);
+            endMsExcl = upperBoundMsExclusive(clusteringDescending ? comparatorStart : comparatorEnd);
         }
         else if (filter instanceof ClusteringIndexNamesFilter)
         {
             exactClusterings = ((ClusteringIndexNamesFilter) filter).requestedRows();
             if (exactClusterings.isEmpty())
                 return hot;
-            startMs = clusteringMs(exactClusterings.first());
-            endMsExcl = clusteringMs(exactClusterings.last()) + 1;
+            Clustering<?> comparatorFirst = exactClusterings.first();
+            Clustering<?> comparatorLast = exactClusterings.last();
+            startMs = clusteringMs(clusteringDescending ? comparatorLast : comparatorFirst);
+            endMsExcl = clusteringMs(clusteringDescending ? comparatorFirst : comparatorLast) + 1;
         }
         else
         {
@@ -163,9 +184,13 @@ public final class TransparentReads
         long queryStartMs = startMs;
         long queryEndMsExcl = endMsExcl;
         NavigableSet<Clustering<?>> exact = exactClusterings;
+        // chunkRows is told the TIMESTAMP order to emit in; the merge decorator is told whether the
+        // iterator runs against clustering-comparator order, which is filter.isReversed() -- the
+        // comparator itself already encodes the DESC-ness.
         return ChunkMergePartitionIterator.wrap(hot, keys,
-                                                key -> chunkRows(metadata, policy, key, queryStartMs, queryEndMsExcl, exact, reversed, cl),
-                                                metadata, reversed);
+                                                key -> chunkRows(metadata, policy, key, queryStartMs, queryEndMsExcl,
+                                                                 exact, emitDescending, cl),
+                                                metadata, filter.isReversed());
     }
 
     /** True when {@link #maybeWrap} returned a merge wrapper rather than the hot iterator itself. */
@@ -174,13 +199,14 @@ public final class TransparentReads
         return iterator instanceof ChunkMergePartitionIterator;
     }
 
+    /** @param descending emit rows newest-timestamp-first (see {@code emitDescending} in {@link #maybeWrap}) */
     private static List<Row> chunkRows(TableMetadata metadata,
                                        TieringPolicy policy,
                                        DecoratedKey key,
                                        long startMs,
                                        long endMsExcl,
                                        NavigableSet<Clustering<?>> exactClusterings,
-                                       boolean reversed,
+                                       boolean descending,
                                        ConsistencyLevel cl)
     {
         // Windows are floor-aligned: a chunk whose window_start is up to one chunk_window before the
@@ -236,8 +262,8 @@ public final class TransparentReads
         List<UntypedResultSet.Row> ordered = new ArrayList<>();
         for (UntypedResultSet.Row chunk : chunks)
             ordered.add(chunk);
-        if (reversed)
-            java.util.Collections.reverse(ordered);       // windows arrive in ascending clustering order
+        if (descending)
+            java.util.Collections.reverse(ordered);       // windows arrive in ascending window_start order
 
         for (UntypedResultSet.Row chunk : ordered)
         {
@@ -246,7 +272,7 @@ public final class TransparentReads
                 List<Row> rows = ChunkReadSupport.rowsFromChunk(metadata,
                                                                 chunk.getBytes("payload"),
                                                                 chunk.getLong("max_row_writetime"),
-                                                                startMs, endMsExcl, reversed);
+                                                                startMs, endMsExcl, descending);
                 if (exactClusterings != null)
                 {
                     for (Row row : rows)
@@ -288,20 +314,26 @@ public final class TransparentReads
         return result;
     }
 
-    private static long lowerBoundMs(ClusteringBound<?> start)
+    /**
+     * The inclusive lower TIME bound expressed by a slice bound that restricts timestamps from below
+     * -- the comparator-order start on an ASC clustering, the comparator-order end on a DESC one. An
+     * unbounded bound is either BOTTOM (ASC) or TOP (DESC), hence both are tested.
+     */
+    private static long lowerBoundMs(ClusteringBound<?> bound)
     {
-        if (start.isBottom())
+        if (bound.isBottom() || bound.isTop())
             return Long.MIN_VALUE;
-        long ms = boundMs(start);
-        return start.isInclusive() ? ms : ms + 1;
+        long ms = boundMs(bound);
+        return bound.isInclusive() ? ms : ms + 1;
     }
 
-    private static long upperBoundMsExclusive(ClusteringBound<?> end)
+    /** The exclusive upper TIME bound of a slice bound that restricts timestamps from above (see above). */
+    private static long upperBoundMsExclusive(ClusteringBound<?> bound)
     {
-        if (end.isTop())
+        if (bound.isTop() || bound.isBottom())
             return Long.MAX_VALUE;
-        long ms = boundMs(end);
-        return end.isInclusive() ? ms + 1 : ms;
+        long ms = boundMs(bound);
+        return bound.isInclusive() ? ms + 1 : ms;
     }
 
     private static long boundMs(ClusteringBound<?> bound)

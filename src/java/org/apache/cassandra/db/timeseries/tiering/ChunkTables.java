@@ -37,12 +37,19 @@ import org.apache.cassandra.schema.TableParams;
 
 /**
  * Creates and names the per-table shadow "chunk table" that the background re-encoder
- * ({@link TieredStorageService}) writes Chimp128-encoded chunks into.
+ * ({@link TieredStorageService}) writes columnar chunks into.
  * <p>
  * The chunk table mirrors the base table's <b>whole</b> partition key -- every column, same names,
  * same types, same order -- so a chunk partition maps one-to-one onto a base partition whatever the
  * base key's arity, and adds a fixed set of clustering/regular columns describing the encoded chunk
  * ({@value #CLUSTERING_COLUMN} plus {@link #RESERVED_COLUMN_NAMES}).
+ * <p>
+ * One chunk row is one window of one partition, holding <b>every regular column</b> of the base
+ * table over that window's shared timestamp axis -- not a stream of {@code (timestamp, value)}
+ * samples. Its {@value #SAMPLES_COLUMN} is the number of rows encoded (not the number of values),
+ * and its {@value #CODEC_COLUMN} is the payload's own leading version byte -- copied out of the blob
+ * after encoding rather than named by the writer, so it always describes what was actually stored
+ * (3 = {@link org.apache.cassandra.db.timeseries.ColumnarChunkCodec}, the only format written).
  */
 public final class ChunkTables
 {
