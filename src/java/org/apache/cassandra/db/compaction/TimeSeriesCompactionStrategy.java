@@ -39,6 +39,7 @@ import org.apache.cassandra.exceptions.ConfigurationException;
 import org.apache.cassandra.io.sstable.format.SSTableReader;
 import org.apache.cassandra.schema.CompactionParams;
 import org.apache.cassandra.utils.Clock;
+import org.apache.cassandra.utils.NoSpamLogger;
 
 /**
  * Time-series compaction: SSTables are classified into fixed time windows by max timestamp.
@@ -151,8 +152,21 @@ public class TimeSeriesCompactionStrategy extends AbstractCompactionStrategy
     {
         Set<SSTableReader> active = new HashSet<>();
         for (SSTableReader sstable : sstables)
-            if (tsOptions.isActiveWindow(tsOptions.windowStartFor(maxTimestampMillis(sstable)), nowMillis))
+        {
+            long windowStart = tsOptions.windowStartFor(maxTimestampMillis(sstable));
+            if (tsOptions.isFarFutureWindow(windowStart, nowMillis))
+            {
+                // Garbage/misconfigured-writer timestamps: keep them out of both the UCS delegate and the
+                // freeze machinery, and complain (throttled) so the operator investigates (design spec section 8).
+                NoSpamLogger.log(logger, NoSpamLogger.Level.WARN, 1, TimeUnit.MINUTES,
+                                 "{} has sstable(s) with max timestamp beyond now + {}ms (e.g. {} in window {}); " +
+                                 "excluding from compaction - check writer clocks or USING TIMESTAMP inputs",
+                                 cfs.getTableName(), tsOptions.maxFutureWindowMillis, sstable, windowStart);
+                continue;
+            }
+            if (tsOptions.isActiveWindow(windowStart, nowMillis))
                 active.add(sstable);
+        }
 
         Set<SSTableReader> inDelegate = new HashSet<>(delegate.getSSTables());
         Set<SSTableReader> toRemove = new HashSet<>(inDelegate);
@@ -168,6 +182,49 @@ public class TimeSeriesCompactionStrategy extends AbstractCompactionStrategy
     long maxTimestampMillis(SSTableReader sstable)
     {
         return TimeUnit.MILLISECONDS.convert(sstable.getMaxTimestamp(), tsOptions.timestampResolution);
+    }
+
+    long minTimestampMillis(SSTableReader sstable)
+    {
+        return TimeUnit.MILLISECONDS.convert(sstable.getMinTimestamp(), tsOptions.timestampResolution);
+    }
+
+    /** Window states, derived statelessly from sstable min/max timestamps every round (design spec section 3). */
+    public enum WindowState { CURRENT, CLOSING, FREEZING, FROZEN, EXPIRED }
+
+    /**
+     * Classifies one window of this instance's sstable slice. Stateless: nothing is persisted, the state is a
+     * pure function of (window key, sstables, now) - restart-safe, and a FROZEN window that gains a late
+     * sstable reverts to FREEZING simply because the derivation changes (design spec sections 3-4).
+     * <p>
+     * FROZEN demands a single sstable <b>fully contained</b> in the window ({@code windowStartFor(min) ==
+     * windowStartFor(max)}). A single sstable spanning window boundaries classifies FREEZING - it is not
+     * frozen - but freeze selection ({@link #nextFreezeCandidate}) will not pick a single-sstable window:
+     * rewriting one spanning sstable cannot fix containment before T3's flush-split lands, and trying would
+     * recompact it forever.
+     * <p>
+     * Scope: the CompactionStrategyManager splits strategy instances per repair status and per disk, so this
+     * judgment (and the frozen event) is per instance slice, never per table.
+     * <p>
+     * Precondition: callers filter far-future windows first via
+     * {@link TimeSeriesCompactionStrategyOptions#isFarFutureWindow} (design spec section 8).
+     */
+    @VisibleForTesting
+    WindowState classify(long windowStartMillis, Set<SSTableReader> windowSSTables, long nowMillis)
+    {
+        if (tsOptions.isExpiredWindow(windowStartMillis, nowMillis))
+            return WindowState.EXPIRED;
+        if (tsOptions.isCurrentWindow(windowStartMillis, nowMillis))
+            return WindowState.CURRENT;
+        if (tsOptions.isActiveWindow(windowStartMillis, nowMillis))
+            return WindowState.CLOSING;
+        if (windowSSTables.size() == 1)
+        {
+            SSTableReader only = windowSSTables.iterator().next();
+            if (tsOptions.windowStartFor(minTimestampMillis(only)) == tsOptions.windowStartFor(maxTimestampMillis(only)))
+                return WindowState.FROZEN;
+        }
+        return WindowState.FREEZING;
     }
 
     @VisibleForTesting
@@ -207,10 +264,15 @@ public class TimeSeriesCompactionStrategy extends AbstractCompactionStrategy
     @Override
     public List<AbstractCompactionTask> getMaximalTasks(long gcBefore, boolean splitOutput)
     {
+        return getMaximalTasksAt(Clock.Global.currentTimeMillis(), gcBefore, splitOutput);
+    }
+
+    @VisibleForTesting
+    List<AbstractCompactionTask> getMaximalTasksAt(long nowMillis, long gcBefore, boolean splitOutput)
+    {
         // Preserve the window invariant for maximal compaction too: never cross windows, one task per window.
-        // A window that is itself expired (per the real clock) is routed through TimeSeriesCompactionTask so
-        // its retention cutoff is honoured here too, rather than silently rewriting it via a plain CompactionTask.
-        long nowMillis = Clock.Global.currentTimeMillis();
+        // A window that is itself expired is routed through TimeSeriesCompactionTask so its retention cutoff
+        // is honoured here too, rather than silently rewriting it via a plain CompactionTask.
         List<AbstractCompactionTask> tasks = new ArrayList<>();
         for (Map.Entry<Long, Set<SSTableReader>> entry : windows().entrySet())
         {

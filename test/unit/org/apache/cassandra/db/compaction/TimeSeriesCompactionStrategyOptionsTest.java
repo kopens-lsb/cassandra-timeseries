@@ -175,6 +175,8 @@ public class TimeSeriesCompactionStrategyOptionsTest
         assertTrue(opts.isActiveWindow(currentStart - opts.windowSizeMillis, now));
         // 창 시작 시각 자신(windowEnd == now + windowSize)은 CURRENT
         assertTrue(opts.isCurrentWindow(currentStart, currentStart));
+        // 경계 고정: 창 끝이 정확히 now인 창은 더 이상 CURRENT가 아니다 — >를 >=로 바꾸는 리팩토링은 실패해야 한다
+        assertFalse(opts.isCurrentWindow(currentStart, currentStart + opts.windowSizeMillis));
     }
 
     @Test
@@ -188,6 +190,8 @@ public class TimeSeriesCompactionStrategyOptionsTest
         assertTrue(opts.isFarFutureWindow(opts.windowStartFor(now + 2 * day), now));
         // 쓰레기 타임스탬프의 창(Long.MAX_VALUE 근처)도 반드시 far-future 판정 — 오버플로로 뒤집히면 안 된다
         assertTrue(opts.isFarFutureWindow(opts.windowStartFor(Long.MAX_VALUE - 775_000L), now));
+        // 경계 고정: 정확히 now + max_future_window에 시작하는 창은 far-future가 아니다 — >를 >=로 바꾸면 실패해야 한다
+        assertFalse(opts.isFarFutureWindow(now + opts.maxFutureWindowMillis, now));
     }
 
     @Test
