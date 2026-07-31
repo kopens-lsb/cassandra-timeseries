@@ -326,6 +326,130 @@ public class TieredStorageColumnsTest extends CQLTester
         assertFalse(cursor.advance());
     }
 
+    // ---- deletes against an already-chunked window: a KNOWN, UNFIXED defect ----
+
+    /*
+     * ==========================================================================================
+     *  CRITICAL KNOWN DEFECT -- the four tests below pin BROKEN behaviour on purpose.
+     *
+     *  A DELETE (cell, row, clustering-range or partition) against a window that tiering has
+     *  already chunked is NOT honoured: the deleted data is served again by the very next SELECT.
+     *
+     *  Why: SelectStatement hands TransparentReads an already-FILTERED PartitionIterator.
+     *  db/transform/Filter has by then run purge(PURGE_ALL) over every row and returned null from
+     *  applyToMarker, so every tombstone -- cell, row, range and partition -- is gone before the
+     *  chunk rows are merged in. The merge cannot reconcile against deletion information it can
+     *  never see.
+     *
+     *  Merging on the UNFILTERED stream instead (before Filter) was implemented and measured, and
+     *  does not work either without changing tiering's central invariant: the re-encoder deletes
+     *  the source rows with USING TIMESTAMP maxWt, and the chunk reconstructs those same rows with
+     *  cell timestamp max_row_writetime == maxWt. DeletionTime.deletes() is `timestamp <= marked
+     *  ForDeleteAt`, so the re-encoder's own range tombstone shadows everything the chunk rebuilds.
+     *  Measured output of the unfiltered merge for the first test below:
+     *
+     *      Marker INCL_START_BOUND(1970-01-01T00:00:00.000Z)@100   <- the re-encoder's own delete
+     *      Row: ts=0 | [value=<tombstone> ts=300]                  <- only the user's DELETE left
+     *      Marker INCL_END_BOUND(1970-01-01T00:00:00.000Z)@100
+     *
+     *  i.e. quality=192 and value=1.5 were both eliminated by tiering's own tombstone.
+     *
+     *  See .superpowers/sdd/sp4-columnar-chunks/task-3-report.md "Fix round 1" for the full
+     *  analysis and the two candidate resolutions. DO NOT read these tests as a specification --
+     *  they exist so the defect cannot be forgotten and so its blast radius is written down.
+     * ==========================================================================================
+     */
+
+    private void chunkOneRow() throws Throwable
+    {
+        createTable("CREATE TABLE %s (tag text, ts timestamp, value double, quality int, PRIMARY KEY (tag, ts))");
+        setPolicy("{\"hot_window\":\"2h\",\"chunk_window\":\"1h\"}");
+        execute("INSERT INTO %s (tag, ts, value, quality) VALUES ('t', ?, 1.5, 192) USING TIMESTAMP 100",
+                new Date(0L));
+        execute("INSERT INTO %s (tag, ts, value) VALUES ('t', ?, 9.0) USING TIMESTAMP 150", new Date(4 * HOUR));
+        assertEquals(1, new TieredStorageService().runOnce(KEYSPACE, currentTable(), 5 * HOUR).windowsEncoded);
+        assertEquals(0, raw("SELECT ts FROM %s WHERE tag = 't' AND ts < ?", new Date(HOUR)).size());
+    }
+
+    @Test
+    public void deletingOneCellOfAChunkedRowIsSilentlyIgnored_KNOWN_DEFECT() throws Throwable
+    {
+        chunkOneRow();
+        execute("DELETE value FROM %s USING TIMESTAMP 300 WHERE tag = 't' AND ts = ?", new Date(0L));
+
+        UntypedResultSet rows = execute("SELECT value, quality FROM %s WHERE tag = 't' AND ts = ?", new Date(0L));
+        assertEquals(1, rows.size());
+        assertTrue("DEFECT: the deleted cell is served again from the chunk", rows.one().has("value"));
+        assertEquals(1.5, rows.one().getDouble("value"), 0.0);
+    }
+
+    @Test
+    public void deletingAChunkedRowIsSilentlyIgnored_KNOWN_DEFECT() throws Throwable
+    {
+        chunkOneRow();
+        execute("DELETE FROM %s USING TIMESTAMP 300 WHERE tag = 't' AND ts = ?", new Date(0L));
+
+        assertEquals("DEFECT: the deleted row is served again from the chunk",
+                     1, execute("SELECT value FROM %s WHERE tag = 't' AND ts = ?", new Date(0L)).size());
+    }
+
+    @Test
+    public void deletingAChunkedRangeIsSilentlyIgnored_KNOWN_DEFECT() throws Throwable
+    {
+        chunkOneRow();
+        execute("DELETE FROM %s USING TIMESTAMP 300 WHERE tag = 't' AND ts >= ? AND ts < ?",
+                new Date(0L), new Date(HOUR));
+
+        assertEquals("DEFECT: the range-deleted window is served again from the chunk",
+                     1, execute("SELECT value FROM %s WHERE tag = 't' AND ts < ?", new Date(HOUR)).size());
+    }
+
+    @Test
+    public void deletingAChunkedPartitionIsSilentlyIgnored_KNOWN_DEFECT() throws Throwable
+    {
+        chunkOneRow();
+        execute("DELETE FROM %s USING TIMESTAMP 300 WHERE tag = 't'");
+
+        // The hot row goes (it is a real base row); everything the chunk holds comes back.
+        assertEquals("DEFECT: the deleted partition's chunked rows are served again",
+                     1, execute("SELECT value FROM %s WHERE tag = 't'").size());
+    }
+
+    // ---- values Cassandra accepts that a fixed-width column codec cannot represent ----
+
+    @Test
+    public void anEmptyFixedWidthValueDoesNotWedgeTheTag() throws Throwable
+    {
+        // `blobAsInt(0x)` is legal CQL and Int32Serializer.validate accepts 0 bytes as well as 4, so
+        // a present-but-empty int cell can reach the encoder. Before the width check it hit
+        // ByteBuffer.getInt() on a 0-byte array, the per-tag handler logged the BufferUnderflow and
+        // skipped -- identically every cycle, so that partition never tiered again.
+        createTable("CREATE TABLE %s (tag text, ts timestamp, quality int, value double, PRIMARY KEY (tag, ts))");
+        setPolicy("{\"hot_window\":\"2h\",\"chunk_window\":\"1h\"}");
+
+        execute("INSERT INTO %s (tag, ts, quality, value) VALUES ('t', ?, 192, 1.0) USING TIMESTAMP 100",
+                new Date(0L));
+        // Non-constant in this window (192 vs empty), which is what makes the column take the
+        // fixed-width section path rather than the O(1) constant path.
+        execute("INSERT INTO %s (tag, ts, quality, value) VALUES ('t', ?, blobAsInt(0x), 2.0) " +
+                "USING TIMESTAMP 101", new Date(600_000L));
+        execute("INSERT INTO %s (tag, ts, value) VALUES ('t', ?, 9.0) USING TIMESTAMP 150", new Date(4 * HOUR));
+
+        TierRunStats stats = new TieredStorageService().runOnce(KEYSPACE, currentTable(), 5 * HOUR);
+        assertEquals(1, stats.windowsEncoded);
+        assertEquals(2, stats.rowsEncoded);
+        assertEquals(0, raw("SELECT ts FROM %s WHERE tag = 't' AND ts < ?", new Date(HOUR)).size());
+
+        ColumnarCursor cursor = ColumnarChunkCodec.cursor(execute(chunkSelectQuery(), "t", new Date(0L))
+                                                          .one().getBytes("payload"), null);
+        assertTrue(cursor.advance());
+        assertEquals(192, (int) Int32Type.instance.compose(cursor.getBytes("quality")));
+        assertTrue(cursor.advance());
+        assertEquals("the empty value must round-trip as the empty value, byte for byte",
+                     0, cursor.getBytes("quality").remaining());
+        assertFalse(cursor.advance());
+    }
+
     // ---- the writetime invariant, across columns ----
 
     @Test

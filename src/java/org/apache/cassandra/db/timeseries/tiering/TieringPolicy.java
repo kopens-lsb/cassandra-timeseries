@@ -108,8 +108,12 @@ public final class TieringPolicy
      * Upper bound on {@code chunk_window}. The re-encoder materializes one chunk window's worth of a
      * tag's rows in memory at a time (its whole memory-boundedness story -- see
      * {@link TieredStorageService}), so an over-large window turns "bounded by one window" into
-     * "bounded by nothing": a year-long window on a high-rate tag is an OOM, and anything past the
-     * codec's per-chunk sample limit ({@code ChunkCodecs.MAX_SAMPLES}) could never be encoded anyway.
+     * "bounded by nothing": a year-long window on a high-rate tag is an OOM.
+     * <p>
+     * Note this bounds a window in <b>time</b>, never in rows -- an event-driven tag can put any
+     * number of rows into 31 days. The row bound is
+     * {@code TieredStorageService.maxSamplesPerWindow}, which aborts the tag with an error naming
+     * this option when a window exceeds it.
      */
     private static final String MAX_CHUNK_WINDOW = "31d";
     private static final long MAX_CHUNK_WINDOW_MILLIS = TimeUnit.DAYS.toMillis(31);

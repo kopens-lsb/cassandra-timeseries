@@ -473,6 +473,10 @@ CREATE TABLE ts.tag_point (
 
 > `default_time_to_live`가 있고 `hot_window >= TTL`이면 재인코더가 데이터를 보기 전에 TTL이 먼저 지워 **아무것도 압축되지 않습니다**. 거부하지는 않지만 두 값을 밝힌 WARN을 남깁니다.
 
+> **⚠️ 계층화 켜기 전에 반드시 알아야 할 두 가지 (상세: [tiered-storage.md §1.1, §5.1.2](doc/timeseries/tiered-storage.md))**
+> 1. **청크화된 구간의 `DELETE`는 적용되지 않습니다** — 셀·행·레인지·파티션 삭제 모두, 지운 데이터가 다음 `SELECT`에서 다시 나옵니다(오류도 경고도 없음). 알려진 결함이며 수정 이월. 콜드 데이터 삭제는 `cold_window` 만료를 쓰십시오.
+> 2. **TTL은 청크화되면서 사라집니다** — `default_time_to_live`로 만료시키던 데이터가 청크로 옮겨지면 영구 보존됩니다. TTL에 의존했다면 같은 기간을 `cold_window`에 설정하십시오.
+
 재인코더는 **일반 컬럼 전부**를 청크 1개에 담습니다: 창의 타임스탬프 축을 한 번만 저장하고 컬럼마다 독립 섹션에 **직렬화 바이트 그대로** 넣으므로, `double`/`boolean`/`int`/`bigint`/`timestamp`/`date`/`text`는 전용 코덱을, 나머지(`blob`·`uuid`·`timeuuid`·frozen 컬렉션 등)는 불투명 바이트 폴백을 탑니다. `null` 셀은 `null`로 그대로 왕복하고, 값이 전부 같은 컬럼은 O(1)(0바이트)로 접힙니다. 자세한 표는 [tiered-storage.md §3.1.1](doc/timeseries/tiered-storage.md) 참고.
 
 ### 12.2 압축 켜기 — CQL 한 줄

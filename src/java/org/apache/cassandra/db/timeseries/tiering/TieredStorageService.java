@@ -166,15 +166,22 @@ public class TieredStorageService implements TieredStorageServiceMBean
     volatile BiConsumer<String, String> preRunHookForTesting;
 
     /**
-     * Hard cap on the samples a single (tag, window) may accumulate in one cycle -- the codec's
-     * per-chunk limit ({@link ColumnarChunkCodec#MAX_ROWS}), pre-checked here so an over-dense window
-     * is aborted while still paging (memory stays bounded) with an actionable error, instead of being
-     * fully materialized and then blowing up in {@code ColumnarChunkCodec.encode} every cycle forever.
-     * Non-final only as a test seam: shrinking it lets a test trigger the abort with a handful of
-     * rows; production code must never write it.
+     * Hard cap on the rows a single (tag, window) may accumulate in one cycle, pre-checked while
+     * still paging so an over-dense window is aborted with an actionable error instead of being
+     * fully materialized first.
+     * <p>
+     * This is a <b>memory</b> budget, not the format's limit ({@link ColumnarChunkCodec#MAX_ROWS} is
+     * 16.7M, which the columnar re-encoder could never afford): one window in flight holds the read
+     * rows, a {@code TreeMap<Long, ByteBuffer[]>} entry per row, and a {@code ByteBuffer[count]} per
+     * regular column, so peak memory scales with rows x (1 + columns), not with rows alone. 200k
+     * covers a full day of 1-second data (86,400 rows) and a month of the measured production cadence
+     * (24s -> ~112k rows) with room to spare, while keeping the worst case on a wide table to a few
+     * hundred MB; {@code chunk_window} bounds a window in time (max 31d), never in rows, so this is
+     * the only thing that bounds it at all. Non-final only as a test seam: shrinking it lets a test
+     * trigger the abort with a handful of rows; production code must never write it.
      */
     @VisibleForTesting
-    volatile int maxSamplesPerWindow = ColumnarChunkCodec.MAX_ROWS;
+    volatile int maxSamplesPerWindow = 200_000;
 
     /**
      * Registers the {@value #MBEAN_NAME} MBean and schedules the single, process-wide sweep

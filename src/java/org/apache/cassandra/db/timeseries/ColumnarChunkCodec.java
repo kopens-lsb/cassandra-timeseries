@@ -215,6 +215,7 @@ public final class ColumnarChunkCodec
         byte flags = allPresent ? FLAG_ALL_PRESENT : 0;
         byte[] sectionBytes = EMPTY_BYTES;
         byte[] constBytes = null;
+        byte typeCode = input.typeCode;
 
         if (allNull)
         {
@@ -235,6 +236,15 @@ public final class ColumnarChunkCodec
                 }
             }
 
+            // A fixed-width code re-serializes at its own width, so a present value of any other
+            // length cannot round-trip through it (and would fail the section encoder outright:
+            // getDouble/getInt/getLong underflow, boolean indexes byte 0). Cassandra does allow
+            // such values -- `blobAsInt(0x)` is legal and Int32Serializer.validate accepts 0 bytes
+            // as well as 4 -- so downgrade this column, in this chunk only, to the opaque code that
+            // stores whatever bytes it is given. Type codes are per column per chunk, so the reader
+            // needs no special case and the values still round-trip byte-for-byte.
+            typeCode = widthCompatible(typeCode, presentBytes) ? typeCode : TYPE_OPAQUE;
+
             boolean constant = true;
             for (int i = 1; i < presentCount; i++)
             {
@@ -252,11 +262,11 @@ public final class ColumnarChunkCodec
             }
             else
             {
-                sectionBytes = encodeSection(name, input.typeCode, presentBytes, presentCount);
+                sectionBytes = encodeSection(name, typeCode, presentBytes, presentCount);
             }
         }
 
-        directory.write(input.typeCode);
+        directory.write(typeCode);
         directory.write(flags);
         directory.write(nameBytes.length);
         directory.write(nameBytes, 0, nameBytes.length);
@@ -271,6 +281,38 @@ public final class ColumnarChunkCodec
             nullBitmaps.writeBytes(encodeNullBitmap(presence, count));
 
         dataSections.add(sectionBytes);
+    }
+
+    /**
+     * The exact serialized length a value must have for {@code typeCode}'s fixed-width encoding, or
+     * 0 for the variable-width codes (text/opaque), which accept any length.
+     */
+    private static int fixedWidthOf(byte typeCode)
+    {
+        switch (typeCode)
+        {
+            case TYPE_DOUBLE_CHIMP:
+            case TYPE_INT64:
+                return 8;
+            case TYPE_INT32:
+                return 4;
+            case TYPE_BOOLEAN:
+                return 1;
+            default:
+                return 0;
+        }
+    }
+
+    /** True if every present value can round-trip through {@code typeCode} (see {@link #fixedWidthOf}). */
+    private static boolean widthCompatible(byte typeCode, byte[][] presentBytes)
+    {
+        int width = fixedWidthOf(typeCode);
+        if (width == 0)
+            return true;
+        for (byte[] bytes : presentBytes)
+            if (bytes.length != width)
+                return false;
+        return true;
     }
 
     private static byte[] encodeSection(String name, byte typeCode, byte[][] presentBytes, int n)

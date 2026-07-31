@@ -64,6 +64,17 @@ import org.apache.cassandra.db.timeseries.ColumnarChunkCodec;
  * <p>
  * Counter columns and non-frozen (multi-cell) columns never reach here --
  * {@link TieringPolicy#unsupportedSchemaError} rejects those tables outright.
+ * <p>
+ * The mapping is per column <em>type</em>, but a chunk records a type code per column per chunk, and
+ * {@link ColumnarChunkCodec#encode} downgrades a column to {@code TYPE_OPAQUE} for that one chunk if
+ * any of its present values is not exactly the fixed width the code re-serializes at. That covers
+ * the values Cassandra accepts but the natural code cannot represent -- {@code blobAsInt(0x)} is
+ * legal and deserializes as a 0-byte {@code int} -- without a schema-level special case.
+ * <p>
+ * One documented non-byte-exactness: {@code boolean} values are stored as one bit, so a cell whose
+ * serialized byte is neither {@code 0x00} nor {@code 0x01} (e.g. {@code blobAsBoolean(0x02)}, which
+ * Cassandra reads as {@code true}) decodes back as {@code 0x01}. The composed CQL value is
+ * unchanged; only the byte pattern is normalised.
  */
 public final class ChunkColumnTypes
 {
