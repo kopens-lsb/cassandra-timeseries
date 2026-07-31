@@ -113,6 +113,45 @@ check() {
     return 0
 }
 
+ntool() { $RUNTIME exec "$CONTAINER" nodetool "$@" 2>&1; }
+
+# check_nodetool <description> <extended regex, or '' for exit-code-only> <nodetool args...>
+# Same contract and reporting as check, but runs nodetool in the container instead of cqlsh;
+# the command must exit 0 AND (if a regex is given) its output must match it.
+check_nodetool() {
+    local desc="$1" expect="$2"; shift 2
+    local out rc status t0 t1 ms
+    t0=$(date +%s%3N)
+    out=$(ntool "$@"); rc=$?
+    t1=$(date +%s%3N); ms=$((t1 - t0))
+    if [ "$rc" -eq 0 ] && { [ -z "$expect" ] || printf '%s' "$out" | grep -qE -- "$expect"; }; then
+        PASS=$((PASS + 1)); status="ok  "
+    else
+        FAIL=$((FAIL + 1)); status="FAIL"
+    fi
+    local flat="nodetool $*"
+    printf '\n   [%s] %-56s %6s ms\n' "$status" "$desc" "$ms"
+    printf '        cmd> %s\n' "$flat"
+    printf '%s\n' "$out" | grep -vE '^[[:space:]]*$' | sed 's/^/        /'
+    [ "$status" = FAIL ] && printf '        !! exit=%s, expected to match: /%s/\n' "$rc" "$expect"
+
+    {
+        printf '<tr class="%s"><td class="st">%s</td><td>%s</td><td><pre>%s</pre></td><td><pre>%s</pre></td><td class="ms">%s ms</td></tr>\n' \
+            "$([ "$status" = FAIL ] && echo fail || echo pass)" \
+            "$([ "$status" = FAIL ] && echo '✗ FAIL' || echo '✓ pass')" \
+            "$(printf '%s' "$desc" | esc)" \
+            "$(printf '%s' "$flat" | esc)" \
+            "$(printf '%s' "$out" | grep -vE '^[[:space:]]*$' | esc)" \
+            "$ms"
+    } >> "$ROWS"
+    {
+        printf '\n### %s %s — `%s ms`\n\n```sql\n%s\n```\n\n```\n%s\n```\n' \
+            "$([ "$status" = FAIL ] && echo '❌' || echo '✅')" "$desc" "$ms" "$flat" \
+            "$(printf '%s\n' "$out" | grep -vE '^[[:space:]]*$')"
+    } >> "$MDROWS"
+    return 0
+}
+
 write_report() {
     mkdir -p "$(dirname "$REPORT")"
     {
@@ -373,6 +412,71 @@ check "LIKE combines with time_bucket aggregation" \
         AND msg LIKE '%connection%'
       GROUP BY device, time_bucket(1h, ts);" \
     '^ *2024-01-01 09:00:00.* 2'
+
+section "tiered storage: policy, retier, chunk re-encode, late merge"
+# Canonical time-series table for the re-encoder: single text partition key, timestamp
+# clustering, double value (the exact shape TieringPolicy.canonicalSchemaError demands).
+cql "
+CREATE TABLE IF NOT EXISTS it.sensor (
+    tag_id text, timestamp timestamp, value double,
+    PRIMARY KEY (tag_id, timestamp)
+);
+" > /dev/null
+
+# Policy: hot_window 1h / chunk_window 1h, so the rows inserted 4 hours in the past below are
+# already closed. The extension value is the policy JSON as a hex blob literal — this constant is
+# hex of exactly (regenerate with: printf '%s' '<json>' | od -An -v -tx1 | tr -d ' \n'):
+#   {"hot_window":"1h","chunk_window":"1h","interval":"5m"}
+TIERING_HEX=7b22686f745f77696e646f77223a223168222c226368756e6b5f77696e646f77223a223168222c22696e74657276616c223a22356d227d
+
+# Hour-aligned chunk window 4 hours in the past (epoch-millis CQL timestamp literals throughout,
+# so the assertions do not depend on any date-formatting tool).
+NOW_MS=$(date +%s%3N)
+WIN_MS=$(( (NOW_MS / 3600000 - 4) * 3600000 ))
+WIN_END_MS=$(( WIN_MS + 3600000 ))
+
+check "ALTER TABLE installs the tiering policy (hex JSON)" \
+    "ALTER TABLE it.sensor WITH extensions = {'timeseries_tiering': 0x$TIERING_HEX};
+     SELECT extensions FROM system_schema.tables WHERE keyspace_name='it' AND table_name='sensor';" \
+    'timeseries_tiering'
+
+cql "
+INSERT INTO it.sensor (tag_id, timestamp, value) VALUES ('pump-01', $(( WIN_MS +  300000 )), 10);
+INSERT INTO it.sensor (tag_id, timestamp, value) VALUES ('pump-01', $(( WIN_MS +  900000 )), 20);
+INSERT INTO it.sensor (tag_id, timestamp, value) VALUES ('pump-01', $(( WIN_MS + 1500000 )), 30);
+" > /dev/null
+
+check_nodetool "nodetool retier runs one re-encode cycle" '' retier it sensor
+check "chunk row created for the window (samples = 3)" \
+    "SELECT samples FROM it.sensor__chunks WHERE tag_id='pump-01' AND window_start=$WIN_MS;" \
+    '^ *3'
+check "re-encoded base rows are deleted" \
+    "SELECT count(*) FROM it.sensor WHERE tag_id='pump-01' AND timestamp >= $WIN_MS AND timestamp < $WIN_END_MS;" \
+    '^ *0'
+check "window remains queryable via the chunk table" \
+    "SELECT tag_id, window_start, codec, samples FROM it.sensor__chunks WHERE tag_id='pump-01';" \
+    '\(1 rows\)'
+
+# Late row into the already-encoded window: its server-side writetime is newer than the range
+# tombstone the first cycle issued (USING TIMESTAMP maxWt), so it survives to be merged.
+cql "INSERT INTO it.sensor (tag_id, timestamp, value) VALUES ('pump-01', $(( WIN_MS + 2100000 )), 40);" > /dev/null
+check "late row survives the first cycle's range tombstone" \
+    "SELECT count(*) FROM it.sensor WHERE tag_id='pump-01' AND timestamp >= $WIN_MS AND timestamp < $WIN_END_MS;" \
+    '^ *1'
+
+check_nodetool "nodetool retier merges the late row" '' retier it sensor
+check "chunk re-encoded merged (samples 3 -> 4)" \
+    "SELECT samples FROM it.sensor__chunks WHERE tag_id='pump-01' AND window_start=$WIN_MS;" \
+    '^ *4'
+check "merged late row's base copy is deleted" \
+    "SELECT count(*) FROM it.sensor WHERE tag_id='pump-01' AND timestamp >= $WIN_MS AND timestamp < $WIN_END_MS;" \
+    '^ *0'
+
+check_nodetool "nodetool tieringstatus lists it.sensor (interval 5m)" 'it +sensor +300000' tieringstatus
+check "system_views.timeseries_tiering exposes policy and run stats" \
+    "SELECT keyspace_name, table_name, windows_encoded, rows_encoded, late_merges
+       FROM system_views.timeseries_tiering;" \
+    'it \| +sensor \| +1 \| +1 \| +1'
 
 echo
 echo "== $PASS passed, $FAIL failed =="
