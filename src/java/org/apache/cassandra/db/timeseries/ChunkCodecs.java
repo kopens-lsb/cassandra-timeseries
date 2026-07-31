@@ -21,12 +21,20 @@ import java.nio.ByteBuffer;
 import java.nio.ByteOrder;
 
 /**
- * Version-dispatching entry point over the chunk codecs: peeks the version byte at
+ * Version-dispatching entry point over the single-column chunk codecs: peeks the version byte at
  * {@code payload.position()} and routes to {@link GorillaCodec} (version 1) or
  * {@link Chimp128Codec} (version 2). This is the sole codec entry point the chunk store is meant
- * to consume -- callers should not invoke {@code GorillaCodec}/{@code Chimp128Codec} directly.
+ * to consume for those two formats -- callers should not invoke
+ * {@code GorillaCodec}/{@code Chimp128Codec} directly.
  * Unrecognised version bytes throw {@link IllegalArgumentException}, matching the per-codec
  * behaviour these methods delegate to.
+ * <p>
+ * Version 3 ({@link ColumnarChunkCodec}, the many-columns-per-chunk format) is a different shape
+ * entirely -- many named columns instead of one {@link SampleCursor}-style value stream -- so it
+ * is out of scope for the methods here that assume a single value per timestamp. {@link #codecOf}
+ * still recognises it (returning {@link Codec#COLUMNAR}) so callers can tell v1/v2 apart from v3
+ * without depending on {@code ColumnarChunkCodec} directly, but {@link #cursor} rejects it with a
+ * clear error pointing at {@link ColumnarChunkCodec#cursor} instead.
  * <p>
  * Payloads must span exactly one chunk (position..limit); corruption surfaces as
  * {@link IllegalArgumentException}, {@link IndexOutOfBoundsException} or
@@ -44,7 +52,7 @@ public final class ChunkCodecs
 
     public enum Codec
     {
-        GORILLA, CHIMP128
+        GORILLA, CHIMP128, COLUMNAR
     }
 
     public static ByteBuffer encode(Codec codec, long[] timestamps, double[] values, int count)
@@ -91,6 +99,8 @@ public final class ChunkCodecs
                 return Codec.GORILLA;
             case Chimp128Codec.VERSION:
                 return Codec.CHIMP128;
+            case ColumnarChunkCodec.VERSION:
+                return Codec.COLUMNAR;
             default:
                 throw new IllegalArgumentException("Unsupported chunk codec version: " + version);
         }
@@ -104,6 +114,9 @@ public final class ChunkCodecs
                 return GorillaCodec.cursor(payload);
             case Chimp128Codec.VERSION:
                 return Chimp128Codec.cursor(payload);
+            case ColumnarChunkCodec.VERSION:
+                throw new IllegalArgumentException("ChunkCodecs.cursor() does not support columnar (v3) " +
+                                                   "payloads -- use ColumnarChunkCodec.cursor() instead");
             default:
                 throw new IllegalArgumentException("Unsupported chunk codec version: " + versionByte(payload));
         }

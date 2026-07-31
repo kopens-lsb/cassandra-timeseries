@@ -35,11 +35,18 @@ public class ChunkCodecsTest
 {
     private static final int HEADER_SLACK = 8;   // small fixed overhead allowance
 
+    // ChunkCodecs.Codec also has a COLUMNAR (v3) value -- codecOf() recognises it (see
+    // codecOfRecognisesColumnarVersion below) but it is not a single-column codec, so it cannot go
+    // through ChunkCodecs.encode(Codec, timestamps, values, count)/.cursor(payload) like GORILLA and
+    // CHIMP128 can. These tests iterate only the two single-column codecs deliberately.
+    private static final ChunkCodecs.Codec[] SINGLE_COLUMN_CODECS =
+        { ChunkCodecs.Codec.GORILLA, ChunkCodecs.Codec.CHIMP128 };
+
     @Test
     public void dispatchesByVersionByte()
     {
         long[] ts = { 1L, 2L, 3L }; double[] vs = { 1.0, 2.0, 3.0 };
-        for (ChunkCodecs.Codec codec : ChunkCodecs.Codec.values())
+        for (ChunkCodecs.Codec codec : SINGLE_COLUMN_CODECS)
         {
             ByteBuffer payload = ChunkCodecs.encode(codec, ts, vs, 3);
             SampleCursor cursor = ChunkCodecs.cursor(payload);
@@ -60,7 +67,7 @@ public class ChunkCodecsTest
     public void firstAndLastTimestampDispatchByVersionByte()
     {
         long[] ts = { 10L, 20L, 30L }; double[] vs = { 1.0, 2.0, 3.0 };
-        for (ChunkCodecs.Codec codec : ChunkCodecs.Codec.values())
+        for (ChunkCodecs.Codec codec : SINGLE_COLUMN_CODECS)
         {
             ByteBuffer payload = ChunkCodecs.encode(codec, ts, vs, 3);
             assertEquals(10L, ChunkCodecs.firstTimestamp(payload));
@@ -72,7 +79,7 @@ public class ChunkCodecsTest
     public void codecOfRoundtrip()
     {
         long[] ts = { 1L, 2L, 3L }; double[] vs = { 1.0, 2.0, 3.0 };
-        for (ChunkCodecs.Codec codec : ChunkCodecs.Codec.values())
+        for (ChunkCodecs.Codec codec : SINGLE_COLUMN_CODECS)
         {
             ByteBuffer payload = ChunkCodecs.encode(codec, ts, vs, 3);
             assertEquals(codec, ChunkCodecs.codecOf(payload));
@@ -81,6 +88,26 @@ public class ChunkCodecsTest
         ByteBuffer payload = ChunkCodecs.encode(ChunkCodecs.Codec.GORILLA, ts, vs, 3);
         payload.put(payload.position(), (byte) 9);
         assertThatThrownBy(() -> ChunkCodecs.codecOf(payload)).isInstanceOf(IllegalArgumentException.class);
+    }
+
+    @Test
+    public void codecOfRecognisesColumnarVersionButCursorRejectsIt()
+    {
+        java.util.SortedMap<String, ColumnarChunkCodec.ColumnInput> columns = new java.util.TreeMap<>();
+        columns.put("v", new ColumnarChunkCodec.ColumnInput(ColumnarChunkCodec.TYPE_INT32,
+                                                            new ByteBuffer[]{ intBytes(1), intBytes(2), intBytes(3) }));
+        ByteBuffer payload = ColumnarChunkCodec.encode(new long[]{ 1L, 2L, 3L }, 3, columns);
+
+        assertEquals(ChunkCodecs.Codec.COLUMNAR, ChunkCodecs.codecOf(payload));
+        assertThatThrownBy(() -> ChunkCodecs.cursor(payload)).isInstanceOf(IllegalArgumentException.class);
+    }
+
+    private static ByteBuffer intBytes(int v)
+    {
+        ByteBuffer b = ByteBuffer.allocate(4);
+        b.putInt(v);
+        b.flip();
+        return b;
     }
 
     @Test

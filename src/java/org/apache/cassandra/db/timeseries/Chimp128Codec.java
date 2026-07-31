@@ -66,16 +66,9 @@ public final class Chimp128Codec
             throw new IllegalArgumentException("arrays shorter than count " + count);
 
         BitWriter bits = new BitWriter();
-        long[] ring = new long[RING_SIZE];
-        int[] indices = new int[1 << INDEX_BITS];
-        Arrays.fill(indices, -1);
+        ValueEncoder valueEncoder = new ValueEncoder();
+        valueEncoder.write(bits, values[0]);
 
-        long firstBits = Double.doubleToRawLongBits(values[0]);
-        bits.writeBits(firstBits, 64);
-        ring[0] = firstBits;
-        indices[(int) (firstBits & KEY_MASK)] = 0;
-
-        int previousLeadCode = -1;
         long previousTimestamp = timestamps[0];
         long previousDelta = 0;
 
@@ -90,62 +83,7 @@ public final class Chimp128Codec
             previousTimestamp = timestamp;
             previousDelta = delta;
 
-            long raw = Double.doubleToRawLongBits(values[j]);
-            int key = (int) (raw & KEY_MASK);
-            int candidateIndex = indices[key];
-            boolean candidateUsable = candidateIndex >= 0 && j - candidateIndex < RING_SIZE;
-            long candidateXor = 0;
-            int candidateTrailing = 0;
-            if (candidateUsable)
-            {
-                candidateXor = raw ^ ring[candidateIndex % RING_SIZE];
-                candidateTrailing = candidateXor == 0 ? 64 : Long.numberOfTrailingZeros(candidateXor);
-            }
-
-            if (candidateUsable && candidateTrailing > TRAILING_THRESHOLD)
-            {
-                // left branch: reference a ring value explicitly
-                bits.writeBit(false);
-                bits.writeBits(candidateIndex % RING_SIZE, 7);
-                if (candidateXor == 0)
-                {
-                    bits.writeBit(false);
-                    // spec decision: previousLeadCode intentionally NOT updated on an exact match
-                }
-                else
-                {
-                    bits.writeBit(true);
-                    int leadCode = leadingCode(Long.numberOfLeadingZeros(candidateXor));
-                    int leadValue = LEADING_BUCKETS[leadCode];
-                    int center = 64 - leadValue - candidateTrailing;
-                    bits.writeBits(leadCode, 3);
-                    bits.writeBits(center, 6);
-                    bits.writeBits(candidateXor >>> candidateTrailing, center);
-                    previousLeadCode = leadCode;
-                }
-            }
-            else
-            {
-                // right branch: XOR against the immediately previous value
-                long xor = raw ^ ring[(j - 1) % RING_SIZE];
-                int leadCode = leadingCode(xor == 0 ? 64 : Long.numberOfLeadingZeros(xor));
-                int leadValue = LEADING_BUCKETS[leadCode];
-                bits.writeBit(true);
-                if (leadCode == previousLeadCode)
-                {
-                    bits.writeBit(false);
-                }
-                else
-                {
-                    bits.writeBit(true);
-                    bits.writeBits(leadCode, 3);
-                }
-                bits.writeBits(xor, 64 - leadValue);
-                previousLeadCode = leadCode;
-            }
-
-            ring[j % RING_SIZE] = raw;
-            indices[key] = j;
+            valueEncoder.write(bits, values[j]);
         }
 
         ByteBuffer out = ByteBuffer.allocate(HEADER_SIZE + bits.sizeInBytes()).order(ByteOrder.BIG_ENDIAN);
@@ -156,6 +94,20 @@ public final class Chimp128Codec
         bits.writeTo(out);
         out.flip();
         return out;
+    }
+
+    /**
+     * Encodes only the value stream (ring-XOR deltas) with no timestamps interleaved -- the
+     * counterpart to the per-sample loop inside {@link #encode}, minus the
+     * {@link GorillaCodec#writeDod} calls. Used by {@link ColumnarChunkCodec} (chunk format
+     * version 3) to store a DOUBLE_CHIMP column section against the chunk's shared timestamp axis
+     * instead of duplicating it per column. See {@link ValueDecoder} for the matching reader.
+     */
+    static void encodeValues(BitWriter bits, double[] values, int count)
+    {
+        ValueEncoder encoder = new ValueEncoder();
+        for (int i = 0; i < count; i++)
+            encoder.write(bits, values[i]);
     }
 
     public static int sampleCount(ByteBuffer payload)
@@ -197,6 +149,7 @@ public final class Chimp128Codec
         long firstTimestamp = buffer.getLong();
         buffer.getLong();
         BitReader bits = new BitReader(buffer);
+        ValueDecoder valueDecoder = new ValueDecoder();
 
         return new SampleCursor()
         {
@@ -204,10 +157,6 @@ public final class Chimp128Codec
             private long timestamp;
             private long delta;
             private long valueBits;
-            private int previousLeadCode = -1;
-            private final long[] ring = new long[RING_SIZE];
-            private final int[] slotIndex = new int[RING_SIZE];
-            { Arrays.fill(slotIndex, -1); }
 
             @Override
             public boolean advance()
@@ -218,60 +167,13 @@ public final class Chimp128Codec
                 if (index == 0)
                 {
                     timestamp = firstTimestamp;
-                    valueBits = bits.readBits(64);
                 }
                 else
                 {
                     delta += GorillaCodec.readDod(bits);
                     timestamp += delta;
-
-                    if (!bits.readBit())
-                    {
-                        // left branch: explicit ring reference
-                        int position = (int) bits.readBits(7);
-                        if (slotIndex[position] < 0)
-                            throw new IllegalArgumentException("Corrupt chimp chunk: reference to unwritten ring slot " + position);
-                        long candidate = ring[position];
-                        if (!bits.readBit())
-                        {
-                            valueBits = candidate;
-                            // previousLeadCode intentionally unchanged (mirrors encoder)
-                        }
-                        else
-                        {
-                            int leadCode = (int) bits.readBits(3);
-                            int leadValue = LEADING_BUCKETS[leadCode];
-                            int center = (int) bits.readBits(6);
-                            int trailing = 64 - leadValue - center;
-                            if (center < 1 || trailing <= TRAILING_THRESHOLD)
-                                throw new IllegalArgumentException("Corrupt chimp chunk: center " + center +
-                                                                   " with lead " + leadValue);
-                            valueBits = candidate ^ (bits.readBits(center) << trailing);
-                            previousLeadCode = leadCode;
-                        }
-                    }
-                    else
-                    {
-                        // right branch: XOR against immediately previous value
-                        int leadCode;
-                        if (!bits.readBit())
-                        {
-                            if (previousLeadCode < 0)
-                                throw new IllegalArgumentException("Corrupt chimp chunk: lead reuse before any lead");
-                            leadCode = previousLeadCode;
-                        }
-                        else
-                        {
-                            leadCode = (int) bits.readBits(3);
-                        }
-                        int leadValue = LEADING_BUCKETS[leadCode];
-                        long xor = bits.readBits(64 - leadValue);
-                        valueBits = ring[(index - 1) % RING_SIZE] ^ xor;
-                        previousLeadCode = leadCode;
-                    }
                 }
-                ring[index % RING_SIZE] = valueBits;
-                slotIndex[index % RING_SIZE] = index;
+                valueBits = valueDecoder.readBits(bits);
                 return true;
             }
 
@@ -291,5 +193,163 @@ public final class Chimp128Codec
                 return Double.longBitsToDouble(valueBits);
             }
         };
+    }
+
+    /**
+     * Stateful writer for the chimp128 value stream, one {@link #write} call per sample in order:
+     * the first call emits the raw 64-bit value; later calls XOR against either an explicit ring
+     * slot (left branch) or the immediately previous value (right branch), mirroring the inline
+     * loop in {@link #encode}. Shared by {@link #encode} (interleaved with per-sample
+     * {@link GorillaCodec#writeDod} calls) and {@link #encodeValues} (value stream only).
+     */
+    static final class ValueEncoder
+    {
+        private final long[] ring = new long[RING_SIZE];
+        private final int[] indices = new int[1 << INDEX_BITS];
+        private int previousLeadCode = -1;
+        private int index = -1;
+
+        ValueEncoder()
+        {
+            Arrays.fill(indices, -1);
+        }
+
+        void write(BitWriter bits, double value)
+        {
+            index++;
+            long raw = Double.doubleToRawLongBits(value);
+            int key = (int) (raw & KEY_MASK);
+            if (index == 0)
+            {
+                bits.writeBits(raw, 64);
+            }
+            else
+            {
+                int candidateIndex = indices[key];
+                boolean candidateUsable = candidateIndex >= 0 && index - candidateIndex < RING_SIZE;
+                long candidateXor = 0;
+                int candidateTrailing = 0;
+                if (candidateUsable)
+                {
+                    candidateXor = raw ^ ring[candidateIndex % RING_SIZE];
+                    candidateTrailing = candidateXor == 0 ? 64 : Long.numberOfTrailingZeros(candidateXor);
+                }
+
+                if (candidateUsable && candidateTrailing > TRAILING_THRESHOLD)
+                {
+                    // left branch: reference a ring value explicitly
+                    bits.writeBit(false);
+                    bits.writeBits(candidateIndex % RING_SIZE, 7);
+                    if (candidateXor == 0)
+                    {
+                        bits.writeBit(false);
+                        // spec decision: previousLeadCode intentionally NOT updated on an exact match
+                    }
+                    else
+                    {
+                        bits.writeBit(true);
+                        int leadCode = leadingCode(Long.numberOfLeadingZeros(candidateXor));
+                        int leadValue = LEADING_BUCKETS[leadCode];
+                        int center = 64 - leadValue - candidateTrailing;
+                        bits.writeBits(leadCode, 3);
+                        bits.writeBits(center, 6);
+                        bits.writeBits(candidateXor >>> candidateTrailing, center);
+                        previousLeadCode = leadCode;
+                    }
+                }
+                else
+                {
+                    // right branch: XOR against the immediately previous value
+                    long xor = raw ^ ring[(index - 1) % RING_SIZE];
+                    int leadCode = leadingCode(xor == 0 ? 64 : Long.numberOfLeadingZeros(xor));
+                    int leadValue = LEADING_BUCKETS[leadCode];
+                    bits.writeBit(true);
+                    if (leadCode == previousLeadCode)
+                    {
+                        bits.writeBit(false);
+                    }
+                    else
+                    {
+                        bits.writeBit(true);
+                        bits.writeBits(leadCode, 3);
+                    }
+                    bits.writeBits(xor, 64 - leadValue);
+                    previousLeadCode = leadCode;
+                }
+            }
+            ring[index % RING_SIZE] = raw;
+            indices[key] = index;
+        }
+    }
+
+    /** Mirrors {@link ValueEncoder}: one {@link #readBits} call per sample, in the same order. */
+    static final class ValueDecoder
+    {
+        private final long[] ring = new long[RING_SIZE];
+        private final int[] slotIndex = new int[RING_SIZE];
+        private int previousLeadCode = -1;
+        private int index = -1;
+
+        ValueDecoder()
+        {
+            Arrays.fill(slotIndex, -1);
+        }
+
+        long readBits(BitReader bits)
+        {
+            index++;
+            long valueBits;
+            if (index == 0)
+            {
+                valueBits = bits.readBits(64);
+            }
+            else if (!bits.readBit())
+            {
+                // left branch: explicit ring reference
+                int position = (int) bits.readBits(7);
+                if (slotIndex[position] < 0)
+                    throw new IllegalArgumentException("Corrupt chimp chunk: reference to unwritten ring slot " + position);
+                long candidate = ring[position];
+                if (!bits.readBit())
+                {
+                    valueBits = candidate;
+                    // previousLeadCode intentionally unchanged (mirrors encoder)
+                }
+                else
+                {
+                    int leadCode = (int) bits.readBits(3);
+                    int leadValue = LEADING_BUCKETS[leadCode];
+                    int center = (int) bits.readBits(6);
+                    int trailing = 64 - leadValue - center;
+                    if (center < 1 || trailing <= TRAILING_THRESHOLD)
+                        throw new IllegalArgumentException("Corrupt chimp chunk: center " + center +
+                                                           " with lead " + leadValue);
+                    valueBits = candidate ^ (bits.readBits(center) << trailing);
+                    previousLeadCode = leadCode;
+                }
+            }
+            else
+            {
+                // right branch: XOR against immediately previous value
+                int leadCode;
+                if (!bits.readBit())
+                {
+                    if (previousLeadCode < 0)
+                        throw new IllegalArgumentException("Corrupt chimp chunk: lead reuse before any lead");
+                    leadCode = previousLeadCode;
+                }
+                else
+                {
+                    leadCode = (int) bits.readBits(3);
+                }
+                int leadValue = LEADING_BUCKETS[leadCode];
+                long xor = bits.readBits(64 - leadValue);
+                valueBits = ring[(index - 1) % RING_SIZE] ^ xor;
+                previousLeadCode = leadCode;
+            }
+            ring[index % RING_SIZE] = valueBits;
+            slotIndex[index % RING_SIZE] = index;
+            return valueBits;
+        }
     }
 }

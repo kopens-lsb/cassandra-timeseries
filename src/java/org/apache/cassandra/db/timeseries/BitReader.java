@@ -61,4 +61,15 @@ final class BitReader
         }
         return result;
     }
+
+    /**
+     * Number of bits consumed so far. Used by callers that pack more than one independent bit
+     * stream into a shared buffer (e.g. {@link ColumnarChunkCodec}'s timestamp DoD stream, which
+     * precedes byte-aligned column data sections) and need to know exactly where a stream ends so
+     * they can resume with ordinary {@link ByteBuffer} reads at the next byte boundary.
+     */
+    int bitPosition()
+    {
+        return bitPosition;
+    }
 }

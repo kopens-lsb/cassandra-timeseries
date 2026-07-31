@@ -60,13 +60,11 @@ public final class GorillaCodec
             throw new IllegalArgumentException("arrays shorter than count " + count);
 
         BitWriter bits = new BitWriter();
-        long previousBits = Double.doubleToRawLongBits(values[0]);
-        bits.writeBits(previousBits, 64);
+        ValueEncoder valueEncoder = new ValueEncoder();
+        valueEncoder.write(bits, values[0]);
 
         long previousTimestamp = timestamps[0];
         long previousDelta = 0;
-        int windowLeading = -1;
-        int windowTrailing = 0;
 
         for (int i = 1; i < count; i++)
         {
@@ -79,34 +77,7 @@ public final class GorillaCodec
             previousTimestamp = timestamp;
             previousDelta = delta;
 
-            long valueBits = Double.doubleToRawLongBits(values[i]);
-            long xor = valueBits ^ previousBits;
-            if (xor == 0)
-            {
-                bits.writeBit(false);
-            }
-            else
-            {
-                bits.writeBit(true);
-                int leading = Math.min(31, Long.numberOfLeadingZeros(xor));
-                int trailing = Long.numberOfTrailingZeros(xor);
-                if (windowLeading != -1 && leading >= windowLeading && trailing >= windowTrailing)
-                {
-                    bits.writeBit(false);
-                    bits.writeBits(xor >>> windowTrailing, 64 - windowLeading - windowTrailing);
-                }
-                else
-                {
-                    bits.writeBit(true);
-                    int meaningful = 64 - leading - trailing;
-                    bits.writeBits(leading, 5);
-                    bits.writeBits(meaningful - 1, 6);   // 1..64 stored as 0..63
-                    bits.writeBits(xor >>> trailing, meaningful);
-                    windowLeading = leading;
-                    windowTrailing = trailing;
-                }
-            }
-            previousBits = valueBits;
+            valueEncoder.write(bits, values[i]);
         }
 
         ByteBuffer out = ByteBuffer.allocate(HEADER_SIZE + bits.sizeInBytes());
@@ -118,6 +89,20 @@ public final class GorillaCodec
         bits.writeTo(out);
         out.flip();
         return out;
+    }
+
+    /**
+     * Encodes only the value stream (first value raw, then XOR-bitpacked deltas) with no
+     * timestamps interleaved -- the counterpart to the per-sample loop inside {@link #encode},
+     * minus the {@link #writeDod} calls. Used by {@link ColumnarChunkCodec} (chunk format
+     * version 3) to store a DOUBLE_GORILLA column section against the chunk's shared timestamp
+     * axis instead of duplicating it per column. See {@link ValueDecoder} for the matching reader.
+     */
+    static void encodeValues(BitWriter bits, double[] values, int count)
+    {
+        ValueEncoder encoder = new ValueEncoder();
+        for (int i = 0; i < count; i++)
+            encoder.write(bits, values[i]);
     }
 
     public static int sampleCount(ByteBuffer payload)
@@ -170,6 +155,7 @@ public final class GorillaCodec
         long firstTimestamp = buffer.getLong();
         buffer.getLong();   // last timestamp: header-only metadata
         BitReader bits = new BitReader(buffer);
+        ValueDecoder valueDecoder = new ValueDecoder();
 
         return new SampleCursor()
         {
@@ -177,8 +163,6 @@ public final class GorillaCodec
             private long timestamp;
             private long delta;
             private long valueBits;
-            private int windowLeading = -1;
-            private int windowTrailing;
 
             @Override
             public boolean advance()
@@ -189,31 +173,13 @@ public final class GorillaCodec
                 if (index == 0)
                 {
                     timestamp = firstTimestamp;
-                    valueBits = bits.readBits(64);
-                    return true;
                 }
-
-                delta += readDod(bits);
-                timestamp += delta;
-
-                if (bits.readBit())
+                else
                 {
-                    if (bits.readBit())
-                    {
-                        windowLeading = (int) bits.readBits(5);
-                        int meaningful = (int) bits.readBits(6) + 1;
-                        if (windowLeading + meaningful > 64)
-                            throw new IllegalArgumentException("Corrupt gorilla chunk: window " +
-                                                               windowLeading + '+' + meaningful + " exceeds 64 bits");
-                        windowTrailing = 64 - windowLeading - meaningful;
-                        valueBits ^= bits.readBits(meaningful) << windowTrailing;
-                    }
-                    else
-                    {
-                        int meaningful = 64 - windowLeading - windowTrailing;
-                        valueBits ^= bits.readBits(meaningful) << windowTrailing;
-                    }
+                    delta += readDod(bits);
+                    timestamp += delta;
                 }
+                valueBits = valueDecoder.readBits(bits);
                 return true;
             }
 
@@ -274,5 +240,98 @@ public final class GorillaCodec
         if (!bits.readBit())
             return bits.readBits(17) - 65535;
         return bits.readBits(64);
+    }
+
+    /**
+     * Stateful writer for the gorilla value stream, one {@link #write} call per sample in order:
+     * the first call emits the raw 64-bit value, later calls XOR against the previous value using
+     * the same leading/trailing "window" bit-saving trick as the inline loop in {@link #encode}.
+     * Shared by {@link #encode} (interleaved with per-sample {@link #writeDod} calls) and
+     * {@link #encodeValues} (value stream only, no timestamps).
+     */
+    static final class ValueEncoder
+    {
+        private long previousBits;
+        private int windowLeading = -1;
+        private int windowTrailing;
+        private int index = -1;
+
+        void write(BitWriter bits, double value)
+        {
+            index++;
+            long valueBits = Double.doubleToRawLongBits(value);
+            if (index == 0)
+            {
+                bits.writeBits(valueBits, 64);
+            }
+            else
+            {
+                long xor = valueBits ^ previousBits;
+                if (xor == 0)
+                {
+                    bits.writeBit(false);
+                }
+                else
+                {
+                    bits.writeBit(true);
+                    int leading = Math.min(31, Long.numberOfLeadingZeros(xor));
+                    int trailing = Long.numberOfTrailingZeros(xor);
+                    if (windowLeading != -1 && leading >= windowLeading && trailing >= windowTrailing)
+                    {
+                        bits.writeBit(false);
+                        bits.writeBits(xor >>> windowTrailing, 64 - windowLeading - windowTrailing);
+                    }
+                    else
+                    {
+                        bits.writeBit(true);
+                        int meaningful = 64 - leading - trailing;
+                        bits.writeBits(leading, 5);
+                        bits.writeBits(meaningful - 1, 6);   // 1..64 stored as 0..63
+                        bits.writeBits(xor >>> trailing, meaningful);
+                        windowLeading = leading;
+                        windowTrailing = trailing;
+                    }
+                }
+            }
+            previousBits = valueBits;
+        }
+    }
+
+    /** Mirrors {@link ValueEncoder}: one {@link #readBits} call per sample, in the same order. */
+    static final class ValueDecoder
+    {
+        private long previousBits;
+        private int windowLeading = -1;
+        private int windowTrailing;
+        private int index = -1;
+
+        long readBits(BitReader bits)
+        {
+            index++;
+            if (index == 0)
+            {
+                previousBits = bits.readBits(64);
+                return previousBits;
+            }
+            if (bits.readBit())
+            {
+                if (bits.readBit())
+                {
+                    windowLeading = (int) bits.readBits(5);
+                    int meaningful = (int) bits.readBits(6) + 1;
+                    if (windowLeading + meaningful > 64)
+                        throw new IllegalArgumentException("Corrupt gorilla chunk: window " +
+                                                           windowLeading + '+' + meaningful + " exceeds 64 bits");
+                    windowTrailing = 64 - windowLeading - meaningful;
+                    previousBits ^= bits.readBits(meaningful) << windowTrailing;
+                }
+                else
+                {
+                    int meaningful = 64 - windowLeading - windowTrailing;
+                    previousBits ^= bits.readBits(meaningful) << windowTrailing;
+                }
+            }
+            return previousBits;
+        }
     }
 }
