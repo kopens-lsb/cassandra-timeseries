@@ -27,6 +27,8 @@ import org.apache.cassandra.cql3.UntypedResultSet;
 import org.apache.cassandra.utils.ByteBufferUtil;
 
 import static org.junit.Assert.assertEquals;
+import static org.junit.Assert.assertTrue;
+import static org.junit.Assert.fail;
 
 /**
  * SP3 end-to-end: after the re-encoder moves closed windows into the chunk table and range-deletes
@@ -117,6 +119,75 @@ public class TransparentReadTest extends CQLTester
         int i = 0;
         for (UntypedResultSet.Row row : desc)
             assertEquals(expected[i++], row.getDouble("value"), 0.0);
+    }
+
+    @Test
+    public void lateRowInsertedAfterSweepWinsOverChunk() throws Throwable
+    {
+        loadTwoWindowsAndReencode();
+
+        // A correction written AFTER the window was encoded: newer writetime than the chunk's
+        // max_row_writetime, so the merge must prefer it over the encoded 2.0.
+        execute("INSERT INTO %s (tag, ts, value) VALUES ('t1', ?, 9.9) USING TIMESTAMP 200", new Date(20 * 60_000L));
+
+        assertEquals(9.9, execute("SELECT value FROM %s WHERE tag = 't1' AND ts = ?", new Date(20 * 60_000L))
+                          .one().getDouble("value"), 0.0);
+        assertEquals(6, execute("SELECT value FROM %s WHERE tag = 't1'").size());
+    }
+
+    @Test
+    public void gapFillSpansHotAndCold() throws Throwable
+    {
+        loadTwoWindowsAndReencode();
+
+        // Buckets over [0, 5h): cold windows 0 and 1h come from chunks, 2h/3h are empty (densified
+        // with null), 4h is the hot base row. Do not alias the bucket column (gap-fill v1 rule).
+        String gf = "time_bucket_gapfill(1h, ts, '1970-01-01 00:00:00+0000', '1970-01-01 05:00:00+0000')";
+        assertRows(execute("SELECT " + gf + ", avg(value) FROM %s WHERE tag = 't1' GROUP BY tag, " + gf),
+                   row(new Date(0L), 2.0),
+                   row(new Date(HOUR), 4.5),
+                   row(new Date(2 * HOUR), null),
+                   row(new Date(3 * HOUR), null),
+                   row(new Date(4 * HOUR), 6.0));
+    }
+
+    @Test
+    public void corruptChunkSkippedWithRemainingDataServed() throws Throwable
+    {
+        loadTwoWindowsAndReencode();
+
+        execute("UPDATE " + KEYSPACE + ".\"" + ChunkTables.chunkTableName(currentTable()) + "\" " +
+                "SET payload = 0xdeadbeef WHERE tag = 't1' AND window_start = ?", new Date(0L));
+
+        // Window [0,1h) is unreadable and skipped; window [1h,2h) and the hot row still serve.
+        UntypedResultSet rows = execute("SELECT value FROM %s WHERE tag = 't1'");
+        assertEquals(3, rows.size());
+        double[] expected = { 4.0, 5.0, 6.0 };
+        int i = 0;
+        for (UntypedResultSet.Row row : rows)
+            assertEquals(expected[i++], row.getDouble("value"), 0.0);
+    }
+
+    @Test
+    public void multiPageMergedReadFailsWithHint() throws Throwable
+    {
+        requireNetwork();
+        createTable("CREATE TABLE %s (tag text, ts timestamp, value double, PRIMARY KEY (tag, ts))");
+        setPolicy("{\"hot_window\":\"2h\",\"chunk_window\":\"1h\"}");
+        for (int i = 0; i < 3; i++)
+            execute("INSERT INTO %s (tag, ts, value) VALUES ('t1', ?, 1.0)", new Date(1000L * (i + 1)));
+
+        // A full-range query on a tiering table activates the merge; needing a second page must fail
+        // with a remedy instead of silently duplicating or losing chunk rows (v1 scope).
+        try
+        {
+            executeNetWithPaging("SELECT * FROM %s WHERE tag = 't1'", 2).all();
+            fail("expected InvalidQueryException for a multi-page transparent tiered read");
+        }
+        catch (com.datastax.driver.core.exceptions.InvalidQueryException e)
+        {
+            assertTrue(e.getMessage(), e.getMessage().contains("spans multiple pages"));
+        }
     }
 
     @Test
