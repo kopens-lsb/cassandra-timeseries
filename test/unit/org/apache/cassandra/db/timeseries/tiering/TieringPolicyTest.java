@@ -172,6 +172,14 @@ public class TieringPolicyTest
     }
 
     @Test
+    public void testWeakConsistencyRejected()
+    {
+        // ONE (and TWO/THREE/LOCAL_ONE/ANY) would let the existing-chunk read miss a prior cycle's
+        // chunk, so weaker-than-quorum levels are rejected outright -- see ALLOWED_CONSISTENCY_LEVELS.
+        assertConfigurationException("{\"hot_window\":\"7d\", \"consistency\":\"ONE\"}", "consistency");
+    }
+
+    @Test
     public void testMalformedJsonRejected()
     {
         assertConfigurationException("{not json", null);

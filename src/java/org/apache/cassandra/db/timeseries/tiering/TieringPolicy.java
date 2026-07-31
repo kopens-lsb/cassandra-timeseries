@@ -73,6 +73,18 @@ public final class TieringPolicy
     private static final Set<String> KNOWN_KEYS = ImmutableSet.of(HOT_WINDOW, CHUNK_WINDOW, COLD_WINDOW,
                                                                     CODEC, CONSISTENCY, INTERVAL);
 
+    /**
+     * Consistency levels weaker than a quorum are rejected: at e.g. {@code ONE}, the re-encoder's
+     * existing-chunk read can miss the previous cycle's chunk (written at a higher CL, or simply not
+     * yet visible to the replica this node read), so a subsequent merge produces a fresh-rows-only
+     * chunk that *loses* to the old chunk on a later read (older write, but same or higher timestamp
+     * doesn't apply here -- it's a distinct write racing on visibility, not ordering) while the range
+     * delete still removes the source rows -- silent, permanent data loss with no error surfaced.
+     */
+    private static final Set<ConsistencyLevel> ALLOWED_CONSISTENCY_LEVELS =
+            ImmutableSet.of(ConsistencyLevel.QUORUM, ConsistencyLevel.LOCAL_QUORUM,
+                            ConsistencyLevel.EACH_QUORUM, ConsistencyLevel.ALL);
+
     private static final Pattern DURATION = Pattern.compile("([1-9][0-9]*)([mhd])");
 
     public enum CodecChoice
@@ -251,15 +263,25 @@ public final class TieringPolicy
 
     private static ConsistencyLevel parseConsistency(String value)
     {
+        ConsistencyLevel consistency;
         try
         {
-            return ConsistencyLevel.fromString(value);
+            consistency = ConsistencyLevel.fromString(value);
         }
         catch (IllegalArgumentException e)
         {
             throw new ConfigurationException(format("%s.%s is not a valid consistency level: '%s'",
                                                       EXTENSION_KEY, CONSISTENCY, value));
         }
+
+        if (!ALLOWED_CONSISTENCY_LEVELS.contains(consistency))
+            throw new ConfigurationException(format(
+                "%s.%s must be one of QUORUM, LOCAL_QUORUM, EACH_QUORUM, ALL (got '%s'): a weaker " +
+                "consistency lets the re-encoder's existing-chunk read miss the previous cycle's chunk, " +
+                "producing a merge that loses data while the source rows still get deleted",
+                EXTENSION_KEY, CONSISTENCY, value));
+
+        return consistency;
     }
 
     private static long parseDurationMillis(String key, String value)

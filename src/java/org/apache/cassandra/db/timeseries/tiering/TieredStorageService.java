@@ -38,6 +38,7 @@ import org.apache.cassandra.cql3.QueryProcessor;
 import org.apache.cassandra.cql3.ResultSet;
 import org.apache.cassandra.cql3.UntypedResultSet;
 import org.apache.cassandra.db.ConsistencyLevel;
+import org.apache.cassandra.db.marshal.AbstractType;
 import org.apache.cassandra.db.marshal.ByteType;
 import org.apache.cassandra.db.marshal.Int32Type;
 import org.apache.cassandra.db.marshal.LongType;
@@ -81,12 +82,18 @@ import static java.lang.String.format;
  *     cycle read the window (a "late" row) has a newer write timestamp than the tombstone and
  *     survives it -- to be merged into the chunk on a subsequent cycle.</li>
  * </ul>
+ * <p>
+ * Per-tag work is memory-bounded: rather than reading every closed row for a tag into one list,
+ * {@link #runOnce} walks the tag's closed windows one at a time (see {@code firstClosedWindowStart}/
+ * {@code nextClosedWindowStart}), so peak memory is one window's worth of rows, not the whole
+ * backlog. A failure re-encoding one tag (a decode error on a corrupt existing chunk, a read/write
+ * timeout, ...) is logged and skipped rather than aborting every other tag on the table.
  */
 public class TieredStorageService
 {
     private static final Logger logger = LoggerFactory.getLogger(TieredStorageService.class);
 
-    /** Network page size for the paged scans this cycle issues (tag enumeration, row reads, cold-expiry candidates). */
+    /** Network page size for the paged scans this cycle issues (tag enumeration, per-window row reads, cold-expiry candidates). */
     private static final int PAGE_SIZE = 5000;
 
     /** Per-{@link #runOnce} call counters, also meant for the (not-yet-built) virtual table / nodetool status. */
@@ -156,13 +163,27 @@ public class TieredStorageService
         ConsistencyLevel cl = policy.consistency;
         long cutoff = policy.windowStartFor(nowMillis - policy.hotWindowMillis);
 
+        // Reused/grown across every window of every tag this call -- not reallocated per window.
         long[] tsBuf = new long[1024];
         double[] valBuf = new double[1024];
+        // Rows with a null value/writetime cell are common (e.g. a bare tag+ts insert, or a
+        // TTL-expired value) and expected, not exceptional -- summarized once at the end of the run
+        // rather than logged per row.
+        long[] nullCellsSkipped = { 0 };
 
-        String rowsQuery = format("SELECT %s, %s, WRITETIME(%s) AS wt FROM %s WHERE %s = ? AND %s < ? ORDER BY %s ASC",
-                                  tsCql, valueCql, valueCql, baseRef, tagCql, tsCql, tsCql);
-        String existingChunkQuery = format("SELECT payload, max_row_writetime FROM %s WHERE %s = ? AND window_start = ?",
-                                           chunkRef, tagCql);
+        // Bounded, per-window queries -- see the class javadoc. "oldest"/"next" only ever return the
+        // single row needed to locate the next window with work; the row scan itself is restricted to
+        // exactly one [windowStart, windowEnd) range at a time, so memory is bounded by one window's
+        // row count, not a tag's entire closed backlog.
+        String oldestRowQuery = format("SELECT %s FROM %s WHERE %s = ? AND %s < ? ORDER BY %s ASC LIMIT 1",
+                                       tsCql, baseRef, tagCql, tsCql, tsCql);
+        String nextRowQuery = format("SELECT %s FROM %s WHERE %s = ? AND %s >= ? AND %s < ? LIMIT 1",
+                                     tsCql, baseRef, tagCql, tsCql, tsCql, tsCql);
+        String windowRowsQuery = format("SELECT %s, %s, WRITETIME(%s) AS wt FROM %s WHERE %s = ? AND %s >= ? " +
+                                        "AND %s < ? ORDER BY %s ASC",
+                                        tsCql, valueCql, valueCql, baseRef, tagCql, tsCql, tsCql, tsCql);
+        String existingChunkQuery = format("SELECT payload, max_row_writetime, WRITETIME(payload) AS chunk_wt " +
+                                           "FROM %s WHERE %s = ? AND window_start = ?", chunkRef, tagCql);
         String insertChunkQuery = format("INSERT INTO %s (%s, window_start, codec, samples, max_row_writetime, payload) " +
                                          "VALUES (?, ?, ?, ?, ?, ?) USING TIMESTAMP ?", chunkRef, tagCql);
         String deleteRowsQuery = format("DELETE FROM %s USING TIMESTAMP ? WHERE %s = ? AND %s >= ? AND %s < ?",
@@ -172,101 +193,174 @@ public class TieredStorageService
 
         for (ByteBuffer tag : enumerateTags(base, tagCql, tagRaw, baseRef, cl))
         {
-            List<UntypedResultSet.Row> rows = pagedSelect(rowsQuery, cl,
-                                                           Arrays.asList(tag, TimestampType.instance.fromTimeInMillis(cutoff)));
-
-            int i = 0;
-            int n = rows.size();
-            while (i < n)
+            // One tag's worth of trouble -- a corrupt existing chunk, a read/write timeout, anything --
+            // must not wedge every other tag on this table out of being re-encoded for good.
+            try
             {
-                long windowStart = policy.windowStartFor(rows.get(i).getTimestamp(tsRaw).getTime());
-                long windowEnd = windowStart + policy.chunkWindowMillis;
-
-                int j = i;
-                while (j < n && rows.get(j).getTimestamp(tsRaw).getTime() < windowEnd)
-                    j++;
-
-                UntypedResultSet existingRs = QueryProcessor.process(existingChunkQuery, cl,
-                        Arrays.asList(tag, TimestampType.instance.fromTimeInMillis(windowStart)));
-                UntypedResultSet.Row existingRow = (existingRs == null || existingRs.isEmpty()) ? null : existingRs.one();
-
-                TreeMap<Long, Double> merged = new TreeMap<>();
-                long maxWt = Long.MIN_VALUE;
-                if (existingRow != null)
+                long windowStart = firstClosedWindowStart(oldestRowQuery, tsRaw, tag, cutoff, policy, cl);
+                while (windowStart >= 0)
                 {
-                    SampleCursor cursor = ChunkCodecs.cursor(existingRow.getBytes("payload"));
-                    while (cursor.advance())
-                        merged.put(cursor.timestamp(), cursor.value());
-                    maxWt = existingRow.getLong("max_row_writetime");
+                    long windowEnd = windowStart + policy.chunkWindowMillis;
+                    List<UntypedResultSet.Row> windowRows = pagedSelect(windowRowsQuery, cl, Arrays.asList(
+                            tag,
+                            TimestampType.instance.fromTimeInMillis(windowStart),
+                            TimestampType.instance.fromTimeInMillis(windowEnd)));
+
+                    if (windowRows.isEmpty())
+                    {
+                        // Nothing in this window (raced with a concurrent process, or the oldest-row probe
+                        // landed on a sparse tag) -- jump straight to the next window that has data instead
+                        // of stepping through potentially many empty windows one at a time.
+                        windowStart = nextClosedWindowStart(nextRowQuery, tsRaw, tag, windowEnd, cutoff, policy, cl);
+                        continue;
+                    }
+
+                    UntypedResultSet existingRs = QueryProcessor.process(existingChunkQuery, cl,
+                            Arrays.asList(tag, TimestampType.instance.fromTimeInMillis(windowStart)));
+                    UntypedResultSet.Row existingRow = (existingRs == null || existingRs.isEmpty()) ? null : existingRs.one();
+
+                    TreeMap<Long, Double> merged = new TreeMap<>();
+                    long maxWt = Long.MIN_VALUE;
+                    long existingChunkWt = Long.MIN_VALUE;
+                    if (existingRow != null)
+                    {
+                        SampleCursor cursor = ChunkCodecs.cursor(existingRow.getBytes("payload"));
+                        while (cursor.advance())
+                            merged.put(cursor.timestamp(), cursor.value());
+                        maxWt = existingRow.getLong("max_row_writetime");
+                        existingChunkWt = existingRow.getLong("chunk_wt");
+                    }
+
+                    int rowsThisWindow = 0;
+                    for (UntypedResultSet.Row row : windowRows)
+                    {
+                        // A row with no live value cell (bare tag+ts insert, an explicit `DELETE value`,
+                        // an expired TTL, ...) has nothing to encode and no writetime to trust for the
+                        // delete below -- skip it rather than NPE-ing on getDouble/getLong(null).
+                        if (!row.has(valueRaw) || !row.has("wt"))
+                        {
+                            nullCellsSkipped[0]++;
+                            continue;
+                        }
+                        // Rows always win over the previously-encoded chunk on a ts collision -- they are
+                        // by definition a rewrite of that timestamp with a newer write time.
+                        merged.put(row.getTimestamp(tsRaw).getTime(), row.getDouble(valueRaw));
+                        maxWt = Math.max(maxWt, row.getLong("wt"));
+                        rowsThisWindow++;
+                    }
+
+                    if (merged.isEmpty())
+                    {
+                        // Every row in the window was null-valued and there was no prior chunk to carry
+                        // forward -- nothing to encode, and no trustworthy writetime to tombstone with, so
+                        // leave the window untouched; it is retried (cheaply) on every future cycle.
+                        windowStart = windowEnd;
+                        continue;
+                    }
+
+                    int count = merged.size();
+                    if (tsBuf.length < count)
+                    {
+                        int newLength = tsBuf.length;
+                        while (newLength < count)
+                            newLength *= 2;
+                        tsBuf = Arrays.copyOf(tsBuf, newLength);
+                        valBuf = Arrays.copyOf(valBuf, newLength);
+                    }
+                    int idx = 0;
+                    for (Map.Entry<Long, Double> sample : merged.entrySet())
+                    {
+                        tsBuf[idx] = sample.getKey();
+                        valBuf[idx] = sample.getValue();
+                        idx++;
+                    }
+
+                    ByteBuffer payload = encode(policy.codec, tsBuf, valBuf, count);
+                    byte codecByte = codecVersionByte(ChunkCodecs.codecOf(payload));
+
+                    // Always write strictly after both the rows just encoded AND the chunk row being
+                    // replaced -- guards a crash-then-backfill corner where maxWt+1 could otherwise land
+                    // exactly on the existing chunk's own write timestamp and tie (same-timestamp writes
+                    // to different columns of the same row can resolve per-column, tearing the chunk).
+                    long insertTs = Math.max(maxWt + 1, existingChunkWt + 1);
+
+                    QueryProcessor.process(insertChunkQuery, cl, Arrays.asList(
+                            tag,
+                            TimestampType.instance.fromTimeInMillis(windowStart),
+                            ByteType.instance.decompose(codecByte),
+                            Int32Type.instance.decompose(count),
+                            LongType.instance.decompose(maxWt),
+                            payload,
+                            LongType.instance.decompose(insertTs)));
+
+                    QueryProcessor.process(deleteRowsQuery, cl, Arrays.asList(
+                            LongType.instance.decompose(maxWt),
+                            tag,
+                            TimestampType.instance.fromTimeInMillis(windowStart),
+                            TimestampType.instance.fromTimeInMillis(windowEnd)));
+
+                    stats.windowsEncoded++;
+                    stats.rowsEncoded += rowsThisWindow;
+                    if (existingRow != null)
+                        stats.lateMerges++;
+                    stats.bytesWritten += payload.remaining();
+
+                    windowStart = windowEnd;
                 }
 
-                for (int k = i; k < j; k++)
+                if (policy.coldWindowMillis >= 0)
                 {
-                    UntypedResultSet.Row row = rows.get(k);
-                    // Rows always win over the previously-encoded chunk on a ts collision -- they are
-                    // by definition a rewrite of that timestamp with a newer write time.
-                    merged.put(row.getTimestamp(tsRaw).getTime(), row.getDouble(valueRaw));
-                    maxWt = Math.max(maxWt, row.getLong("wt"));
+                    List<ByteBuffer> coldValues = Arrays.asList(
+                            tag, TimestampType.instance.fromTimeInMillis(nowMillis - policy.coldWindowMillis));
+                    List<UntypedResultSet.Row> expired = pagedSelect(selectExpiredQuery, cl, coldValues);
+                    if (!expired.isEmpty())
+                    {
+                        stats.chunksExpired += expired.size();
+                        QueryProcessor.process(deleteExpiredQuery, cl, coldValues);
+                    }
                 }
-
-                int count = merged.size();
-                if (tsBuf.length < count)
-                {
-                    int newLength = tsBuf.length;
-                    while (newLength < count)
-                        newLength *= 2;
-                    tsBuf = Arrays.copyOf(tsBuf, newLength);
-                    valBuf = Arrays.copyOf(valBuf, newLength);
-                }
-                int idx = 0;
-                for (Map.Entry<Long, Double> sample : merged.entrySet())
-                {
-                    tsBuf[idx] = sample.getKey();
-                    valBuf[idx] = sample.getValue();
-                    idx++;
-                }
-
-                ByteBuffer payload = encode(policy.codec, tsBuf, valBuf, count);
-                byte codecByte = codecVersionByte(ChunkCodecs.codecOf(payload));
-
-                QueryProcessor.process(insertChunkQuery, cl, Arrays.asList(
-                        tag,
-                        TimestampType.instance.fromTimeInMillis(windowStart),
-                        ByteType.instance.decompose(codecByte),
-                        Int32Type.instance.decompose(count),
-                        LongType.instance.decompose(maxWt),
-                        payload,
-                        LongType.instance.decompose(maxWt + 1)));
-
-                QueryProcessor.process(deleteRowsQuery, cl, Arrays.asList(
-                        LongType.instance.decompose(maxWt),
-                        tag,
-                        TimestampType.instance.fromTimeInMillis(windowStart),
-                        TimestampType.instance.fromTimeInMillis(windowEnd)));
-
-                stats.windowsEncoded++;
-                stats.rowsEncoded += (j - i);
-                if (existingRow != null)
-                    stats.lateMerges++;
-                stats.bytesWritten += payload.remaining();
-
-                i = j;
             }
-
-            if (policy.coldWindowMillis >= 0)
+            catch (RuntimeException e)
             {
-                List<ByteBuffer> coldValues = Arrays.asList(
-                        tag, TimestampType.instance.fromTimeInMillis(nowMillis - policy.coldWindowMillis));
-                List<UntypedResultSet.Row> expired = pagedSelect(selectExpiredQuery, cl, coldValues);
-                if (!expired.isEmpty())
-                {
-                    stats.chunksExpired += expired.size();
-                    QueryProcessor.process(deleteExpiredQuery, cl, coldValues);
-                }
+                logger.error("Tiered storage runOnce: {}.{} failed while re-encoding tag {} -- skipping to the " +
+                             "next tag; this tag will be retried next cycle", keyspace, table,
+                             tagColumn.type.getString(tag), e);
             }
         }
 
+        if (nullCellsSkipped[0] > 0)
+        {
+            logger.warn("Tiered storage runOnce: {}.{} skipped {} row(s) with no live value cell to encode " +
+                        "(bare key insert, deleted value, or expired TTL)", keyspace, table, nullCellsSkipped[0]);
+        }
+
         return stats;
+    }
+
+    /** @return the {@code window_start} of the oldest closed (ts &lt; cutoff) row for {@code tag}, or -1 if none. */
+    private static long firstClosedWindowStart(String oldestRowQuery, String tsRaw, ByteBuffer tag, long cutoff,
+                                                TieringPolicy policy, ConsistencyLevel cl)
+    {
+        UntypedResultSet rs = QueryProcessor.process(oldestRowQuery, cl,
+                Arrays.asList(tag, TimestampType.instance.fromTimeInMillis(cutoff)));
+        if (rs == null || rs.isEmpty())
+            return -1;
+        return policy.windowStartFor(rs.one().getTimestamp(tsRaw).getTime());
+    }
+
+    /**
+     * @return the {@code window_start} of the next closed row for {@code tag} with {@code ts} in
+     * {@code [fromTsMillis, cutoff)}, or -1 if there is none -- used to skip past a run of empty
+     * windows in one query instead of probing them one at a time.
+     */
+    private static long nextClosedWindowStart(String nextRowQuery, String tsRaw, ByteBuffer tag, long fromTsMillis,
+                                               long cutoff, TieringPolicy policy, ConsistencyLevel cl)
+    {
+        UntypedResultSet rs = QueryProcessor.process(nextRowQuery, cl, Arrays.asList(
+                tag, TimestampType.instance.fromTimeInMillis(fromTsMillis), TimestampType.instance.fromTimeInMillis(cutoff)));
+        if (rs == null || rs.isEmpty())
+            return -1;
+        return policy.windowStartFor(rs.one().getTimestamp(tsRaw).getTime());
     }
 
     /**
@@ -276,11 +370,15 @@ public class TieredStorageService
      * <p>
      * A primary range can wrap the ring's zero point (e.g. a single-node cluster's sole range, which
      * is degenerate: {@code (t, t]} covering the whole ring); {@link Range#unwrap()} normalizes that
-     * into 1-2 non-wrapping sub-ranges, each turned into its own {@code token(tag) > ? AND <= ?}
+     * into 1-2 non-wrapping sub-ranges, each turned into its own bound {@code token(tag) > ? AND <= ?}
      * restriction (a bound equal to the partitioner's minimum token is omitted -- it is a sentinel,
-     * not a real, ownable token). If {@code getPrimaryRanges} itself reports no ranges at all -- which
-     * should not happen once a node has joined the ring, but is treated defensively rather than
-     * silently scanning nothing -- this falls back to an unrestricted scan of every tag.
+     * not a real, ownable token). Bind values are encoded via the partitioner's own
+     * {@link org.apache.cassandra.dht.IPartitioner#getTokenValidator()} type, so this works for any
+     * partitioner's token representation (a raw {@code long} for Murmur3, a {@code BigInteger} for
+     * RandomPartitioner, etc.), not just one whose {@code Token.toString()} happens to be a bare CQL
+     * numeric literal. If {@code getPrimaryRanges} itself reports no ranges at all -- which should not
+     * happen once a node has joined the ring, but is treated defensively rather than silently scanning
+     * nothing -- this falls back to an unrestricted scan of every tag.
      */
     private static List<ByteBuffer> enumerateTags(TableMetadata base, String tagCql, String tagRaw, String baseRef,
                                                    ConsistencyLevel cl)
@@ -296,14 +394,23 @@ public class TieredStorageService
             return new ArrayList<>(tags);
         }
 
+        AbstractType<?> tokenType = base.partitioner.getTokenValidator();
         for (Range<Token> range : primaryRanges)
+        {
             for (Range<Token> sub : range.unwrap())
-                collectTags(tags, tagRangeQuery(tagCql, baseRef, sub), tagRaw, cl, Collections.emptyList());
+            {
+                List<ByteBuffer> values = new ArrayList<>(2);
+                String query = tagRangeQuery(tagCql, baseRef, sub, tokenType, values);
+                collectTags(tags, query, tagRaw, cl, values);
+            }
+        }
 
         return new ArrayList<>(tags);
     }
 
-    private static String tagRangeQuery(String tagCql, String baseRef, Range<Token> sub)
+    /** Builds the token-range restricted tag query, appending its bind values (0-2) to {@code valuesOut} in order. */
+    private static String tagRangeQuery(String tagCql, String baseRef, Range<Token> sub, AbstractType<?> tokenType,
+                                        List<ByteBuffer> valuesOut)
     {
         boolean hasLower = !sub.left.isMinimum();
         boolean hasUpper = !sub.right.isMinimum();
@@ -313,11 +420,17 @@ public class TieredStorageService
         {
             query.append(" WHERE ");
             if (hasLower)
-                query.append("token(").append(tagCql).append(") > ").append(sub.left);
+            {
+                query.append("token(").append(tagCql).append(") > ?");
+                valuesOut.add(tokenType.decomposeUntyped(sub.left.getTokenValue()));
+            }
             if (hasLower && hasUpper)
                 query.append(" AND ");
             if (hasUpper)
-                query.append("token(").append(tagCql).append(") <= ").append(sub.right);
+            {
+                query.append("token(").append(tagCql).append(") <= ?");
+                valuesOut.add(tokenType.decomposeUntyped(sub.right.getTokenValue()));
+            }
         }
         return query.toString();
     }
@@ -365,7 +478,9 @@ public class TieredStorageService
      * Runs {@code query} to completion across as many pages as needed (network page size
      * {@link #PAGE_SIZE}), via {@link QueryProcessor#instance} directly rather than the static
      * {@link QueryProcessor#process(String, ConsistencyLevel, List)} convenience method, since that
-     * overload has no way to carry a {@link PagingState} between calls.
+     * overload has no way to carry a {@link PagingState} between calls. Only ever used for queries this
+     * class has already bounded to at most one tag/one window/one candidate-list -- never for an
+     * unbounded per-tag row scan (see the class javadoc).
      */
     private static List<UntypedResultSet.Row> pagedSelect(String query, ConsistencyLevel cl, List<ByteBuffer> values)
     {
