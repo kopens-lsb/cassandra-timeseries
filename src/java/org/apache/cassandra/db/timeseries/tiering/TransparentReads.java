@@ -103,8 +103,17 @@ public final class TransparentReads
         {
             return hot;                                   // invalid policy must never break reads
         }
-        if (policy == null || !(query instanceof SinglePartitionReadCommand.Group))
+        if (policy == null)
             return hot;
+        if (!(query instanceof SinglePartitionReadCommand.Group))
+        {
+            // Range scans cannot merge chunks (no partition context) and would otherwise silently
+            // see hot rows only - warn instead of returning a quietly incomplete answer (v1 scope;
+            // spec section 3.3).
+            ClientWarn.instance.warn("tiered table " + metadata.keyspace + '.' + metadata.name +
+                                     ": range scans read hot rows only; query by partition key for merged hot+cold reads");
+            return hot;
+        }
 
         SinglePartitionReadCommand.Group group = (SinglePartitionReadCommand.Group) query;
         if (group.queries.isEmpty())
