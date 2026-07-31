@@ -26,4 +26,18 @@ home="$(cd "$bin/../.." > /dev/null; pwd)" # this script lives in .build/sh
 # Switch to the project root so all commands work properly
 cd "$home"
 
+# Guard: a mistyped FQCN resolves to an empty class list downstream and "passes" having run
+# zero tests. Fail fast here instead: every dotted non-flag argument must exist under test/*/.
+for arg in "$@"; do
+  case "$arg" in
+    -*) ;;
+    *.*)
+      if ! compgen -G "test/*/$(echo "$arg" | tr '.' '/').java" > /dev/null; then
+        echo "ERROR: test class not found under test/*/: $arg (typo in the FQCN?)" >&2
+        exit 2
+      fi
+      ;;
+  esac
+done
+
 "$bin"/ci-test "$@" 2>&1 | "$bin"/ant-log-summary.py -
