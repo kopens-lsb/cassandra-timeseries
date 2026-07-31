@@ -28,6 +28,7 @@ import org.apache.cassandra.config.DatabaseDescriptor;
 import org.apache.cassandra.db.ConsistencyLevel;
 import org.apache.cassandra.db.marshal.DoubleType;
 import org.apache.cassandra.db.marshal.Int32Type;
+import org.apache.cassandra.db.marshal.ReversedType;
 import org.apache.cassandra.db.marshal.TimestampType;
 import org.apache.cassandra.db.marshal.UTF8Type;
 import org.apache.cassandra.db.timeseries.tiering.TieringPolicy.CodecChoice;
@@ -128,6 +129,26 @@ public class TieringPolicyTest
     public void testHotWindowLessThanChunkWindowRejected()
     {
         assertConfigurationException("{\"hot_window\":\"1h\", \"chunk_window\":\"2h\"}", null);
+    }
+
+    @Test
+    public void testChunkWindowAtCapAccepted()
+    {
+        // 31d is the documented maximum chunk_window -- the boundary itself must parse.
+        TieringPolicy policy = TieringPolicy.parse("{\"hot_window\":\"40d\", \"chunk_window\":\"31d\"}");
+        assertEquals(TimeUnit.DAYS.toMillis(31), policy.chunkWindowMillis);
+    }
+
+    @Test
+    public void testChunkWindowOverCapRejected()
+    {
+        // An unbounded chunk_window defeats the re-encoder's one-window-at-a-time memory bound (and can
+        // exceed the codec's per-chunk sample limit), so anything over 31d is rejected at parse time.
+        // The message must name both the offending value and the cap so the operator can act on it.
+        assertConfigurationException("{\"hot_window\":\"33d\", \"chunk_window\":\"32d\"}", "32d");
+        assertConfigurationException("{\"hot_window\":\"33d\", \"chunk_window\":\"32d\"}", "31d");
+        assertConfigurationException("{\"hot_window\":\"370d\", \"chunk_window\":\"365d\"}", "365d");
+        assertConfigurationException("{\"hot_window\":\"370d\", \"chunk_window\":\"365d\"}", "31d");
     }
 
     @Test
@@ -233,6 +254,19 @@ public class TieringPolicyTest
     public void testCanonicalSchemaIsAccepted()
     {
         assertNull(TieringPolicy.canonicalSchemaError(canonicalTable(null)));
+    }
+
+    @Test
+    public void testDescClusteredCanonicalSchemaIsAccepted()
+    {
+        // CLUSTERING ORDER BY (ts DESC) wraps the clustering column type in ReversedType(timestamp);
+        // it is still canonical -- newest-first is the dominant time-series clustering idiom.
+        TableMetadata table = TableMetadata.builder("ks", "tbl")
+                                            .addPartitionKeyColumn("tag", UTF8Type.instance)
+                                            .addClusteringColumn("ts", ReversedType.getInstance(TimestampType.instance))
+                                            .addRegularColumn("value", DoubleType.instance)
+                                            .build();
+        assertNull(TieringPolicy.canonicalSchemaError(table));
     }
 
     @Test

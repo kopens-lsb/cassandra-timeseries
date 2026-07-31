@@ -47,7 +47,7 @@ import static java.lang.String.format;
  * <p>Recognised JSON keys (unknown keys are rejected):
  * <ul>
  *     <li>{@code hot_window} (required) - rows younger than this are left alone.</li>
- *     <li>{@code chunk_window} (default {@code "1h"}) - fixed-length re-encoding window.</li>
+ *     <li>{@code chunk_window} (default {@code "1h"}, max {@code 31d}) - fixed-length re-encoding window.</li>
  *     <li>{@code cold_window} (optional) - once a chunk is older than this, delete it outright.</li>
  *     <li>{@code codec} (default {@code "auto"}) - {@code auto|gorilla|chimp128}.</li>
  *     <li>{@code consistency} (default {@code "LOCAL_QUORUM"}) - a {@link ConsistencyLevel} name.</li>
@@ -87,6 +87,16 @@ public final class TieringPolicy
                             ConsistencyLevel.EACH_QUORUM, ConsistencyLevel.ALL);
 
     private static final Pattern DURATION = Pattern.compile("([1-9][0-9]*)([mhd])");
+
+    /**
+     * Upper bound on {@code chunk_window}. The re-encoder materializes one chunk window's worth of a
+     * tag's rows in memory at a time (its whole memory-boundedness story -- see
+     * {@link TieredStorageService}), so an over-large window turns "bounded by one window" into
+     * "bounded by nothing": a year-long window on a high-rate tag is an OOM, and anything past the
+     * codec's per-chunk sample limit ({@code ChunkCodecs.MAX_SAMPLES}) could never be encoded anyway.
+     */
+    private static final String MAX_CHUNK_WINDOW = "31d";
+    private static final long MAX_CHUNK_WINDOW_MILLIS = TimeUnit.DAYS.toMillis(31);
 
     public enum CodecChoice
     {
@@ -169,7 +179,15 @@ public final class TieringPolicy
         long hotWindowMillis = parseDurationMillis(HOT_WINDOW, hotWindow);
 
         String chunkWindow = requireString(raw, CHUNK_WINDOW);
-        long chunkWindowMillis = parseDurationMillis(CHUNK_WINDOW, chunkWindow != null ? chunkWindow : DEFAULT_CHUNK_WINDOW);
+        String effectiveChunkWindow = chunkWindow != null ? chunkWindow : DEFAULT_CHUNK_WINDOW;
+        long chunkWindowMillis = parseDurationMillis(CHUNK_WINDOW, effectiveChunkWindow);
+        if (chunkWindowMillis > MAX_CHUNK_WINDOW_MILLIS)
+            throw new ConfigurationException(format("%s.%s ('%s') must not exceed %s: the re-encoder reads one " +
+                                                      "chunk_window of rows into memory per window, so a larger window " +
+                                                      "can exhaust the heap and exceed the codec's per-chunk sample " +
+                                                      "limit on a high-rate table; use a chunk_window of %s or less",
+                                                      EXTENSION_KEY, CHUNK_WINDOW, effectiveChunkWindow,
+                                                      MAX_CHUNK_WINDOW, MAX_CHUNK_WINDOW));
 
         String coldWindow = requireString(raw, COLD_WINDOW);
         long coldWindowMillis = coldWindow == null ? -1 : parseDurationMillis(COLD_WINDOW, coldWindow);
@@ -186,7 +204,7 @@ public final class TieringPolicy
         if (hotWindowMillis < chunkWindowMillis)
             throw new ConfigurationException(format("%s.%s (%s) must be >= %s (%s)",
                                                       EXTENSION_KEY, HOT_WINDOW, hotWindow, CHUNK_WINDOW,
-                                                      chunkWindow != null ? chunkWindow : DEFAULT_CHUNK_WINDOW));
+                                                      effectiveChunkWindow));
 
         if (coldWindowMillis >= 0 && coldWindowMillis <= hotWindowMillis)
             throw new ConfigurationException(format("%s.%s (%s) must be > %s (%s)",
@@ -203,8 +221,9 @@ public final class TieringPolicy
 
     /**
      * @return {@code null} if {@code metadata} is a canonical time-series table (exactly one partition key
-     * column, exactly one {@code timestamp} clustering column, exactly one {@code double} regular column),
-     * else a human-readable description of why it is not.
+     * column, exactly one {@code timestamp} clustering column -- {@code ASC} or {@code DESC}, since
+     * newest-first is the dominant time-series clustering idiom -- exactly one {@code double} regular
+     * column), else a human-readable description of why it is not.
      */
     public static String canonicalSchemaError(TableMetadata metadata)
     {
@@ -215,7 +234,9 @@ public final class TieringPolicy
             return format("expected exactly 1 clustering column, found %d", metadata.clusteringColumns().size());
 
         ColumnMetadata clustering = metadata.clusteringColumns().get(0);
-        if (!clustering.type.equals(TimestampType.instance))
+        // unwrap(): CLUSTERING ORDER BY (ts DESC) wraps the column type in ReversedType(timestamp);
+        // both orders are canonical (the re-encoder's queries all say ORDER BY ... ASC explicitly).
+        if (!clustering.type.unwrap().equals(TimestampType.instance))
             return format("expected clustering column '%s' to be of type timestamp, found %s",
                            clustering.name.toCQLString(), clustering.type.asCQL3Type());
 

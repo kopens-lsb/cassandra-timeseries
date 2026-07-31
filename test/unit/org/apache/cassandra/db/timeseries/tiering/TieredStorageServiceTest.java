@@ -428,6 +428,96 @@ public class TieredStorageServiceTest extends CQLTester
     }
 
     @Test
+    public void oversizedWindowAbortsThatTagOnlyWithError() throws Throwable
+    {
+        // Regression for a final-review finding: a window holding more samples than the codec can
+        // encode (ChunkCodecs.MAX_SAMPLES in production; shrunk to 3 here via the maxSamplesPerWindow
+        // seam) must be detected while paging -- never fully materialized -- and abort that tag's walk
+        // with an actionable ERROR, instead of blowing up in encode and re-reading the giant window
+        // every cycle forever. Other tags in the same run must still encode.
+        createTable("CREATE TABLE %s (tag text, ts timestamp, value double, PRIMARY KEY (tag, ts))");
+        setPolicy("{\"hot_window\":\"2h\",\"chunk_window\":\"1h\"}");
+
+        // "big": 5 rows in one closed window -- over the injected 3-sample cap.
+        for (int i = 0; i < 5; i++)
+            insertRow("big", i * 60_000L, i * 1.0, 10 + i);
+        insertRow("big", 4 * HOUR, 999.0, 99);
+
+        // "small": 2 rows in one closed window -- under the cap, must encode normally.
+        insertRow("small", 0L, 1.0, 10);
+        insertRow("small", 60_000L, 2.0, 11);
+        insertRow("small", 4 * HOUR, 999.0, 99);
+
+        TieredStorageService service = new TieredStorageService();
+        service.maxSamplesPerWindow = 3;
+
+        Logger serviceLogger = (Logger) LoggerFactory.getLogger(TieredStorageService.class);
+        ListAppender<ILoggingEvent> appender = new ListAppender<>();
+        appender.start();
+        serviceLogger.addAppender(appender);
+        TierRunStats stats;
+        try
+        {
+            stats = service.runOnce(KEYSPACE, currentTable(), 5 * HOUR);
+        }
+        finally
+        {
+            serviceLogger.detachAppender(appender);
+        }
+
+        // "big" encoded nothing: no chunk row, and every source row is still in base, untouched.
+        assertEquals(0, execute(chunkSelectQuery(), "big", new Date(0L)).size());
+        assertEquals(5, execute("SELECT * FROM %s WHERE tag = ? AND ts < ?", "big", new Date(HOUR)).size());
+
+        // The abort was logged at ERROR, naming the tag and telling the operator what to change.
+        assertTrue("expected an ERROR naming tag 'big' and pointing at chunk_window",
+                   appender.list.stream().anyMatch(e -> e.getLevel() == Level.ERROR &&
+                                                        e.getFormattedMessage().contains("big") &&
+                                                        e.getFormattedMessage().contains("chunk_window")));
+
+        // "small" still encoded on the very same run.
+        assertEquals(1, stats.windowsEncoded);
+        assertEquals(2, stats.rowsEncoded);
+        assertEquals(1, execute(chunkSelectQuery(), "small", new Date(0L)).size());
+        assertEquals(0, execute("SELECT * FROM %s WHERE tag = ? AND ts < ?", "small", new Date(HOUR)).size());
+    }
+
+    @Test
+    public void descClusteredTableDrainsBacklogInOneRun() throws Throwable
+    {
+        // Regression for a final-review finding: with CLUSTERING ORDER BY (ts DESC) -- the dominant
+        // time-series idiom -- an order-less LIMIT 1 probe returns the NEWEST row in range, so the
+        // empty-window jump would leap over every window between the gap and the cutoff and the
+        // backlog would drain a couple of windows per cycle instead of completely. The deliberate
+        // empty window [1h,2h) below forces the walk through that jump (nextClosedWindowStart): it
+        // must land on the OLDEST remaining row's window (2h), not the newest's (3h).
+        createTable("CREATE TABLE %s (tag text, ts timestamp, value double, PRIMARY KEY (tag, ts)) " +
+                    "WITH CLUSTERING ORDER BY (ts DESC)");
+        setPolicy("{\"hot_window\":\"2h\",\"chunk_window\":\"1h\"}");
+
+        long now = 6 * HOUR; // cutoff = windowStartFor(6h - 2h) = 4h
+        insertRow("d", 0L, 1.0, 1);        // window [0,1h)  -- closed
+        insertRow("d", 600_000L, 1.5, 2);  // window [0,1h)  -- closed
+        insertRow("d", 2 * HOUR, 2.0, 3);  // window [2h,3h) -- closed, after the empty [1h,2h) gap
+        insertRow("d", 3 * HOUR, 3.0, 4);  // window [3h,4h) -- closed
+        insertRow("d", 5 * HOUR, 999.0, 5); // hot -- must survive untouched
+
+        TierRunStats stats = new TieredStorageService().runOnce(KEYSPACE, currentTable(), now);
+
+        // The whole multi-window backlog drained in this single run...
+        assertEquals(3, stats.windowsEncoded);
+        assertEquals(4, stats.rowsEncoded);
+        for (long windowStart : new long[]{ 0L, 2 * HOUR, 3 * HOUR })
+            assertEquals("expected a chunk for window starting at " + windowStart,
+                         1, execute(chunkSelectQuery(), "d", new Date(windowStart)).size());
+        assertEquals(2, execute(chunkSelectQuery(), "d", new Date(0L)).one().getInt("samples"));
+
+        // ...every closed source row is gone, and the hot row survived.
+        assertEquals(0, execute("SELECT * FROM %s WHERE tag = ? AND ts < ?", "d", new Date(4 * HOUR)).size());
+        assertEquals(1, execute("SELECT * FROM %s WHERE tag = ? AND ts = ?", "d", new Date(5 * HOUR)).size());
+    }
+
+    @Test
     public void virtualTableShowsPolicyAndStats() throws Throwable
     {
         createTable("CREATE TABLE %s (tag text, ts timestamp, value double, PRIMARY KEY (tag, ts))");

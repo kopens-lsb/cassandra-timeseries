@@ -154,6 +154,17 @@ public class TieredStorageService implements TieredStorageServiceMBean
     volatile BiConsumer<String, String> preRunHookForTesting;
 
     /**
+     * Hard cap on the samples a single (tag, window) may accumulate in one cycle -- the codec's
+     * per-chunk limit ({@link ChunkCodecs#MAX_SAMPLES}), pre-checked here so an over-dense window is
+     * aborted while still paging (memory stays bounded) with an actionable error, instead of being
+     * fully materialized and then blowing up in {@code ChunkCodecs.encode} every cycle forever.
+     * Non-final only as a test seam: shrinking it lets a test trigger the abort with a handful of
+     * rows; production code must never write it.
+     */
+    @VisibleForTesting
+    volatile int maxSamplesPerWindow = ChunkCodecs.MAX_SAMPLES;
+
+    /**
      * Registers the {@value #MBEAN_NAME} MBean and schedules the single, process-wide sweep
      * ({@link #sweep}) that drives every policy-bearing table's re-encode cycle, on
      * {@link ScheduledExecutors#optionalTasks} at a fixed {@value #SWEEP_DELAY_SECONDS}s delay.
@@ -415,8 +426,12 @@ public class TieredStorageService implements TieredStorageServiceMBean
         // row count, not a tag's entire closed backlog.
         String oldestRowQuery = format("SELECT %s FROM %s WHERE %s = ? AND %s < ? ORDER BY %s ASC LIMIT 1",
                                        tsCql, baseRef, tagCql, tsCql, tsCql);
-        String nextRowQuery = format("SELECT %s FROM %s WHERE %s = ? AND %s >= ? AND %s < ? LIMIT 1",
-                                     tsCql, baseRef, tagCql, tsCql, tsCql, tsCql);
+        // Both LIMIT 1 probes say ORDER BY ... ASC explicitly: on a table declared WITH CLUSTERING
+        // ORDER BY (ts DESC) -- the dominant time-series idiom -- the default order is newest-first,
+        // so an order-less probe would return the NEWEST row in range and the empty-window jump would
+        // leap over every window between here and the cutoff instead of landing on the next one.
+        String nextRowQuery = format("SELECT %s FROM %s WHERE %s = ? AND %s >= ? AND %s < ? ORDER BY %s ASC LIMIT 1",
+                                     tsCql, baseRef, tagCql, tsCql, tsCql, tsCql, tsCql);
         String windowRowsQuery = format("SELECT %s, %s, WRITETIME(%s) AS wt FROM %s WHERE %s = ? AND %s >= ? " +
                                         "AND %s < ? ORDER BY %s ASC",
                                         tsCql, valueCql, valueCql, baseRef, tagCql, tsCql, tsCql, tsCql);
@@ -453,10 +468,26 @@ public class TieredStorageService implements TieredStorageServiceMBean
                     // that actually touch hot data (this read, and the delete below), as a second,
                     // independent guard against the exact class of bug the belt above exists to fix.
                     long readEnd = Math.min(windowEnd, cutoff);
+                    int maxSamples = maxSamplesPerWindow;
                     List<UntypedResultSet.Row> windowRows = pagedSelect(windowRowsQuery, cl, Arrays.asList(
                             tag,
                             TimestampType.instance.fromTimeInMillis(windowStart),
-                            TimestampType.instance.fromTimeInMillis(readEnd)));
+                            TimestampType.instance.fromTimeInMillis(readEnd)),
+                            maxSamples);
+                    if (windowRows.size() > maxSamples)
+                    {
+                        // Paging stopped as soon as the count crossed the cap (see pagedSelect), so
+                        // memory stayed bounded -- but this window can never be encoded as configured.
+                        // Encoding a partial window would delete rows the chunk doesn't contain, and
+                        // retrying the full read every cycle would wedge this tag forever, so abort the
+                        // tag's walk until an operator shrinks chunk_window.
+                        logger.error("Tiered storage runOnce: {}.{} tag {} window [{}, {}) holds more than {} rows, " +
+                                     "over the {}-sample per-chunk codec limit -- it cannot be encoded. Lower the " +
+                                     "table's timeseries_tiering chunk_window so one window holds at most {} samples; " +
+                                     "skipping this tag until then", keyspace, table, tagColumn.type.getString(tag),
+                                     windowStart, readEnd, maxSamples, maxSamples, maxSamples);
+                        break;
+                    }
 
                     if (windowRows.isEmpty())
                     {
@@ -511,6 +542,18 @@ public class TieredStorageService implements TieredStorageServiceMBean
                     }
 
                     int count = merged.size();
+                    if (count > maxSamples)
+                    {
+                        // The window's own rows fit the cap, but merged with the existing chunk's
+                        // samples (disjoint late-row timestamps) the total doesn't -- encode would
+                        // throw, be caught by the per-tag handler, and retry identically forever.
+                        logger.error("Tiered storage runOnce: {}.{} tag {} window [{}, {}) merges to {} samples, " +
+                                     "over the {}-sample per-chunk codec limit -- it cannot be encoded. Lower the " +
+                                     "table's timeseries_tiering chunk_window so one window holds at most {} samples; " +
+                                     "skipping this tag until then", keyspace, table, tagColumn.type.getString(tag),
+                                     windowStart, readEnd, count, maxSamples, maxSamples);
+                        break;
+                    }
                     if (tsBuf.length < count)
                     {
                         int newLength = tsBuf.length;
@@ -736,6 +779,20 @@ public class TieredStorageService implements TieredStorageServiceMBean
      */
     private static List<UntypedResultSet.Row> pagedSelect(String query, ConsistencyLevel cl, List<ByteBuffer> values)
     {
+        return pagedSelect(query, cl, values, Integer.MAX_VALUE);
+    }
+
+    /**
+     * As {@link #pagedSelect(String, ConsistencyLevel, List)}, but stops fetching further pages as soon
+     * as more than {@code maxRows} rows have accumulated, returning what it has (at most one page over
+     * the cap). Callers that pass a real cap must treat {@code result.size() > maxRows} as "the scan
+     * overflowed, and the result is truncated" -- see the {@code maxSamplesPerWindow} guard in
+     * {@link #runOnce} -- so an over-dense window is detected mid-paging with bounded memory, never
+     * fully materialized.
+     */
+    private static List<UntypedResultSet.Row> pagedSelect(String query, ConsistencyLevel cl, List<ByteBuffer> values,
+                                                          int maxRows)
+    {
         List<UntypedResultSet.Row> rows = new ArrayList<>();
         QueryState queryState = QueryState.forInternalCalls();
         PagingState pagingState = null;
@@ -752,6 +809,9 @@ public class TieredStorageService implements TieredStorageServiceMBean
             ResultSet resultSet = ((ResultMessage.Rows) result).result;
             for (UntypedResultSet.Row row : UntypedResultSet.create(resultSet))
                 rows.add(row);
+
+            if (rows.size() > maxRows)
+                break;
 
             pagingState = resultSet.metadata.getPagingState();
             if (pagingState == null)
