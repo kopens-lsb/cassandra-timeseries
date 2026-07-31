@@ -32,23 +32,69 @@
 > 실패합니다(침묵 중복/유실 방지, v1 스코프). ② 디코드 로우의 `writetime(value)`은 청크의
 > `max_row_writetime` 근사값입니다. ③ 손상 청크는 경고와 함께 건너뛰고 나머지 데이터를 제공합니다.
 
-## 1. 대상 스키마 — 정준(canonical) 시계열 테이블
+## 1. 대상 스키마 — 시간으로 클러스터링된 아무 테이블
 
-재인코더는 다음 형태의 테이블만 처리합니다 (그 외 형태에 정책을 걸면 60초 스위프마다 ERROR 로그를
-남기고 건너뜁니다):
+계층화는 **시간축이 하나인 시계열 테이블이면 형태를 가리지 않습니다.** 지원되지 않는 형태에 정책을
+걸면 60초 스위프마다 사유를 밝힌 ERROR 로그를 남기고 건너뜁니다.
 
-- 파티션 키 컬럼 **정확히 1개** (이름·타입 자유 — 예: `text` 태그)
-- 클러스터링 컬럼 **정확히 1개**, 타입 `timestamp`
-- 일반 컬럼 **정확히 1개**, 타입 `double`
+**지원:**
+
+| 요소 | 조건 |
+| --- | --- |
+| 파티션 키 | **개수 무관** — 복합 키(`PRIMARY KEY ((asset_id, date, hour), ts)`) 가능. 청크 테이블이 전체 파티션 키를 그대로(이름·타입·순서) 미러링합니다 |
+| 클러스터링 | **정확히 1개**, 타입 `timestamp` (`ASC`/`DESC` 무관) |
+| 일반 컬럼 | **개수·타입 무관** — `text`/`int`/`bigint`/`double`/`boolean`/`blob`/`uuid`/`frozen<...>` 등 |
+| static 컬럼 | **개수·타입 무관** (비frozen 컬렉션도 가능). static 셀은 청크화 대상이 아니며, 재인코더의 클러스터링 레인지 딜리트가 static을 건드리지 않으므로 그대로 보존됩니다 |
+| 보조 인덱스 | static·파티션 키·클러스터링 컬럼에 걸린 인덱스는 무방 (예: static `asset_id`의 SAI) |
+
+**거부 (각각 사유를 명시한 ERROR 로그):**
+
+| 형태 | 사유 |
+| --- | --- |
+| `counter` 컬럼 | 재인코더는 행을 삭제 후 재삽입하는데, 삭제된 카운터는 영구히 다시 쓸 수 없습니다 — 정합성 정지 조건이지 한계가 아닙니다 |
+| 비frozen 컬렉션 **일반** 컬럼 | 멀티셀 값(셀·타임스탬프가 원소별로 존재)은 청크의 행 단위 불투명 바이트로 표현할 수 없습니다. `frozen<...>`으로 감싸면 지원됩니다 |
+| 클러스터링이 0개·2개 이상이거나 `timestamp`가 아닌 경우 | 청크가 인코딩할 시간축이 없습니다 |
+| **일반 컬럼**에 걸린 보조 인덱스(SAI 포함) | 재인코딩된 행은 베이스에서 삭제되므로 인덱스에서도 사라집니다 — 인덱스 질의가 `hot_window`보다 오래된 데이터를 조용히 누락합니다 |
+| 이 테이블 위의 **머티리얼라이즈드 뷰** | 레인지 딜리트가 뷰까지 전파되지만 투명 읽기는 **베이스 테이블만** 복원하므로, 뷰는 `hot_window` 이전 이력을 아무 에러 없이 영구히 잃습니다 |
+| 청크 테이블 예약어와 겹치는 파티션 키 이름 | `window_start`/`codec`/`samples`/`max_row_writetime`/`payload` — 미러링 시 같은 이름이 두 번 선언됩니다 |
 
 ```sql
+-- 가장 단순한 형태
 CREATE TABLE ts.sensor (
     tag_id    text,
     timestamp timestamp,
     value     double,
     PRIMARY KEY (tag_id, timestamp)
 );
+
+-- 실 운영형: 복합 파티션 키 + static 다수 + 일반 컬럼 다수(혼합 타입) + DESC
+CREATE TABLE ts.tag_point (
+    tag_id     text,
+    timestamp  timestamp,
+    site_id    text STATIC,
+    tag_name   text STATIC,
+    attribute  frozen<map<text,text>>,
+    quality    int,
+    latency    int,
+    value      text,
+    PRIMARY KEY (tag_id, timestamp)
+) WITH CLUSTERING ORDER BY (timestamp DESC);
 ```
+
+> **진행 중(SP4)**: 스키마 수용은 위와 같이 일반화됐지만, 재인코더 자체는 아직 `double` 일반 컬럼
+> **1개**짜리 청크만 씁니다. 그 외 형태는 수용된 뒤에도 "아직 다중 컬럼 인코딩 전"이라는 ERROR와
+> 함께 건너뜁니다 — 한 컬럼만 인코딩하고 나머지를 지우는 일은 절대 하지 않습니다. 다중 컬럼
+> 인코딩은 컬럼 지향 청크 포맷 전환과 함께 들어옵니다.
+
+### 1.1 `default_time_to_live`와 `hot_window`
+
+베이스 테이블에 `default_time_to_live`가 있고 `hot_window >= TTL`이면 **재인코더가 데이터를 볼 기회가
+없습니다** (TTL이 먼저 지웁니다) — 계층화를 켜 두고도 아무것도 압축되지 않습니다. 이 조합은 거부되지
+않고(행 단위 `USING TTL`이 테이블 기본값과 다를 수 있으므로) 두 값을 함께 밝힌 WARN을 남깁니다.
+`hot_window`를 TTL보다 짧게 잡거나 `default_time_to_live`를 올리십시오.
+
+청크로 옮겨진 데이터에는 베이스 TTL이 더 이상 적용되지 않습니다 — `cold_window`가 유일한 보존
+장치이며, 이것이 "압축해서 보존 기간을 늘린다"의 메커니즘입니다.
 
 ## 2. 정책 설정 — `timeseries_tiering` 테이블 확장
 
@@ -112,7 +158,7 @@ ALTER TABLE ts.sensor WITH extensions = {
 
 | 컬럼 | 타입 | 의미 |
 | --- | --- | --- |
-| *(베이스 파티션 키)* | 동일 | 베이스 테이블의 파티션 키 컬럼을 이름·타입 그대로 복제 (예: `tag_id text`) |
+| *(베이스 파티션 키 전체)* | 동일 | 베이스 테이블의 파티션 키 컬럼 **전부**를 이름·타입·순서 그대로 복제 (예: `tag_id text`, 또는 복합 키면 `(asset_id text, date text, hour int)` 세 컬럼 모두) |
 | `window_start` | `timestamp` | 청크가 덮는 창의 시작 (클러스터링 키; 창 길이 = `chunk_window`) |
 | `codec` | `tinyint` | 페이로드 코덱 버전 (2 = Chimp128; 1 = 제거된 Gorilla) |
 | `samples` | `int` | 청크에 인코딩된 샘플 수 |

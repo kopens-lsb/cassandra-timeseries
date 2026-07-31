@@ -26,12 +26,17 @@ import org.junit.Test;
 
 import org.apache.cassandra.config.DatabaseDescriptor;
 import org.apache.cassandra.db.ConsistencyLevel;
+import org.apache.cassandra.db.marshal.BooleanType;
+import org.apache.cassandra.db.marshal.CounterColumnType;
 import org.apache.cassandra.db.marshal.DoubleType;
 import org.apache.cassandra.db.marshal.Int32Type;
+import org.apache.cassandra.db.marshal.MapType;
 import org.apache.cassandra.db.marshal.ReversedType;
 import org.apache.cassandra.db.marshal.TimestampType;
 import org.apache.cassandra.db.marshal.UTF8Type;
 import org.apache.cassandra.exceptions.ConfigurationException;
+import org.apache.cassandra.schema.IndexMetadata;
+import org.apache.cassandra.schema.Indexes;
 import org.apache.cassandra.schema.TableMetadata;
 import org.apache.cassandra.schema.TableParams;
 import org.apache.cassandra.utils.ByteBufferUtil;
@@ -61,6 +66,45 @@ public class TieringPolicyTest
                                       .extensions(ImmutableMap.of(TieringPolicy.EXTENSION_KEY, ByteBufferUtil.bytes(json)))
                                       .build());
         return builder.build();
+    }
+
+    private static TableMetadata tableWithTtl(int ttlSeconds)
+    {
+        return TableMetadata.builder("ks", "tbl")
+                             .addPartitionKeyColumn("tag", UTF8Type.instance)
+                             .addClusteringColumn("ts", TimestampType.instance)
+                             .addRegularColumn("value", DoubleType.instance)
+                             .params(TableParams.builder().defaultTimeToLive(ttlSeconds).build())
+                             .build();
+    }
+
+    /** The shape of the production table this work exists for: 7 static, 7 regular of mixed types, DESC. */
+    private static TableMetadata productionShapedTable()
+    {
+        return TableMetadata.builder("pp", "tm_tag_point")
+                             .addPartitionKeyColumn("tag_id", UTF8Type.instance)
+                             .addClusteringColumn("timestamp", ReversedType.getInstance(TimestampType.instance))
+                             .addStaticColumn("area_id", UTF8Type.instance)
+                             .addStaticColumn("asset_id", UTF8Type.instance)
+                             .addStaticColumn("line_id", UTF8Type.instance)
+                             .addStaticColumn("opc_id", UTF8Type.instance)
+                             .addStaticColumn("site_id", UTF8Type.instance)
+                             .addStaticColumn("tag_name", UTF8Type.instance)
+                             .addStaticColumn("type", UTF8Type.instance)
+                             .addRegularColumn("attribute", MapType.getInstance(UTF8Type.instance, UTF8Type.instance, false))
+                             .addRegularColumn("error_code", Int32Type.instance)
+                             .addRegularColumn("latency", Int32Type.instance)
+                             .addRegularColumn("quality", Int32Type.instance)
+                             .addRegularColumn("value", UTF8Type.instance)
+                             .addRegularColumn("value_boolean", BooleanType.instance)
+                             .addRegularColumn("value_numeric", DoubleType.instance)
+                             .build();
+    }
+
+    /** An index definition carrying only what {@link TieringPolicy} reads from one: its target. */
+    private static IndexMetadata index(String name, String target)
+    {
+        return IndexMetadata.fromSchemaMetadata(name, IndexMetadata.Kind.CUSTOM, ImmutableMap.of("target", target));
     }
 
     // ---- parsing + defaults ----
@@ -250,40 +294,96 @@ public class TieringPolicyTest
         assertEquals(-2 * hourMillis, policy.windowStartFor(-hourMillis - 1));
     }
 
-    // ---- canonicalSchemaError ----
+    // ---- unsupportedSchemaError: accepted shapes ----
 
     @Test
-    public void testCanonicalSchemaIsAccepted()
+    public void testSingleValueSchemaIsAccepted()
     {
-        assertNull(TieringPolicy.canonicalSchemaError(canonicalTable(null)));
+        assertNull(TieringPolicy.unsupportedSchemaError(canonicalTable(null)));
     }
 
     @Test
-    public void testDescClusteredCanonicalSchemaIsAccepted()
+    public void testDescClusteredSchemaIsAccepted()
     {
         // CLUSTERING ORDER BY (ts DESC) wraps the clustering column type in ReversedType(timestamp);
-        // it is still canonical -- newest-first is the dominant time-series clustering idiom.
+        // it is still supported -- newest-first is the dominant time-series clustering idiom.
         TableMetadata table = TableMetadata.builder("ks", "tbl")
                                             .addPartitionKeyColumn("tag", UTF8Type.instance)
                                             .addClusteringColumn("ts", ReversedType.getInstance(TimestampType.instance))
                                             .addRegularColumn("value", DoubleType.instance)
                                             .build();
-        assertNull(TieringPolicy.canonicalSchemaError(table));
+        assertNull(TieringPolicy.unsupportedSchemaError(table));
     }
 
     @Test
-    public void testExtraRegularColumnRejected()
+    public void testCompositePartitionKeyAccepted()
     {
+        // A real production table: PRIMARY KEY ((asset_id, date, hour), ts).
+        TableMetadata table = TableMetadata.builder("ks", "tbl")
+                                            .addPartitionKeyColumn("asset_id", UTF8Type.instance)
+                                            .addPartitionKeyColumn("date", UTF8Type.instance)
+                                            .addPartitionKeyColumn("hour", Int32Type.instance)
+                                            .addClusteringColumn("ts", TimestampType.instance)
+                                            .addRegularColumn("value", DoubleType.instance)
+                                            .build();
+        assertNull(TieringPolicy.unsupportedSchemaError(table));
+    }
+
+    @Test
+    public void testManyRegularColumnsOfMixedTypesAccepted()
+    {
+        // The shape of pp.tm_tag_point: seven regular columns, mixed types, incl. a frozen map.
+        assertNull(TieringPolicy.unsupportedSchemaError(productionShapedTable()));
+    }
+
+    @Test
+    public void testStaticColumnsAccepted()
+    {
+        // Static columns are never chunked: a clustering-range delete leaves them alone (static cells
+        // live outside the clustering range), so they survive tiering untouched and need no rules --
+        // not even the non-frozen-collection one that applies to regular columns.
         TableMetadata table = TableMetadata.builder("ks", "tbl")
                                             .addPartitionKeyColumn("tag", UTF8Type.instance)
                                             .addClusteringColumn("ts", TimestampType.instance)
+                                            .addStaticColumn("site_id", UTF8Type.instance)
+                                            .addStaticColumn("labels", MapType.getInstance(UTF8Type.instance,
+                                                                                            UTF8Type.instance, true))
                                             .addRegularColumn("value", DoubleType.instance)
-                                            .addRegularColumn("extra", DoubleType.instance)
                                             .build();
-        String error = TieringPolicy.canonicalSchemaError(table);
-        assertNotNull(error);
-        assertTrue(error, error.contains("regular column"));
+        assertNull(TieringPolicy.unsupportedSchemaError(table));
     }
+
+    @Test
+    public void testFrozenCollectionRegularColumnAccepted()
+    {
+        // frozen<map<text,text>> is a single cell -- a chunk can carry it as opaque bytes.
+        TableMetadata table = TableMetadata.builder("ks", "tbl")
+                                            .addPartitionKeyColumn("tag", UTF8Type.instance)
+                                            .addClusteringColumn("ts", TimestampType.instance)
+                                            .addRegularColumn("attribute", MapType.getInstance(UTF8Type.instance,
+                                                                                                UTF8Type.instance, false))
+                                            .build();
+        assertNull(TieringPolicy.unsupportedSchemaError(table));
+    }
+
+    @Test
+    public void testIndexOnStaticOrKeyColumnAccepted()
+    {
+        // The real table carries SAI on static asset_id/opc_id. Those rows never move, so the index
+        // stays complete -- only regular-column indexes are a problem.
+        TableMetadata table = TableMetadata.builder("ks", "tbl")
+                                            .addPartitionKeyColumn("tag", UTF8Type.instance)
+                                            .addClusteringColumn("ts", TimestampType.instance)
+                                            .addStaticColumn("asset_id", UTF8Type.instance)
+                                            .addRegularColumn("value", DoubleType.instance)
+                                            .indexes(Indexes.of(index("by_asset", "asset_id"),
+                                                                index("by_tag", "tag"),
+                                                                index("by_ts", "ts")))
+                                            .build();
+        assertNull(TieringPolicy.unsupportedSchemaError(table));
+    }
+
+    // ---- unsupportedSchemaError: rejected shapes ----
 
     @Test
     public void testNonTimestampClusteringRejected()
@@ -293,23 +393,153 @@ public class TieringPolicyTest
                                             .addClusteringColumn("ts", Int32Type.instance)
                                             .addRegularColumn("value", DoubleType.instance)
                                             .build();
-        String error = TieringPolicy.canonicalSchemaError(table);
+        String error = TieringPolicy.unsupportedSchemaError(table);
         assertNotNull(error);
         assertTrue(error, error.contains("timestamp"));
+        assertTrue(error, error.contains("ts"));
     }
 
     @Test
-    public void testCompositePartitionKeyRejected()
+    public void testNoClusteringColumnRejected()
     {
         TableMetadata table = TableMetadata.builder("ks", "tbl")
-                                            .addPartitionKeyColumn("tag1", UTF8Type.instance)
-                                            .addPartitionKeyColumn("tag2", UTF8Type.instance)
-                                            .addClusteringColumn("ts", TimestampType.instance)
+                                            .addPartitionKeyColumn("tag", UTF8Type.instance)
                                             .addRegularColumn("value", DoubleType.instance)
                                             .build();
-        String error = TieringPolicy.canonicalSchemaError(table);
+        String error = TieringPolicy.unsupportedSchemaError(table);
         assertNotNull(error);
-        assertTrue(error, error.contains("partition key"));
+        assertTrue(error, error.contains("exactly 1 clustering column"));
+    }
+
+    @Test
+    public void testTwoClusteringColumnsRejected()
+    {
+        TableMetadata table = TableMetadata.builder("ks", "tbl")
+                                            .addPartitionKeyColumn("tag", UTF8Type.instance)
+                                            .addClusteringColumn("ts", TimestampType.instance)
+                                            .addClusteringColumn("seq", Int32Type.instance)
+                                            .addRegularColumn("value", DoubleType.instance)
+                                            .build();
+        String error = TieringPolicy.unsupportedSchemaError(table);
+        assertNotNull(error);
+        assertTrue(error, error.contains("exactly 1 clustering column"));
+    }
+
+    @Test
+    public void testCounterColumnRejected()
+    {
+        // 192 of the production keyspace's columns are counters. A counter cannot be deleted and
+        // re-inserted, which is exactly what the re-encoder does -- so this is a correctness stop.
+        TableMetadata table = TableMetadata.builder("ks", "tbl")
+                                            .addPartitionKeyColumn("tag", UTF8Type.instance)
+                                            .addClusteringColumn("ts", TimestampType.instance)
+                                            .addRegularColumn("hits", CounterColumnType.instance)
+                                            .build();
+        String error = TieringPolicy.unsupportedSchemaError(table);
+        assertNotNull(error);
+        assertTrue(error, error.contains("counter"));
+        assertTrue(error, error.contains("hits"));
+    }
+
+    @Test
+    public void testNonFrozenCollectionRegularColumnRejected()
+    {
+        TableMetadata table = TableMetadata.builder("ks", "tbl")
+                                            .addPartitionKeyColumn("tag", UTF8Type.instance)
+                                            .addClusteringColumn("ts", TimestampType.instance)
+                                            .addRegularColumn("labels", MapType.getInstance(UTF8Type.instance,
+                                                                                             UTF8Type.instance, true))
+                                            .build();
+        String error = TieringPolicy.unsupportedSchemaError(table);
+        assertNotNull(error);
+        assertTrue(error, error.contains("labels"));
+        assertTrue(error, error.contains("non-frozen"));
+    }
+
+    @Test
+    public void testIndexOnRegularColumnRejected()
+    {
+        TableMetadata table = TableMetadata.builder("ks", "tbl")
+                                            .addPartitionKeyColumn("tag", UTF8Type.instance)
+                                            .addClusteringColumn("ts", TimestampType.instance)
+                                            .addRegularColumn("value", DoubleType.instance)
+                                            .indexes(Indexes.of(index("by_value", "value")))
+                                            .build();
+        String error = TieringPolicy.unsupportedSchemaError(table);
+        assertNotNull(error);
+        assertTrue(error, error.contains("by_value"));
+        assertTrue(error, error.contains("value"));
+    }
+
+    @Test
+    public void testIndexWithAnUnresolvableTargetRejected()
+    {
+        // An index whose target cannot be resolved to a column is rejected rather than assumed safe:
+        // "cannot prove it is not on a regular column" must not read as "it is not".
+        TableMetadata table = TableMetadata.builder("ks", "tbl")
+                                            .addPartitionKeyColumn("tag", UTF8Type.instance)
+                                            .addClusteringColumn("ts", TimestampType.instance)
+                                            .addRegularColumn("value", DoubleType.instance)
+                                            .indexes(Indexes.of(index("by_ghost", "no_such_column")))
+                                            .build();
+        String error = TieringPolicy.unsupportedSchemaError(table);
+        assertNotNull(error);
+        assertTrue(error, error.contains("by_ghost"));
+    }
+
+    @Test
+    public void testPartitionKeyCollidingWithAChunkTableColumnRejected()
+    {
+        // The chunk table mirrors the base partition key and adds window_start/codec/samples/
+        // max_row_writetime/payload -- a base key column of the same name could not be mirrored.
+        for (String reserved : ChunkTables.RESERVED_COLUMN_NAMES)
+        {
+            TableMetadata table = TableMetadata.builder("ks", "tbl")
+                                                .addPartitionKeyColumn(reserved, UTF8Type.instance)
+                                                .addClusteringColumn("ts", TimestampType.instance)
+                                                .addRegularColumn("value", DoubleType.instance)
+                                                .build();
+            String error = TieringPolicy.unsupportedSchemaError(table);
+            assertNotNull(reserved, error);
+            assertTrue(error, error.contains(reserved));
+        }
+    }
+
+    // ---- ttlShadowsHotWindowWarning ----
+
+    @Test
+    public void testTtlBelowHotWindowWarns()
+    {
+        // default_time_to_live 62d with hot_window 90d: the rows are gone before the re-encoder may
+        // touch them, so tiering is configured but can never compress anything.
+        TieringPolicy policy = TieringPolicy.parse("{\"hot_window\":\"90d\"}");
+        String warning = TieringPolicy.ttlShadowsHotWindowWarning(tableWithTtl(5_356_800), policy);
+        assertNotNull(warning);
+        assertTrue(warning, warning.contains("5356800"));
+        assertTrue(warning, warning.contains("default_time_to_live"));
+        assertTrue(warning, warning.contains("hot_window"));
+    }
+
+    @Test
+    public void testTtlEqualToHotWindowWarns()
+    {
+        // Exactly equal is still unusable: a row expires the instant it stops being hot.
+        TieringPolicy policy = TieringPolicy.parse("{\"hot_window\":\"1d\"}");
+        assertNotNull(TieringPolicy.ttlShadowsHotWindowWarning(tableWithTtl(86_400), policy));
+    }
+
+    @Test
+    public void testTtlAboveHotWindowDoesNotWarn()
+    {
+        TieringPolicy policy = TieringPolicy.parse("{\"hot_window\":\"1d\"}");
+        assertNull(TieringPolicy.ttlShadowsHotWindowWarning(tableWithTtl(86_401), policy));
+    }
+
+    @Test
+    public void testNoTtlDoesNotWarn()
+    {
+        TieringPolicy policy = TieringPolicy.parse("{\"hot_window\":\"90d\"}");
+        assertNull(TieringPolicy.ttlShadowsHotWindowWarning(canonicalTable(null), policy));
     }
 
     // ---- fromTable ----

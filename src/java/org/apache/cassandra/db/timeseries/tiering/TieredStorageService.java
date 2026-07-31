@@ -47,6 +47,7 @@ import org.apache.cassandra.cql3.UntypedResultSet;
 import org.apache.cassandra.db.ConsistencyLevel;
 import org.apache.cassandra.db.marshal.AbstractType;
 import org.apache.cassandra.db.marshal.ByteType;
+import org.apache.cassandra.db.marshal.DoubleType;
 import org.apache.cassandra.db.marshal.Int32Type;
 import org.apache.cassandra.db.marshal.LongType;
 import org.apache.cassandra.db.marshal.TimestampType;
@@ -69,6 +70,7 @@ import org.apache.cassandra.transport.messages.ResultMessage;
 import org.apache.cassandra.utils.Clock;
 import org.apache.cassandra.utils.JVMStabilityInspector;
 import org.apache.cassandra.utils.MBeanWrapper;
+import org.apache.cassandra.utils.NoSpamLogger;
 
 import static java.lang.String.format;
 
@@ -357,8 +359,8 @@ public class TieredStorageService implements TieredStorageServiceMBean
     /**
      * Runs one re-encode cycle for {@code keyspace.table}. No-ops (returning all-zero stats) if the
      * table has no {@code timeseries_tiering} policy, the policy is invalid, or the table's schema is
-     * not the canonical single-partition-key/timestamp-clustering/double-value shape the re-encoder
-     * requires -- in the latter two cases an error is logged rather than failing silently.
+     * one tiering cannot support ({@link TieringPolicy#unsupportedSchemaError}) -- in the latter two
+     * cases an error is logged rather than failing silently.
      */
     public TierRunStats runOnce(String keyspace, String table, long nowMillis)
     {
@@ -400,25 +402,52 @@ public class TieredStorageService implements TieredStorageServiceMBean
         if (policy == null)
             return stats;
 
-        String schemaError = TieringPolicy.canonicalSchemaError(base);
+        String schemaError = TieringPolicy.unsupportedSchemaError(base);
         if (schemaError != null)
         {
-            logger.error("Tiered storage runOnce skipped: {}.{} has a timeseries_tiering policy but is not a " +
-                         "canonical time-series table: {}", keyspace, table, schemaError);
+            logger.error("Tiered storage runOnce skipped: {}.{} has a timeseries_tiering policy but a schema " +
+                         "tiering cannot support: {}", keyspace, table, schemaError);
             return stats;
+        }
+
+        // TEMPORARY (deleted when the re-encoder moves to the columnar chunk format): the encoder below
+        // still writes a single-column chunk, so it can only carry one double regular column even though
+        // the schema check above now accepts arbitrary shapes. Encoding one column and range-deleting
+        // the row would destroy every other column, so refuse instead.
+        if (base.regularColumns().size() != 1 || !base.regularColumns().iterator().next().type.equals(DoubleType.instance))
+        {
+            logger.error("Tiered storage runOnce skipped: {}.{} is a supported time-series schema, but the " +
+                         "re-encoder still writes single-column chunks and can only encode exactly one double " +
+                         "regular column; this table's regular columns are [{}]. Multi-column encoding lands " +
+                         "with the columnar chunk format",
+                         keyspace, table, columnList(base.regularColumns()));
+            return stats;
+        }
+
+        String ttlWarning = TieringPolicy.ttlShadowsHotWindowWarning(base, policy);
+        if (ttlWarning != null)
+        {
+            // Rate-limited: the sweep re-reads the policy every 60s and this condition does not clear
+            // itself, so an unthrottled WARN would be one line per table per minute forever.
+            NoSpamLogger.log(logger, NoSpamLogger.Level.WARN, key(keyspace, table) + ":ttl-shadows-hot-window",
+                             1, TimeUnit.HOURS, "{}", ttlWarning);
         }
 
         ChunkTables.ensureChunkTable(base);
         String chunkRef = quotedRef(keyspace, ChunkTables.chunkTableName(table));
 
-        ColumnMetadata tagColumn = base.partitionKeyColumns().get(0);
+        List<ColumnMetadata> tagColumns = base.partitionKeyColumns();
         ColumnMetadata tsColumn = base.clusteringColumns().get(0);
         ColumnMetadata valueColumn = base.regularColumns().iterator().next();
 
-        String tagCql = tagColumn.name.toCQLString();
+        // Every chunk-table query names the base table's WHOLE partition key: `tagCqlList` for select/
+        // insert column lists, `tagPredicate` for the single-partition restriction. With a one-column
+        // key both collapse to what they were before composite keys were supported.
+        String tagCqlList = columnList(tagColumns);
+        String tagPredicate = equalityPredicate(tagColumns);
         String tsCql = tsColumn.name.toCQLString();
         String valueCql = valueColumn.name.toCQLString();
-        String tagRaw = tagColumn.name.toString();
+        List<String> tagRawNames = rawNames(tagColumns);
         String tsRaw = tsColumn.name.toString();
         String valueRaw = valueColumn.name.toString();
         String baseRef = base.toString();
@@ -438,27 +467,29 @@ public class TieredStorageService implements TieredStorageServiceMBean
         // single row needed to locate the next window with work; the row scan itself is restricted to
         // exactly one [windowStart, windowEnd) range at a time, so memory is bounded by one window's
         // row count, not a tag's entire closed backlog.
-        String oldestRowQuery = format("SELECT %s FROM %s WHERE %s = ? AND %s < ? ORDER BY %s ASC LIMIT 1",
-                                       tsCql, baseRef, tagCql, tsCql, tsCql);
+        String oldestRowQuery = format("SELECT %s FROM %s WHERE %s AND %s < ? ORDER BY %s ASC LIMIT 1",
+                                       tsCql, baseRef, tagPredicate, tsCql, tsCql);
         // Both LIMIT 1 probes say ORDER BY ... ASC explicitly: on a table declared WITH CLUSTERING
         // ORDER BY (ts DESC) -- the dominant time-series idiom -- the default order is newest-first,
         // so an order-less probe would return the NEWEST row in range and the empty-window jump would
         // leap over every window between here and the cutoff instead of landing on the next one.
-        String nextRowQuery = format("SELECT %s FROM %s WHERE %s = ? AND %s >= ? AND %s < ? ORDER BY %s ASC LIMIT 1",
-                                     tsCql, baseRef, tagCql, tsCql, tsCql, tsCql, tsCql);
-        String windowRowsQuery = format("SELECT %s, %s, WRITETIME(%s) AS wt FROM %s WHERE %s = ? AND %s >= ? " +
+        String nextRowQuery = format("SELECT %s FROM %s WHERE %s AND %s >= ? AND %s < ? ORDER BY %s ASC LIMIT 1",
+                                     tsCql, baseRef, tagPredicate, tsCql, tsCql, tsCql);
+        String windowRowsQuery = format("SELECT %s, %s, WRITETIME(%s) AS wt FROM %s WHERE %s AND %s >= ? " +
                                         "AND %s < ? ORDER BY %s ASC",
-                                        tsCql, valueCql, valueCql, baseRef, tagCql, tsCql, tsCql, tsCql);
+                                        tsCql, valueCql, valueCql, baseRef, tagPredicate, tsCql, tsCql, tsCql);
         String existingChunkQuery = format("SELECT payload, max_row_writetime, WRITETIME(payload) AS chunk_wt " +
-                                           "FROM %s WHERE %s = ? AND window_start = ?", chunkRef, tagCql);
+                                           "FROM %s WHERE %s AND window_start = ?", chunkRef, tagPredicate);
         String insertChunkQuery = format("INSERT INTO %s (%s, window_start, codec, samples, max_row_writetime, payload) " +
-                                         "VALUES (?, ?, ?, ?, ?, ?) USING TIMESTAMP ?", chunkRef, tagCql);
-        String deleteRowsQuery = format("DELETE FROM %s USING TIMESTAMP ? WHERE %s = ? AND %s >= ? AND %s < ?",
-                                        baseRef, tagCql, tsCql, tsCql);
-        String selectExpiredQuery = format("SELECT window_start FROM %s WHERE %s = ? AND window_start < ?", chunkRef, tagCql);
-        String deleteExpiredQuery = format("DELETE FROM %s WHERE %s = ? AND window_start < ?", chunkRef, tagCql);
+                                         "VALUES (%s, ?, ?, ?, ?, ?) USING TIMESTAMP ?",
+                                         chunkRef, tagCqlList, bindMarkers(tagColumns.size()));
+        String deleteRowsQuery = format("DELETE FROM %s USING TIMESTAMP ? WHERE %s AND %s >= ? AND %s < ?",
+                                        baseRef, tagPredicate, tsCql, tsCql);
+        String selectExpiredQuery = format("SELECT window_start FROM %s WHERE %s AND window_start < ?",
+                                           chunkRef, tagPredicate);
+        String deleteExpiredQuery = format("DELETE FROM %s WHERE %s AND window_start < ?", chunkRef, tagPredicate);
 
-        for (ByteBuffer tag : enumerateTags(base, tagCql, tagRaw, baseRef, cl))
+        for (List<ByteBuffer> tag : enumerateTags(base, tagCqlList, tagRawNames, baseRef, cl))
         {
             // One tag's worth of trouble -- a corrupt existing chunk, a read/write timeout, anything --
             // must not wedge every other tag on this table out of being re-encoded for good.
@@ -483,8 +514,7 @@ public class TieredStorageService implements TieredStorageServiceMBean
                     // independent guard against the exact class of bug the belt above exists to fix.
                     long readEnd = Math.min(windowEnd, cutoff);
                     int maxSamples = maxSamplesPerWindow;
-                    List<UntypedResultSet.Row> windowRows = pagedSelect(windowRowsQuery, cl, Arrays.asList(
-                            tag,
+                    List<UntypedResultSet.Row> windowRows = pagedSelect(windowRowsQuery, cl, boundTo(tag,
                             TimestampType.instance.fromTimeInMillis(windowStart),
                             TimestampType.instance.fromTimeInMillis(readEnd)),
                             maxSamples);
@@ -498,7 +528,7 @@ public class TieredStorageService implements TieredStorageServiceMBean
                         logger.error("Tiered storage runOnce: {}.{} tag {} window [{}, {}) holds more than {} rows, " +
                                      "over the {}-sample per-chunk codec limit -- it cannot be encoded. Lower the " +
                                      "table's timeseries_tiering chunk_window so one window holds at most {} samples; " +
-                                     "skipping this tag until then", keyspace, table, tagColumn.type.getString(tag),
+                                     "skipping this tag until then", keyspace, table, describeTag(tagColumns, tag),
                                      windowStart, readEnd, maxSamples, maxSamples, maxSamples);
                         break;
                     }
@@ -513,7 +543,7 @@ public class TieredStorageService implements TieredStorageServiceMBean
                     }
 
                     UntypedResultSet existingRs = QueryProcessor.process(existingChunkQuery, cl,
-                            Arrays.asList(tag, TimestampType.instance.fromTimeInMillis(windowStart)));
+                            boundTo(tag, TimestampType.instance.fromTimeInMillis(windowStart)));
                     UntypedResultSet.Row existingRow = (existingRs == null || existingRs.isEmpty()) ? null : existingRs.one();
 
                     TreeMap<Long, Double> merged = new TreeMap<>();
@@ -564,7 +594,7 @@ public class TieredStorageService implements TieredStorageServiceMBean
                         logger.error("Tiered storage runOnce: {}.{} tag {} window [{}, {}) merges to {} samples, " +
                                      "over the {}-sample per-chunk codec limit -- it cannot be encoded. Lower the " +
                                      "table's timeseries_tiering chunk_window so one window holds at most {} samples; " +
-                                     "skipping this tag until then", keyspace, table, tagColumn.type.getString(tag),
+                                     "skipping this tag until then", keyspace, table, describeTag(tagColumns, tag),
                                      windowStart, readEnd, count, maxSamples, maxSamples);
                         break;
                     }
@@ -596,8 +626,7 @@ public class TieredStorageService implements TieredStorageServiceMBean
                     // to different columns of the same row can resolve per-column, tearing the chunk).
                     long insertTs = Math.max(maxWt + 1, existingChunkWt + 1);
 
-                    QueryProcessor.process(insertChunkQuery, cl, Arrays.asList(
-                            tag,
+                    QueryProcessor.process(insertChunkQuery, cl, boundTo(tag,
                             TimestampType.instance.fromTimeInMillis(windowStart),
                             ByteType.instance.decompose(codecByte),
                             Int32Type.instance.decompose(count),
@@ -605,11 +634,14 @@ public class TieredStorageService implements TieredStorageServiceMBean
                             payload,
                             LongType.instance.decompose(insertTs)));
 
-                    QueryProcessor.process(deleteRowsQuery, cl, Arrays.asList(
-                            LongType.instance.decompose(maxWt),
-                            tag,
-                            TimestampType.instance.fromTimeInMillis(windowStart),
-                            TimestampType.instance.fromTimeInMillis(readEnd)));
+                    // The USING TIMESTAMP marker precedes the WHERE clause, so this is the one query
+                    // whose tag values are not the leading binds.
+                    List<ByteBuffer> deleteValues = new ArrayList<>(tag.size() + 3);
+                    deleteValues.add(LongType.instance.decompose(maxWt));
+                    deleteValues.addAll(tag);
+                    deleteValues.add(TimestampType.instance.fromTimeInMillis(windowStart));
+                    deleteValues.add(TimestampType.instance.fromTimeInMillis(readEnd));
+                    QueryProcessor.process(deleteRowsQuery, cl, deleteValues);
 
                     stats.windowsEncoded++;
                     stats.rowsEncoded += rowsThisWindow;
@@ -631,14 +663,14 @@ public class TieredStorageService implements TieredStorageServiceMBean
                 logger.error("Tiered storage runOnce: {}.{} cannot re-encode tag {}: its existing chunk was written " +
                              "by an older build and is unreadable ({}). Retrying will not fix this -- drop {} and " +
                              "let tiering re-run; that data is not recoverable. Source rows are left untouched.",
-                             keyspace, table, tagColumn.type.getString(tag), e.getMessage(),
+                             keyspace, table, describeTag(tagColumns, tag), e.getMessage(),
                              ChunkTables.chunkTableName(table));
             }
             catch (RuntimeException e)
             {
                 logger.error("Tiered storage runOnce: {}.{} failed while re-encoding tag {} -- skipping to the " +
                              "next tag; this tag will be retried next cycle", keyspace, table,
-                             tagColumn.type.getString(tag), e);
+                             describeTag(tagColumns, tag), e);
             }
         }
 
@@ -656,11 +688,11 @@ public class TieredStorageService implements TieredStorageServiceMBean
             TableMetadata chunkMeta = Schema.instance.getTableMetadata(keyspace, ChunkTables.chunkTableName(table));
             if (chunkMeta != null)
             {
-                for (ByteBuffer tag : enumerateTags(chunkMeta, tagCql, tagRaw, chunkRef, cl))
+                for (List<ByteBuffer> tag : enumerateTags(chunkMeta, tagCqlList, tagRawNames, chunkRef, cl))
                 {
                     try
                     {
-                        List<ByteBuffer> coldValues = Arrays.asList(
+                        List<ByteBuffer> coldValues = boundTo(
                                 tag, TimestampType.instance.fromTimeInMillis(nowMillis - policy.coldWindowMillis));
                         List<UntypedResultSet.Row> expired = pagedSelect(selectExpiredQuery, cl, coldValues);
                         if (!expired.isEmpty())
@@ -673,7 +705,7 @@ public class TieredStorageService implements TieredStorageServiceMBean
                     {
                         logger.error("Tiered storage runOnce: {}.{} failed while expiring cold chunks of tag {} -- " +
                                      "skipping to the next tag; retried next cycle", keyspace, table,
-                                     tagColumn.type.getString(tag), e);
+                                     describeTag(tagColumns, tag), e);
                     }
                 }
             }
@@ -682,12 +714,84 @@ public class TieredStorageService implements TieredStorageServiceMBean
         return stats;
     }
 
+    /** @return {@code "a, b, c"} -- the columns' CQL names, for a select/insert column list. */
+    private static String columnList(Iterable<ColumnMetadata> columns)
+    {
+        StringBuilder sb = new StringBuilder();
+        for (ColumnMetadata column : columns)
+        {
+            if (sb.length() > 0)
+                sb.append(", ");
+            sb.append(column.name.toCQLString());
+        }
+        return sb.toString();
+    }
+
+    /** @return {@code "a = ? AND b = ?"} -- the single-partition restriction for a whole partition key. */
+    private static String equalityPredicate(List<ColumnMetadata> columns)
+    {
+        StringBuilder sb = new StringBuilder();
+        for (ColumnMetadata column : columns)
+        {
+            if (sb.length() > 0)
+                sb.append(" AND ");
+            sb.append(column.name.toCQLString()).append(" = ?");
+        }
+        return sb.toString();
+    }
+
+    /** @return {@code "?, ?, ?"} -- {@code count} positional bind markers. */
+    private static String bindMarkers(int count)
+    {
+        StringBuilder sb = new StringBuilder();
+        for (int i = 0; i < count; i++)
+        {
+            if (i > 0)
+                sb.append(", ");
+            sb.append('?');
+        }
+        return sb.toString();
+    }
+
+    private static List<String> rawNames(List<ColumnMetadata> columns)
+    {
+        List<String> names = new ArrayList<>(columns.size());
+        for (ColumnMetadata column : columns)
+            names.add(column.name.toString());
+        return names;
+    }
+
+    /** @return the bind values for a query whose leading markers are the partition key's, followed by {@code rest}. */
+    private static List<ByteBuffer> boundTo(List<ByteBuffer> tag, ByteBuffer... rest)
+    {
+        List<ByteBuffer> values = new ArrayList<>(tag.size() + rest.length);
+        values.addAll(tag);
+        Collections.addAll(values, rest);
+        return values;
+    }
+
+    /** @return a human-readable rendering of one partition key's values, for log messages. */
+    private static String describeTag(List<ColumnMetadata> tagColumns, List<ByteBuffer> tag)
+    {
+        if (tagColumns.size() == 1)
+            return tagColumns.get(0).type.getString(tag.get(0));
+
+        StringBuilder sb = new StringBuilder("(");
+        for (int i = 0; i < tagColumns.size(); i++)
+        {
+            if (i > 0)
+                sb.append(", ");
+            sb.append(tagColumns.get(i).type.getString(tag.get(i)));
+        }
+        return sb.append(')').toString();
+    }
+
     /** @return the {@code window_start} of the oldest closed (ts &lt; cutoff) row for {@code tag}, or -1 if none. */
-    private static long firstClosedWindowStart(String oldestRowQuery, String tsRaw, ByteBuffer tag, long cutoff,
+    private static long firstClosedWindowStart(String oldestRowQuery, String tsRaw, List<ByteBuffer> tag, long cutoff,
                                                 TieringPolicy policy, ConsistencyLevel cl)
     {
         UntypedResultSet rs = QueryProcessor.process(oldestRowQuery, cl,
-                Arrays.asList(tag, TimestampType.instance.fromTimeInMillis(cutoff)));
+                boundTo(tag, TimestampType.instance.fromTimeInMillis(cutoff)));
         if (rs == null || rs.isEmpty())
             return -1;
         return policy.windowStartFor(rs.one().getTimestamp(tsRaw).getTime());
@@ -698,10 +802,10 @@ public class TieredStorageService implements TieredStorageServiceMBean
      * {@code [fromTsMillis, cutoff)}, or -1 if there is none -- used to skip past a run of empty
      * windows in one query instead of probing them one at a time.
      */
-    private static long nextClosedWindowStart(String nextRowQuery, String tsRaw, ByteBuffer tag, long fromTsMillis,
+    private static long nextClosedWindowStart(String nextRowQuery, String tsRaw, List<ByteBuffer> tag, long fromTsMillis,
                                                long cutoff, TieringPolicy policy, ConsistencyLevel cl)
     {
-        UntypedResultSet rs = QueryProcessor.process(nextRowQuery, cl, Arrays.asList(
+        UntypedResultSet rs = QueryProcessor.process(nextRowQuery, cl, boundTo(
                 tag, TimestampType.instance.fromTimeInMillis(fromTsMillis), TimestampType.instance.fromTimeInMillis(cutoff)));
         if (rs == null || rs.isEmpty())
             return -1;
@@ -725,17 +829,20 @@ public class TieredStorageService implements TieredStorageServiceMBean
      * happen once a node has joined the ring, but is treated defensively rather than silently scanning
      * nothing -- this falls back to an unrestricted scan of every tag.
      */
-    private static List<ByteBuffer> enumerateTags(TableMetadata base, String tagCql, String tagRaw, String baseRef,
-                                                   ConsistencyLevel cl)
+    private static List<List<ByteBuffer>> enumerateTags(TableMetadata base, String tagCqlList, List<String> tagRawNames,
+                                                        String baseRef, ConsistencyLevel cl)
     {
-        Set<ByteBuffer> tags = new LinkedHashSet<>();
+        // LinkedHashSet of List<ByteBuffer>: List's equals/hashCode are the element-wise ones, so a
+        // composite key deduplicates on all of its columns, not on identity.
+        Set<List<ByteBuffer>> tags = new LinkedHashSet<>();
         Collection<Range<Token>> primaryRanges = StorageService.instance.getPrimaryRanges(base.keyspace);
 
         if (primaryRanges.isEmpty())
         {
             logger.warn("Tiered storage: {}.{} has no local primary ranges reported for this node; falling back " +
                         "to an unrestricted tag scan rather than silently skipping data", base.keyspace, base.name);
-            collectTags(tags, format("SELECT DISTINCT %s FROM %s", tagCql, baseRef), tagRaw, cl, Collections.emptyList());
+            collectTags(tags, format("SELECT DISTINCT %s FROM %s", tagCqlList, baseRef), tagRawNames, cl,
+                        Collections.emptyList());
             return new ArrayList<>(tags);
         }
 
@@ -745,46 +852,55 @@ public class TieredStorageService implements TieredStorageServiceMBean
             for (Range<Token> sub : range.unwrap())
             {
                 List<ByteBuffer> values = new ArrayList<>(2);
-                String query = tagRangeQuery(tagCql, baseRef, sub, tokenType, values);
-                collectTags(tags, query, tagRaw, cl, values);
+                String query = tagRangeQuery(tagCqlList, baseRef, sub, tokenType, values);
+                collectTags(tags, query, tagRawNames, cl, values);
             }
         }
 
         return new ArrayList<>(tags);
     }
 
-    /** Builds the token-range restricted tag query, appending its bind values (0-2) to {@code valuesOut} in order. */
-    private static String tagRangeQuery(String tagCql, String baseRef, Range<Token> sub, AbstractType<?> tokenType,
+    /**
+     * Builds the token-range restricted tag query, appending its bind values (0-2) to {@code valuesOut}
+     * in order. {@code tagCqlList} is the whole partition key, so the restriction is
+     * {@code token(a, b) > ?} for a composite key -- the token is computed from all of its columns.
+     */
+    private static String tagRangeQuery(String tagCqlList, String baseRef, Range<Token> sub, AbstractType<?> tokenType,
                                         List<ByteBuffer> valuesOut)
     {
         boolean hasLower = !sub.left.isMinimum();
         boolean hasUpper = !sub.right.isMinimum();
 
-        StringBuilder query = new StringBuilder("SELECT DISTINCT ").append(tagCql).append(" FROM ").append(baseRef);
+        StringBuilder query = new StringBuilder("SELECT DISTINCT ").append(tagCqlList).append(" FROM ").append(baseRef);
         if (hasLower || hasUpper)
         {
             query.append(" WHERE ");
             if (hasLower)
             {
-                query.append("token(").append(tagCql).append(") > ?");
+                query.append("token(").append(tagCqlList).append(") > ?");
                 valuesOut.add(tokenType.decomposeUntyped(sub.left.getTokenValue()));
             }
             if (hasLower && hasUpper)
                 query.append(" AND ");
             if (hasUpper)
             {
-                query.append("token(").append(tagCql).append(") <= ?");
+                query.append("token(").append(tagCqlList).append(") <= ?");
                 valuesOut.add(tokenType.decomposeUntyped(sub.right.getTokenValue()));
             }
         }
         return query.toString();
     }
 
-    private static void collectTags(Set<ByteBuffer> out, String query, String tagRaw, ConsistencyLevel cl,
-                                     List<ByteBuffer> values)
+    private static void collectTags(Set<List<ByteBuffer>> out, String query, List<String> tagRawNames,
+                                     ConsistencyLevel cl, List<ByteBuffer> values)
     {
         for (UntypedResultSet.Row row : pagedSelect(query, cl, values))
-            out.add(row.getBytes(tagRaw));
+        {
+            List<ByteBuffer> tag = new ArrayList<>(tagRawNames.size());
+            for (String name : tagRawNames)
+                tag.add(row.getBytes(name));
+            out.add(tag);
+        }
     }
 
     private static String quotedRef(String keyspace, String table)

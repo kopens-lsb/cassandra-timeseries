@@ -28,14 +28,20 @@ import java.util.regex.Pattern;
 import com.google.common.collect.ImmutableMap;
 import com.google.common.collect.ImmutableSet;
 
+import org.apache.cassandra.cql3.statements.schema.IndexTarget;
 import org.apache.cassandra.db.ConsistencyLevel;
-import org.apache.cassandra.db.marshal.DoubleType;
 import org.apache.cassandra.db.marshal.TimestampType;
 import org.apache.cassandra.exceptions.ConfigurationException;
+import org.apache.cassandra.index.TargetParser;
 import org.apache.cassandra.schema.ColumnMetadata;
+import org.apache.cassandra.schema.IndexMetadata;
+import org.apache.cassandra.schema.KeyspaceMetadata;
+import org.apache.cassandra.schema.Schema;
 import org.apache.cassandra.schema.TableMetadata;
+import org.apache.cassandra.schema.ViewMetadata;
 import org.apache.cassandra.utils.ByteBufferUtil;
 import org.apache.cassandra.utils.JsonUtils;
+import org.apache.cassandra.utils.Pair;
 
 import static java.lang.String.format;
 
@@ -223,35 +229,170 @@ public final class TieringPolicy
     }
 
     /**
-     * @return {@code null} if {@code metadata} is a canonical time-series table (exactly one partition key
-     * column, exactly one {@code timestamp} clustering column -- {@code ASC} or {@code DESC}, since
-     * newest-first is the dominant time-series clustering idiom -- exactly one {@code double} regular
-     * column), else a human-readable description of why it is not.
+     * Decides whether tiering can safely handle {@code metadata}'s shape.
+     *
+     * <p><b>Supported:</b> any number of partition key columns (a composite key is fine); exactly one
+     * clustering column whose type is {@code timestamp} ({@code ASC} or {@code DESC} -- newest-first
+     * is the dominant time-series idiom, and {@code CLUSTERING ORDER BY (ts DESC)} merely wraps the
+     * type in {@link org.apache.cassandra.db.marshal.ReversedType}); any number of regular columns of
+     * any supported type; any number of static columns. Static columns are deliberately unconstrained:
+     * they are never chunked, and the re-encoder's clustering-range delete cannot touch them (static
+     * cells live outside the clustering range), so they survive tiering untouched.
+     *
+     * <p><b>Rejected</b>, each for a reason that would otherwise cost data or answers silently:
+     * <ul>
+     *     <li>a <b>counter</b> column anywhere in the table -- the re-encoder deletes rows and
+     *     re-inserts their content, which a counter cannot survive (a counter delete is permanent;
+     *     the column can never be written again). This is a correctness stop, not a limitation.</li>
+     *     <li>a <b>non-frozen collection</b> (or non-frozen UDT) regular column -- multi-cell values
+     *     have per-element cells and timestamps that a chunk's opaque per-row bytes cannot represent.
+     *     Frozen collections are single-cell and are fine, carried as opaque bytes.</li>
+     *     <li>zero or several clustering columns, or a clustering column that is not a timestamp.</li>
+     *     <li>a <b>secondary index (SAI or otherwise) on a regular column</b> -- re-encoded rows are
+     *     deleted from the base table, so they disappear from the index and index queries would
+     *     silently return only data younger than {@code hot_window}. Indexes on static, partition key
+     *     or clustering columns are unaffected and stay supported.</li>
+     *     <li>a <b>materialized view</b> over the table -- the range delete propagates to the view
+     *     (view maintenance reads the deleted base rows and issues the matching view deletions), but
+     *     transparent reads only reconstruct rows for the <em>base</em> table, so the view would
+     *     permanently lose everything older than {@code hot_window} with no error anywhere.</li>
+     *     <li>a partition key column named like one of the chunk table's own columns
+     *     ({@link ChunkTables#RESERVED_COLUMN_NAMES}) -- the mirrored chunk table would declare that
+     *     name twice.</li>
+     * </ul>
+     *
+     * @return {@code null} if tiering supports {@code metadata}, else a human-readable reason naming
+     * the offending column/index/view.
      */
-    public static String canonicalSchemaError(TableMetadata metadata)
+    public static String unsupportedSchemaError(TableMetadata metadata)
     {
-        if (metadata.partitionKeyColumns().size() != 1)
-            return format("expected exactly 1 partition key column, found %d", metadata.partitionKeyColumns().size());
-
         if (metadata.clusteringColumns().size() != 1)
-            return format("expected exactly 1 clustering column, found %d", metadata.clusteringColumns().size());
+            return format("expected exactly 1 clustering column, found %d: a chunk encodes one time axis, " +
+                           "so the table must be clustered by time alone",
+                           metadata.clusteringColumns().size());
 
         ColumnMetadata clustering = metadata.clusteringColumns().get(0);
         // unwrap(): CLUSTERING ORDER BY (ts DESC) wraps the column type in ReversedType(timestamp);
-        // both orders are canonical (the re-encoder's queries all say ORDER BY ... ASC explicitly).
+        // both orders are supported (the re-encoder's queries all say ORDER BY ... ASC explicitly).
         if (!clustering.type.unwrap().equals(TimestampType.instance))
             return format("expected clustering column '%s' to be of type timestamp, found %s",
                            clustering.name.toCQLString(), clustering.type.asCQL3Type());
 
-        if (metadata.regularColumns().size() != 1)
-            return format("expected exactly 1 regular column, found %d", metadata.regularColumns().size());
+        // Counters are checked across every column, not just the regular ones: a counter table's
+        // deletes are irreversible, and Cassandra refuses the re-encoder's `DELETE ... USING TIMESTAMP`
+        // on one outright, so there is no shape of counter table this can work on.
+        // columnsInFixedOrder(), not columns(): the latter iterates in hash order, which would make
+        // *which* offending column the message names vary between JVMs.
+        for (ColumnMetadata column : metadata.columnsInFixedOrder())
+        {
+            if (column.type.isCounter())
+                return format("column '%s' is a counter: the re-encoder deletes rows after encoding them, and a " +
+                               "deleted counter can never be written again, so tiering a counter table would " +
+                               "destroy it",
+                               column.name.toCQLString());
+        }
 
-        ColumnMetadata value = metadata.regularColumns().iterator().next();
-        if (!value.type.equals(DoubleType.instance))
-            return format("expected regular column '%s' to be of type double, found %s",
-                           value.name.toCQLString(), value.type.asCQL3Type());
+        // regularColumns() is itself a fixed-order (comparator-sorted) collection.
+        for (ColumnMetadata column : metadata.regularColumns())
+        {
+            // isMultiCell() covers non-frozen collections and non-frozen UDTs alike -- both store one
+            // cell per element, with per-element timestamps a chunk's per-row bytes cannot carry.
+            if (column.type.isMultiCell())
+                return format("regular column '%s' (%s) is a non-frozen (multi-cell) type: its per-element cells " +
+                               "and timestamps cannot be encoded into a chunk. Freeze it (frozen<...>) to make " +
+                               "this table tierable",
+                               column.name.toCQLString(), column.type.asCQL3Type());
+        }
+
+        for (ColumnMetadata column : metadata.partitionKeyColumns())
+        {
+            if (ChunkTables.RESERVED_COLUMN_NAMES.contains(column.name.toString()))
+                return format("partition key column '%s' collides with a column the chunk table defines itself " +
+                               "(%s); rename it to make this table tierable",
+                               column.name.toCQLString(), String.join(", ", ChunkTables.RESERVED_COLUMN_NAMES));
+        }
+
+        String indexError = regularColumnIndexError(metadata);
+        if (indexError != null)
+            return indexError;
+
+        return materializedViewError(metadata);
+    }
+
+    /**
+     * @return why {@code metadata}'s secondary indexes make it un-tierable, or {@code null} if none do.
+     * Every index is resolved to its target column via {@link TargetParser} (the same parse the index
+     * implementations themselves use, so {@code values(m)}/{@code keys(m)}/quoted names all resolve
+     * identically); an index whose target cannot be resolved is rejected rather than assumed safe.
+     */
+    private static String regularColumnIndexError(TableMetadata metadata)
+    {
+        for (IndexMetadata index : metadata.indexes)
+        {
+            String target = index.options.get(IndexTarget.TARGET_OPTION_NAME);
+            if (target == null)
+                return format("index '%s' records no target column, so tiering cannot establish that it does not " +
+                               "cover a regular column", index.name);
+
+            Pair<ColumnMetadata, IndexTarget.Type> parsed = TargetParser.parse(metadata, target);
+            if (parsed == null)
+                return format("index '%s' targets '%s', which does not resolve to a column of this table, so " +
+                               "tiering cannot establish that it does not cover a regular column",
+                               index.name, target);
+
+            if (parsed.left.isRegular())
+                return format("index '%s' is on regular column '%s': re-encoded rows are deleted from the base " +
+                               "table, so they vanish from the index and index queries would silently return only " +
+                               "data younger than hot_window. Indexes on static or primary key columns are fine",
+                               index.name, parsed.left.name.toCQLString());
+        }
+        return null;
+    }
+
+    /**
+     * @return why {@code metadata}'s materialized views make it un-tierable, or {@code null} if it has
+     * none. Returns {@code null} when the keyspace is not registered in {@link Schema} (metadata built
+     * directly in a test): there is nothing to look up, and the other rules still apply.
+     */
+    private static String materializedViewError(TableMetadata metadata)
+    {
+        KeyspaceMetadata keyspace = Schema.instance.getKeyspaceMetadata(metadata.keyspace);
+        if (keyspace == null)
+            return null;
+
+        for (ViewMetadata view : keyspace.views.forTable(metadata.id))
+            return format("materialized view '%s' is built on this table: the re-encoder's delete of an encoded " +
+                           "window propagates into the view, but transparent reads only rebuild rows for the base " +
+                           "table, so the view would silently lose everything older than hot_window. Drop the view " +
+                           "to make this table tierable", view.name());
 
         return null;
+    }
+
+    /**
+     * @return a warning for the operator when {@code metadata}'s {@code default_time_to_live} expires
+     * rows before {@code policy}'s {@code hot_window} ever releases them for encoding -- i.e. tiering
+     * is configured but can never compress anything -- else {@code null}.
+     * <p>
+     * A warning, not a rejection: {@code default_time_to_live} is only the default, and a writer that
+     * says {@code USING TTL} per row (or 0) is unaffected by it, so the combination is legal -- just
+     * almost always a misconfiguration.
+     */
+    public static String ttlShadowsHotWindowWarning(TableMetadata metadata, TieringPolicy policy)
+    {
+        long ttlSeconds = metadata.params.defaultTimeToLive;
+        if (ttlSeconds <= 0)
+            return null;
+
+        long ttlMillis = TimeUnit.SECONDS.toMillis(ttlSeconds);
+        if (policy.hotWindowMillis < ttlMillis)
+            return null;
+
+        return format("%s.%s has default_time_to_live = %ds but a timeseries_tiering hot_window of %dms " +
+                       "(%ds): rows expire before the re-encoder is allowed to touch them, so nothing will ever " +
+                       "be compressed. Lower hot_window below the TTL, or raise/clear default_time_to_live",
+                       metadata.keyspace, metadata.name, ttlSeconds, policy.hotWindowMillis,
+                       TimeUnit.MILLISECONDS.toSeconds(policy.hotWindowMillis));
     }
 
     @Override

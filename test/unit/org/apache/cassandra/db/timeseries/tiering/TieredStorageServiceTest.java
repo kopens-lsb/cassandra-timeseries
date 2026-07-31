@@ -329,11 +329,33 @@ public class TieredStorageServiceTest extends CQLTester
     }
 
     @Test
-    public void nonCanonicalSchemaSkipsWithError() throws Throwable
+    public void unsupportedSchemaSkipsWithError() throws Throwable
     {
-        createTable("CREATE TABLE %s (tag text, ts timestamp, value double, extra int, PRIMARY KEY (tag, ts))");
+        // A second clustering column: no time axis a chunk could encode. See TieringPolicyTest /
+        // TieringSchemaSupportTest for the whole accept/reject matrix.
+        createTable("CREATE TABLE %s (tag text, ts timestamp, seq int, value double, PRIMARY KEY (tag, ts, seq))");
         setPolicy("{\"hot_window\":\"2h\",\"chunk_window\":\"1h\"}");
 
+        assertSkippedWithError("clustering column");
+    }
+
+    @Test
+    public void multiColumnTableIsAcceptedButNotYetReEncoded() throws Throwable
+    {
+        // TEMPORARY, alongside the guard in TieredStorageService: the schema check now accepts this
+        // table, but the re-encoder still writes single-column chunks, so it must refuse rather than
+        // encode `value` and range-delete `extra` along with it. Delete both when the re-encoder
+        // moves to the columnar chunk format.
+        createTable("CREATE TABLE %s (tag text, ts timestamp, value double, extra int, PRIMARY KEY (tag, ts))");
+        setPolicy("{\"hot_window\":\"2h\",\"chunk_window\":\"1h\"}");
+        assertNull("the schema itself is supported now", TieringPolicy.unsupportedSchemaError(getCurrentColumnFamilyStore().metadata()));
+
+        assertSkippedWithError("one double regular column");
+    }
+
+    /** Runs one cycle and asserts it did nothing but log an ERROR containing {@code expectedInMessage}. */
+    private void assertSkippedWithError(String expectedInMessage) throws Throwable
+    {
         Logger serviceLogger = (Logger) LoggerFactory.getLogger(TieredStorageService.class);
         ListAppender<ILoggingEvent> appender = new ListAppender<>();
         appender.start();
@@ -342,8 +364,9 @@ public class TieredStorageServiceTest extends CQLTester
         try
         {
             stats = new TieredStorageService().runOnce(KEYSPACE, currentTable(), 5 * HOUR);
-            assertTrue("expected an ERROR log for the non-canonical schema",
-                       appender.list.stream().anyMatch(e -> e.getLevel() == Level.ERROR));
+            assertTrue("expected an ERROR log containing '" + expectedInMessage + "', got: " + appender.list,
+                       appender.list.stream().anyMatch(e -> e.getLevel() == Level.ERROR &&
+                                                            e.getFormattedMessage().contains(expectedInMessage)));
         }
         finally
         {

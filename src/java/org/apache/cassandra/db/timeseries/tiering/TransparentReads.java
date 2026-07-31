@@ -20,7 +20,7 @@ package org.apache.cassandra.db.timeseries.tiering;
 
 import java.nio.ByteBuffer;
 import java.util.ArrayList;
-import java.util.Arrays;
+import java.util.Collections;
 import java.util.Date;
 import java.util.List;
 import java.util.NavigableSet;
@@ -41,11 +41,13 @@ import org.apache.cassandra.db.Slices;
 import org.apache.cassandra.db.filter.ClusteringIndexFilter;
 import org.apache.cassandra.db.filter.ClusteringIndexNamesFilter;
 import org.apache.cassandra.db.filter.ClusteringIndexSliceFilter;
+import org.apache.cassandra.db.marshal.CompositeType;
 import org.apache.cassandra.db.marshal.TimestampType;
 import org.apache.cassandra.db.partitions.PartitionIterator;
 import org.apache.cassandra.db.rows.Row;
 import org.apache.cassandra.db.timeseries.UnsupportedChunkFormatException;
 import org.apache.cassandra.exceptions.ConfigurationException;
+import org.apache.cassandra.schema.ColumnMetadata;
 import org.apache.cassandra.schema.TableMetadata;
 import org.apache.cassandra.service.ClientWarn;
 import org.apache.cassandra.utils.Clock;
@@ -188,14 +190,27 @@ public final class TransparentReads
         long safeStart = Math.max(startMs, -(1L << 62));
         long windowLow = policy.windowStartFor(safeStart) - policy.chunkWindowMillis;
         long windowHigh = Math.min(endMsExcl, 1L << 62);
-        // The chunk table's partition key column mirrors the base table's (whatever it is named).
-        String tagCql = metadata.partitionKeyColumns().get(0).name.toCQLString();
+        // The chunk table mirrors the base table's whole partition key (same names, same order), so the
+        // restriction names every key column and binds the key's components in that order.
+        List<ColumnMetadata> tagColumns = metadata.partitionKeyColumns();
+        StringBuilder tagPredicate = new StringBuilder();
+        for (ColumnMetadata column : tagColumns)
+        {
+            if (tagPredicate.length() > 0)
+                tagPredicate.append(" AND ");
+            tagPredicate.append(column.name.toCQLString()).append(" = ?");
+        }
         String select = String.format("SELECT window_start, max_row_writetime, payload FROM %s.\"%s\" " +
-                                      "WHERE %s = ? AND window_start >= ? AND window_start < ?",
-                                      metadata.keyspace, ChunkTables.chunkTableName(metadata.name), tagCql);
-        List<ByteBuffer> values = Arrays.asList(key.getKey(),
-                                                TimestampType.instance.decompose(new Date(windowLow)),
-                                                TimestampType.instance.decompose(new Date(windowHigh)));
+                                      "WHERE %s AND window_start >= ? AND window_start < ?",
+                                      metadata.keyspace, ChunkTables.chunkTableName(metadata.name), tagPredicate);
+        List<ByteBuffer> values = new ArrayList<>(tagColumns.size() + 2);
+        // A composite partition key arrives as one CompositeType-encoded buffer; split it back into the
+        // per-column values the chunk table's own key columns expect.
+        Collections.addAll(values, tagColumns.size() == 1
+                                   ? new ByteBuffer[]{ key.getKey() }
+                                   : ((CompositeType) metadata.partitionKeyType).split(key.getKey()));
+        values.add(TimestampType.instance.decompose(new Date(windowLow)));
+        values.add(TimestampType.instance.decompose(new Date(windowHigh)));
         UntypedResultSet chunks;
         try
         {

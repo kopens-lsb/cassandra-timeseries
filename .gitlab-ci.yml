@@ -77,6 +77,9 @@ timeseries-tests:
     # ALTER TABLE extensions validation
     - ant testsome -Dtest.name=org.apache.cassandra.db.timeseries.tiering.TieringPolicyTest
     - ant testsome -Dtest.name=org.apache.cassandra.db.timeseries.tiering.TieredStorageServiceTest
+    # supported schemas (SP4): accept/reject matrix on real CQL schemas (indexes, views, counters,
+    # collections), composite partition key mirroring, static-column survival, TTL vs hot_window
+    - ant testsome -Dtest.name=org.apache.cassandra.db.timeseries.tiering.TieringSchemaSupportTest
     # transparent reads (SP3): chunk decode, coordinator merge, end-to-end SELECT matrix
     - ant testsome -Dtest.name=org.apache.cassandra.db.timeseries.tiering.ChunkReadSupportTest
     - ant testsome -Dtest.name=org.apache.cassandra.db.timeseries.tiering.ChunkMergeIteratorTest

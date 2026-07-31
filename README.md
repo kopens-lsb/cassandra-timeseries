@@ -445,18 +445,35 @@ CREATE TABLE ts.sensor (
 
 오래된 창을 Chimp128 청크로 압축해 `<테이블>__chunks`로 옮기고, **SELECT는 그대로**(투명 읽기가 핫+콜드 자동 병합) 쓰는 기능입니다. 테이블 `extensions`에 JSON 정책을 hex로 넣습니다:
 
-### 12.1 대상 스키마 (필수)
+### 12.1 대상 스키마
 
-압축 대상은 **정준 시계열 테이블**만입니다 — 그 외 형태에 정책을 걸면 60초마다 ERROR 로그만 남고 아무 일도 하지 않습니다.
+**시간축(`timestamp` 클러스터링 컬럼)이 하나인 시계열 테이블이면 형태를 가리지 않습니다.** 파티션 키는 복합이어도 되고, 일반 컬럼은 개수·타입 무관, static 컬럼은 몇 개든 그대로 보존됩니다 (static 셀은 청크화 대상이 아니고, 재인코더의 클러스터링 레인지 딜리트가 건드리지 않습니다).
 
 ```sql
-CREATE TABLE ts.sensor (
-    tag_id    text,        -- 파티션 키 1개 (이름 자유)
-    timestamp timestamp,   -- 클러스터링 1개, timestamp 타입 (ASC/DESC 모두 가능)
-    value     double,      -- 일반 컬럼은 이 하나뿐 (이름 자유)
+CREATE TABLE ts.tag_point (
+    tag_id     text,                    -- 파티션 키: 개수 무관 (복합 키 가능)
+    timestamp  timestamp,               -- 클러스터링 1개, timestamp (ASC/DESC 모두 가능)
+    site_id    text STATIC,             -- static 컬럼: 개수·타입 무관, 그대로 보존
+    attribute  frozen<map<text,text>>,  -- 일반 컬럼: 개수·타입 무관
+    quality    int,
+    value      double,
     PRIMARY KEY (tag_id, timestamp)
-);
+) WITH CLUSTERING ORDER BY (timestamp DESC);
 ```
+
+지원되지 않는 형태에 정책을 걸면 60초마다 **사유를 밝힌** ERROR 로그를 남기고 건너뜁니다. 거부 대상은 다섯 가지뿐입니다:
+
+| 형태 | 사유 |
+| --- | --- |
+| `counter` 컬럼 | 재인코더는 행을 삭제 후 재삽입하는데, 삭제된 카운터는 영구히 다시 쓸 수 없습니다 |
+| 비frozen 컬렉션 **일반** 컬럼 | 멀티셀 값은 청크로 인코딩할 수 없습니다 — `frozen<...>`으로 감싸면 지원됩니다 |
+| 클러스터링이 0개·2개 이상이거나 `timestamp`가 아님 | 인코딩할 시간축이 없습니다 |
+| **일반 컬럼**에 걸린 보조 인덱스(SAI 포함) | 재인코딩된 행이 인덱스에서 사라져 인덱스 질의가 콜드 데이터를 조용히 누락합니다 (static·키 컬럼 인덱스는 무방) |
+| 이 테이블 위의 머티리얼라이즈드 뷰 | 투명 읽기는 베이스 테이블만 복원하므로 뷰가 오래된 이력을 영구히 잃습니다 |
+
+> `default_time_to_live`가 있고 `hot_window >= TTL`이면 재인코더가 데이터를 보기 전에 TTL이 먼저 지워 **아무것도 압축되지 않습니다**. 거부하지는 않지만 두 값을 밝힌 WARN을 남깁니다.
+
+> **진행 중(SP4)**: 스키마 수용은 위와 같이 일반화됐지만, 재인코더는 아직 `double` 일반 컬럼 1개짜리 청크만 씁니다. 그 외 형태는 수용된 뒤에도 ERROR와 함께 건너뜁니다 — 한 컬럼만 인코딩하고 나머지를 지우는 일은 하지 않습니다.
 
 ### 12.2 압축 켜기 — CQL 한 줄
 

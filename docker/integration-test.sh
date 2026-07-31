@@ -414,8 +414,9 @@ check "LIKE combines with time_bucket aggregation" \
     '^ *2024-01-01 09:00:00.* 2'
 
 section "tiered storage: policy, retier, chunk re-encode, late merge"
-# Canonical time-series table for the re-encoder: single text partition key, timestamp
-# clustering, double value (the exact shape TieringPolicy.canonicalSchemaError demands).
+# The simplest supported shape (TieringPolicy.unsupportedSchemaError accepts far more -- composite
+# partition keys, many regular columns, static columns): one text partition key, timestamp
+# clustering, one double value, which is also all the re-encoder can encode until it goes columnar.
 cql "
 CREATE TABLE IF NOT EXISTS it.sensor (
     tag_id text, timestamp timestamp, value double,
