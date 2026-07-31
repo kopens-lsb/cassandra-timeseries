@@ -447,7 +447,7 @@ public final class ColumnarChunkCodec
         buffer.order(ByteOrder.BIG_ENDIAN);
         byte version = buffer.get();
         if (version != VERSION)
-            throw new IllegalArgumentException("Unsupported columnar chunk version: " + version);
+            throw ChunkCodecs.unsupportedVersion(version, "columnar chunk");
         int rowCount = buffer.getInt();
         // Even in the cheapest legitimate encoding (all-zero delta-of-delta, 1 bit/row), rowCount
         // rows need at least rowCount/8 bytes of timestamp bitstream alone -- a rowCount that could
@@ -529,9 +529,11 @@ public final class ColumnarChunkCodec
         // too -- those never reach decodeColumn's type switch, and a chunk carrying a type code
         // this build cannot honour must be rejected whatever its flags say.
         if (typeCode == TYPE_DOUBLE_GORILLA_REMOVED)
-            throw new IllegalArgumentException("Unsupported columnar chunk: double column type code " +
-                                               TYPE_DOUBLE_GORILLA_REMOVED + " (gorilla) was removed -- chimp128 " +
-                                               "(type code " + TYPE_DOUBLE_CHIMP + ") is the only double codec");
+            throw new UnsupportedChunkFormatException("Unsupported columnar chunk: double column type code " +
+                                                      TYPE_DOUBLE_GORILLA_REMOVED + " (gorilla) was removed when " +
+                                                      "chimp128 became the only double codec; chunks written by " +
+                                                      "that build cannot be read by this one (type code " +
+                                                      TYPE_DOUBLE_CHIMP + " is the only double codec now)");
         if (typeCode < TYPE_DOUBLE_CHIMP || typeCode > TYPE_OPAQUE)
             throw new IllegalArgumentException("Corrupt columnar chunk: unknown column type code " + typeCode);
         byte flags = buffer.get();
@@ -864,7 +866,7 @@ public final class ColumnarChunkCodec
         buffer.order(ByteOrder.BIG_ENDIAN);
         byte version = buffer.get(buffer.position());
         if (version != VERSION)
-            throw new IllegalArgumentException("Unsupported columnar chunk version: " + version);
+            throw ChunkCodecs.unsupportedVersion(version, "columnar chunk");
         return buffer;
     }
 

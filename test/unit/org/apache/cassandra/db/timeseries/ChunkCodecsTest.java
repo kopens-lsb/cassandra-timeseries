@@ -54,22 +54,31 @@ public class ChunkCodecsTest
     }
 
     @Test
-    public void rejectsUnknownVersion()
+    public void unrecognisedVersionIsReportedAsCorruption()
     {
+        // A version byte naming no known format is indistinguishable from a header whose first byte
+        // got scrambled, so it must stay a plain IllegalArgumentException -- the read path skips
+        // those one at a time rather than failing the query.
         ByteBuffer payload = ChunkCodecs.encode(new long[]{ 1L }, new double[]{ 1.0 }, 1);
         payload.put(payload.position(), (byte) 9);
-        assertThatThrownBy(() -> ChunkCodecs.cursor(payload)).isInstanceOf(IllegalArgumentException.class);
+        assertThatThrownBy(() -> ChunkCodecs.cursor(payload))
+            .isInstanceOf(IllegalArgumentException.class)
+            .isNotInstanceOf(UnsupportedChunkFormatException.class);
     }
 
     @Test
-    public void rejectsRemovedGorillaVersion()
+    public void removedGorillaVersionIsReportedAsAnUnsupportedFormat()
     {
-        // version byte 1 was the gorilla single-column format; it must fail loudly, never be
-        // half-decoded as a chimp payload (the headers are byte-identical in layout)
+        // Version byte 1 was the gorilla single-column format. It names a real format, so it is a
+        // systematic "this build cannot read these chunks" condition, NOT one bad chunk -- and it
+        // must never be half-decoded as chimp (the two headers are byte-identical in layout).
         ByteBuffer payload = ChunkCodecs.encode(new long[]{ 1L }, new double[]{ 1.0 }, 1);
         payload.put(payload.position(), (byte) 1);
-        assertThatThrownBy(() -> ChunkCodecs.cursor(payload)).isInstanceOf(IllegalArgumentException.class);
-        assertThatThrownBy(() -> ChunkCodecs.sampleCount(payload)).isInstanceOf(IllegalArgumentException.class);
+        assertThatThrownBy(() -> ChunkCodecs.cursor(payload))
+            .isInstanceOf(UnsupportedChunkFormatException.class)
+            .hasMessageContaining("gorilla");
+        assertThatThrownBy(() -> ChunkCodecs.sampleCount(payload))
+            .isInstanceOf(UnsupportedChunkFormatException.class);
     }
 
     @Test
@@ -89,7 +98,7 @@ public class ChunkCodecsTest
         ByteBuffer payload = ColumnarChunkCodec.encode(new long[]{ 1L, 2L, 3L }, 3, columns);
 
         assertThatThrownBy(() -> ChunkCodecs.cursor(payload))
-            .isInstanceOf(IllegalArgumentException.class)
+            .isInstanceOf(UnsupportedChunkFormatException.class)
             .hasMessageContaining("ColumnarChunkCodec.cursor()");
     }
 

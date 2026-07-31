@@ -620,7 +620,7 @@ public class ColumnarChunkCodecTest
         bytes[ColumnarChunkCodec.HEADER_SIZE] = 0x00;
 
         assertThatThrownBy(() -> ColumnarChunkCodec.cursor(ByteBuffer.wrap(bytes), null))
-            .isInstanceOf(IllegalArgumentException.class)
+            .isInstanceOf(UnsupportedChunkFormatException.class)
             .hasMessageContaining("gorilla");
     }
 
@@ -638,6 +638,7 @@ public class ColumnarChunkCodecTest
 
         assertThatThrownBy(() -> ColumnarChunkCodec.cursor(ByteBuffer.wrap(bytes), null))
             .isInstanceOf(IllegalArgumentException.class)
+            .isNotInstanceOf(UnsupportedChunkFormatException.class)   // corruption, not a removed format
             .hasMessageContaining("unknown column type code");
     }
 

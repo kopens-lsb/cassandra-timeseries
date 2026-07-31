@@ -25,7 +25,7 @@ FROM ts.metrics WHERE series='cpu' GROUP BY series, time_bucket_gapfill(1h, ts, 
 
 | 항목 | 업스트림 방식(행 저장) | 이 포크(계층화) | 효과 |
 | --- | --- | --- | --- |
-| 저장 용량 | 1.47 GB | **0.70 GB** | **2.1× 절감** (풀정밀 double = 압축 최악 조건; 양자화된 실제 산업 데이터는 [코덱 실측](doc/timeseries/codec-bakeoff.md) 기준 10배 이상) |
+| 저장 용량 | 1.47 GB | **0.70 GB** | **2.1× 절감** (풀정밀 double = 압축 최악 조건; 양자화된 실제 산업 데이터는 [코덱 실측](doc/timeseries/codec-bakeoff.md) 기준 10배 이상). 코덱 통합(Chimp128 단일화) 이전 실측이라 재측정 필요 |
 | 단일 시리즈 집계 (10만 행) | 329~524 ms | **39~100 ms** | **5~8× 빠름** |
 | 100 시리즈 시간별 평균 (1,000만 행) | 39.9 s | **5.6 s** | **7.1× 빠름** |
 | 대시보드 종합 쿼리(OHLC+p95) | 512 ms | **150 ms** | **3.4× 빠름** |
@@ -59,7 +59,7 @@ FROM ts.metrics WHERE series='cpu' GROUP BY series, time_bucket_gapfill(1h, ts, 
 | [Gap-Fill 설계 (gapfill-design.md)](doc/timeseries/gapfill-design.md) | `time_bucket_gapfill`의 CQL 문법, 보간 규칙, 가드레일 |
 | [Continuous Aggregates 설계 (continuous-aggregates-design.md)](doc/timeseries/continuous-aggregates-design.md) | 시간 버킷 롤업(연속 집계) 설계안 — 진행 중 |
 | **[풀텍스트 검색 (fulltext-search.md)](doc/timeseries/fulltext-search.md)** | SAI `LIKE` + `index_analyzer` — 로그/메시지 본문 부분문자열 검색 (한글 포함) |
-| **[계층화 벤치마크 (tiering-benchmark.md)](doc/timeseries/tiering-benchmark.md)** | 1억 건 전/후 실측 — 저장 2.1×↓(풀정밀 최악 케이스), 재인코딩 265k rows/s, 동일 결과로 질의 5~8× 가속 |
+| **[계층화 벤치마크 (tiering-benchmark.md)](doc/timeseries/tiering-benchmark.md)** | 1억 건 전/후 실측 — 저장 2.1×↓(풀정밀 최악 케이스), 재인코딩 265k rows/s, 동일 결과로 질의 5~8× 가속. 저장 수치는 코덱 통합 이전 실측 |
 | **[운영 튜닝 가이드 (operations-tuning.md)](doc/timeseries/operations-tuning.md)** | 장기 보존(10년) 전환 실전 가이드 — 용량 산수, 적용 순서, 원본·**청크 테이블** 튜닝값과 근거, TTL과 계층화의 관계, 점검 목록 |
 | **[계층형 저장 (tiered-storage.md)](doc/timeseries/tiered-storage.md)** | `timeseries_tiering` 정책·청크 재인코더 — 설정, 청크 조회 패턴, 운영(nodetool/가상 테이블), 불변식과 제한사항 |
 | [통합 테스트 보고서](doc/timeseries/integration-test-report.md) | 실제 컨테이너에서 실행한 52개 검증의 CQL·결과·소요 시간 |

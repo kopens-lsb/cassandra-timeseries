@@ -143,7 +143,7 @@ public final class Chimp128Codec
         ByteBuffer buffer = payload.duplicate().order(ByteOrder.BIG_ENDIAN);
         byte version = buffer.get(buffer.position());
         if (version != VERSION)
-            throw new IllegalArgumentException("Unsupported chimp chunk version: " + version);
+            throw ChunkCodecs.unsupportedVersion(version, "chimp chunk");
         return buffer;
     }
 
@@ -152,7 +152,7 @@ public final class Chimp128Codec
         ByteBuffer buffer = payload.duplicate().order(ByteOrder.BIG_ENDIAN);
         byte version = buffer.get();
         if (version != VERSION)
-            throw new IllegalArgumentException("Unsupported chimp chunk version: " + version);
+            throw ChunkCodecs.unsupportedVersion(version, "chimp chunk");
         int count = buffer.getInt();
         if (count < 1)
             throw new IllegalArgumentException("Corrupt chimp chunk: count " + count);

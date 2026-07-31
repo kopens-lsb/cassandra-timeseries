@@ -24,6 +24,7 @@ import org.junit.Test;
 
 import org.apache.cassandra.cql3.CQLTester;
 import org.apache.cassandra.cql3.UntypedResultSet;
+import org.apache.cassandra.db.timeseries.UnsupportedChunkFormatException;
 import org.apache.cassandra.utils.ByteBufferUtil;
 
 import static org.junit.Assert.assertEquals;
@@ -151,21 +152,70 @@ public class TransparentReadTest extends CQLTester
                    row(new Date(4 * HOUR), 6.0));
     }
 
-    @Test
-    public void corruptChunkSkippedWithRemainingDataServed() throws Throwable
+    /** Overwrites the [0,1h) window's chunk payload with {@code hexPayload} (a 0x... CQL blob literal). */
+    private void overwriteFirstChunkPayload(String hexPayload) throws Throwable
     {
-        loadTwoWindowsAndReencode();
-
         execute("UPDATE " + KEYSPACE + ".\"" + ChunkTables.chunkTableName(currentTable()) + "\" " +
-                "SET payload = 0xdeadbeef WHERE tag = 't1' AND window_start = ?", new Date(0L));
+                "SET payload = " + hexPayload + " WHERE tag = 't1' AND window_start = ?", new Date(0L));
+    }
 
-        // Window [0,1h) is unreadable and skipped; window [1h,2h) and the hot row still serve.
+    private void assertOnlySecondWindowAndHotRowServed() throws Throwable
+    {
         UntypedResultSet rows = execute("SELECT value FROM %s WHERE tag = 't1'");
         assertEquals(3, rows.size());
         double[] expected = { 4.0, 5.0, 6.0 };
         int i = 0;
         for (UntypedResultSet.Row row : rows)
             assertEquals(expected[i++], row.getDouble("value"), 0.0);
+    }
+
+    @Test
+    public void corruptChunkSkippedWithRemainingDataServed() throws Throwable
+    {
+        loadTwoWindowsAndReencode();
+
+        // A first byte naming no chunk format at all -- what a scrambled header looks like.
+        overwriteFirstChunkPayload("0xdeadbeef");
+
+        // Window [0,1h) is unreadable and skipped; window [1h,2h) and the hot row still serve.
+        assertOnlySecondWindowAndHotRowServed();
+    }
+
+    @Test
+    public void corruptChunkWithASupportedVersionIsStillSkipped() throws Throwable
+    {
+        loadTwoWindowsAndReencode();
+
+        // Version byte 2 (supported), but a header claiming 0 samples: corrupt CONTENT, not a format
+        // this build cannot read. Availability wins here -- skip the one bad chunk, serve the rest.
+        overwriteFirstChunkPayload("0x02" + "0".repeat(40));
+
+        assertOnlySecondWindowAndHotRowServed();
+    }
+
+    @Test
+    public void chunkFromARemovedCodecFailsTheReadInsteadOfTruncatingIt() throws Throwable
+    {
+        loadTwoWindowsAndReencode();
+
+        // Version byte 1 = the removed gorilla format. Unlike corruption this is systematic (every
+        // chunk the old build wrote carries it), so skipping would make this SELECT -- and every
+        // future one -- succeed while silently omitting the [0,1h) window's history.
+        overwriteFirstChunkPayload("0x01" + "0".repeat(40));
+
+        try
+        {
+            execute("SELECT value FROM %s WHERE tag = 't1'");
+            fail("expected the read to fail rather than silently drop the unreadable window");
+        }
+        catch (UnsupportedChunkFormatException e)
+        {
+            // must name the table, the window that proved it, and what the operator has to do
+            assertTrue(e.getMessage(), e.getMessage().contains(currentTable()));
+            assertTrue(e.getMessage(), e.getMessage().contains("older build"));
+            assertTrue(e.getMessage(), e.getMessage().contains(ChunkTables.chunkTableName(currentTable())));
+            assertTrue(e.getMessage(), e.getMessage().contains("not recoverable"));
+        }
     }
 
     @Test

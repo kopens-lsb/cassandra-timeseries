@@ -50,9 +50,9 @@ import org.apache.cassandra.db.marshal.ByteType;
 import org.apache.cassandra.db.marshal.Int32Type;
 import org.apache.cassandra.db.marshal.LongType;
 import org.apache.cassandra.db.marshal.TimestampType;
-import org.apache.cassandra.db.timeseries.Chimp128Codec;
 import org.apache.cassandra.db.timeseries.ChunkCodecs;
 import org.apache.cassandra.db.timeseries.SampleCursor;
+import org.apache.cassandra.db.timeseries.UnsupportedChunkFormatException;
 import org.apache.cassandra.dht.Range;
 import org.apache.cassandra.dht.Token;
 import org.apache.cassandra.exceptions.ConfigurationException;
@@ -585,7 +585,10 @@ public class TieredStorageService implements TieredStorageServiceMBean
                     }
 
                     ByteBuffer payload = ChunkCodecs.encode(tsBuf, valBuf, count);
-                    byte codecByte = Chimp128Codec.VERSION;
+                    // Read the version byte back out of the payload rather than naming a codec
+                    // constant here: the `codec` column must describe what was actually written, so
+                    // it stays honest if the encode path ever changes underneath this call.
+                    byte codecByte = payload.get(payload.position());
 
                     // Always write strictly after both the rows just encoded AND the chunk row being
                     // replaced -- guards a crash-then-backfill corner where maxWt+1 could otherwise land
@@ -617,6 +620,19 @@ public class TieredStorageService implements TieredStorageServiceMBean
                     windowStart = windowEnd;
                 }
 
+            }
+            catch (UnsupportedChunkFormatException e)
+            {
+                // The tag's existing chunk was written by a build whose chunk format this one cannot
+                // read, so the late-merge read of it failed. Retrying achieves nothing -- unlike the
+                // generic failure below, this never fixes itself -- and the tag is now permanently
+                // stuck, so say what has to happen instead of implying a retry will help. Skipping is
+                // still the safe response: no rows are deleted, so nothing further is lost.
+                logger.error("Tiered storage runOnce: {}.{} cannot re-encode tag {}: its existing chunk was written " +
+                             "by an older build and is unreadable ({}). Retrying will not fix this -- drop {} and " +
+                             "let tiering re-run; that data is not recoverable. Source rows are left untouched.",
+                             keyspace, table, tagColumn.type.getString(tag), e.getMessage(),
+                             ChunkTables.chunkTableName(table));
             }
             catch (RuntimeException e)
             {

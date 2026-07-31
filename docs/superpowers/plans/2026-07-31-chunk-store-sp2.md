@@ -49,9 +49,9 @@ CREATE TABLE ks."<base>__chunks" (
 
 ```json
 {"hot_window":"7d", "chunk_window":"1h", "cold_window":"365d",
- "codec":"auto", "consistency":"LOCAL_QUORUM", "interval":"5m"}
+ "consistency":"LOCAL_QUORUM", "interval":"5m"}
 ```
-- `hot_window`: 이 시간 안의 로우는 건드리지 않음. `chunk_window`: 청크 창 폭(고정 길이, TSCS `window_size`와 정렬 권장). `cold_window`: 선택 — 지나면 청크 파티션 범위 삭제(윈도우 통째). `codec`: `auto|gorilla|chimp128`. `interval`: 서비스 틱 주기.
+- `hot_window`: 이 시간 안의 로우는 건드리지 않음. `chunk_window`: 청크 창 폭(고정 길이, TSCS `window_size`와 정렬 권장). `cold_window`: 선택 — 지나면 청크 파티션 범위 삭제(윈도우 통째). `interval`: 서비스 틱 주기. (계획 당시 있던 `codec` 필드는 SP4 Task 1.5에서 제거됐다 — Chimp128이 유일한 코덱이며, 정책에 `codec`이 남아 있으면 파서가 거부한다.)
 - 파서는 TSCS의 duration 문법(`<int><m|h|d>`) 재사용 수준으로 자체 구현, 검증: `hot_window >= chunk_window`, `cold_window > hot_window`(설정 시), 미지 키 거부.
 
 ## 재인코딩 사이클 (규범 알고리즘 — TieredStorageService.runOnce)

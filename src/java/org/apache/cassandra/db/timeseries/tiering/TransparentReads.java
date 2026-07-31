@@ -44,11 +44,14 @@ import org.apache.cassandra.db.filter.ClusteringIndexSliceFilter;
 import org.apache.cassandra.db.marshal.TimestampType;
 import org.apache.cassandra.db.partitions.PartitionIterator;
 import org.apache.cassandra.db.rows.Row;
+import org.apache.cassandra.db.timeseries.UnsupportedChunkFormatException;
 import org.apache.cassandra.exceptions.ConfigurationException;
 import org.apache.cassandra.schema.TableMetadata;
 import org.apache.cassandra.service.ClientWarn;
 import org.apache.cassandra.utils.Clock;
 import org.apache.cassandra.utils.NoSpamLogger;
+
+import static java.lang.String.format;
 
 /**
  * SP3 transparent reads (design spec section 3.3.1): decides whether a SELECT on a tiering-enabled
@@ -239,6 +242,24 @@ public final class TransparentReads
                 {
                     result.addAll(rows);
                 }
+            }
+            catch (UnsupportedChunkFormatException e)
+            {
+                // NOT skippable, unlike corruption below. A removed codec version is systematic --
+                // every chunk this table wrote under the old build carries it -- so skipping would
+                // let this SELECT succeed while silently returning truncated history, and keep doing
+                // so on every future read. Fail the query instead, loudly and with the window that
+                // proved it, so the condition is impossible to miss.
+                String detail = format("%s.%s: the chunk for window %s was written by an older build and cannot " +
+                                        "be read (%s). Drop %s.\"%s\" and let tiering re-run -- that data is not " +
+                                        "recoverable, its base rows were deleted when it was encoded.",
+                                        metadata.keyspace, metadata.name, chunk.getTimestamp("window_start"),
+                                        e.getMessage(), metadata.keyspace,
+                                        ChunkTables.chunkTableName(metadata.name));
+                NoSpamLogger.log(logger, NoSpamLogger.Level.ERROR,
+                                 metadata.keyspace + '.' + metadata.name + ":chunk-unsupported", 1, TimeUnit.MINUTES,
+                                 "{}", detail);
+                throw new UnsupportedChunkFormatException(detail);
             }
             catch (IllegalArgumentException e)
             {
