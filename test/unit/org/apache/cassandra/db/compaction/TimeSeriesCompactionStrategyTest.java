@@ -70,11 +70,7 @@ public class TimeSeriesCompactionStrategyTest
     /** UnifiedCompactionStrategyTest.mockSSTable 축소판: 창 분류에 필요한 것만 스텁 */
     static SSTableReader sstableAt(long maxTimestampMillis)
     {
-        SSTableReader sstable = mock(SSTableReader.class, Mockito.RETURNS_DEEP_STUBS);
-        // 전략은 timestampResolution(MICROSECONDS 기본)으로 변환하므로 마이크로초로 스텁
-        when(sstable.getMaxTimestamp()).thenReturn(maxTimestampMillis * 1000);
-        when(sstable.getMinTimestamp()).thenReturn(maxTimestampMillis * 1000 - 1000);
-        return sstable;
+        return sstableSpanning(maxTimestampMillis - 1, maxTimestampMillis);
     }
 
     /** min·max를 각각 지정하는 상태 기계용 확장판 (기존 sstableAt(max)는 min = max − 1ms 고정) */
@@ -83,6 +79,11 @@ public class TimeSeriesCompactionStrategyTest
         SSTableReader sstable = mock(SSTableReader.class, Mockito.RETURNS_DEEP_STUBS);
         when(sstable.getMaxTimestamp()).thenReturn(maxTimestampMillis * 1000);   // timestampResolution 기본 MICROSECONDS
         when(sstable.getMinTimestamp()).thenReturn(minTimestampMillis * 1000);
+        // AbstractCompactionTask.validateSSTables는 2개 이상 묶을 때 수리 상태 일관성을 검사한다 — 딥스텁은
+        // getPendingRepair()에 목 TimeUUID를 내주면서 isPendingRepair()는 false라 자기모순이 된다
+        // (UnifiedCompactionStrategyTest.mockSSTable과 같은 처방)
+        when(sstable.isRepaired()).thenReturn(false);
+        when(sstable.getPendingRepair()).thenReturn(null);
         return sstable;
     }
 
@@ -406,5 +407,165 @@ public class TimeSeriesCompactionStrategyTest
         TimeSeriesCompactionStrategy tscs = new TimeSeriesCompactionStrategy(cfs, options(), delegate);
 
         assertNull(tscs.getUserDefinedTask(List.of(sstableAt(NOW - HOUR)), 0));
+    }
+
+    @Test
+    public void freezeTaskIsCreatedForClosedMultiSSTableWindow()
+    {
+        UnifiedCompactionStrategy delegate = mock(UnifiedCompactionStrategy.class);
+        when(delegate.getNextBackgroundTasks(anyLong())).thenReturn(List.of());
+        ColumnFamilyStore cfs = mock(ColumnFamilyStore.class, Mockito.RETURNS_DEEP_STUBS);
+        stubTracker(cfs);
+        TimeSeriesCompactionStrategy tscs = new TimeSeriesCompactionStrategy(cfs, options(), delegate);
+
+        SSTableReader current = sstableAt(NOW - 60_000);
+        SSTableReader old1 = sstableAt(NOW - 10 * HOUR);
+        SSTableReader old2 = sstableAt(NOW - 10 * HOUR + 60_000);    // 같은 닫힌 창
+        tscs.addSSTable(current);
+        tscs.addSSTable(old1);
+        tscs.addSSTable(old2);
+        when(cfs.getLiveSSTables()).thenReturn(Set.of(current, old1, old2));
+
+        Collection<AbstractCompactionTask> tasks = tscs.getNextBackgroundTasksAt(NOW, 0);
+
+        AbstractCompactionTask task = List.copyOf(tasks).get(0);
+        assertEquals(1, tasks.size());                               // 라운드당 동결 최대 1개
+        assertTrue(task instanceof FreezeCompactionTask);
+        assertEquals(Set.of(old1, old2), task.transaction.originals());
+        verify(delegate, Mockito.never()).getNextBackgroundTasks(anyLong());   // 동결이 위임보다 우선
+    }
+
+    @Test
+    public void oldestFreezingWindowIsSelectedFirst()
+    {
+        UnifiedCompactionStrategy delegate = mock(UnifiedCompactionStrategy.class);
+        when(delegate.getNextBackgroundTasks(anyLong())).thenReturn(List.of());
+        ColumnFamilyStore cfs = mock(ColumnFamilyStore.class, Mockito.RETURNS_DEEP_STUBS);
+        stubTracker(cfs);
+        TimeSeriesCompactionStrategy tscs = new TimeSeriesCompactionStrategy(cfs, options(), delegate);
+
+        SSTableReader newer1 = sstableAt(NOW - 10 * HOUR);
+        SSTableReader newer2 = sstableAt(NOW - 10 * HOUR + 60_000);
+        SSTableReader older1 = sstableAt(NOW - 20 * HOUR);
+        SSTableReader older2 = sstableAt(NOW - 20 * HOUR + 60_000);
+        for (SSTableReader s : List.of(newer1, newer2, older1, older2))
+            tscs.addSSTable(s);
+        when(cfs.getLiveSSTables()).thenReturn(Set.of(newer1, newer2, older1, older2));
+
+        Collection<AbstractCompactionTask> tasks = tscs.getNextBackgroundTasksAt(NOW, 0);
+
+        assertEquals(1, tasks.size());
+        assertEquals(Set.of(older1, older2), List.copyOf(tasks).get(0).transaction.originals());   // 오래된 창 우선
+    }
+
+    @Test
+    public void frozenWindowIsNotReselected()
+    {
+        UnifiedCompactionStrategy delegate = mock(UnifiedCompactionStrategy.class);
+        when(delegate.getNextBackgroundTasks(anyLong())).thenReturn(List.of());
+        ColumnFamilyStore cfs = mock(ColumnFamilyStore.class, Mockito.RETURNS_DEEP_STUBS);
+        TimeSeriesCompactionStrategy tscs = new TimeSeriesCompactionStrategy(cfs, options(), delegate);
+
+        tscs.addSSTable(sstableAt(NOW - 10 * HOUR));                 // 단일 + 포함(min = max − 1ms) = FROZEN
+        Collection<AbstractCompactionTask> tasks = tscs.getNextBackgroundTasksAt(NOW, 0);
+
+        assertEquals(List.of(), List.copyOf(tasks));
+        verify(cfs.getTracker(), Mockito.never()).tryModify(anyCollection(), any(OperationType.class));
+    }
+
+    @Test
+    public void spanningSingleSSTableIsNeverFreezeSelected()
+    {
+        // FREEZING로 분류돼도(포함 실패) 단일 sstable은 재작성해 봐야 포함이 안 고쳐진다(T3 스플릿 전) →
+        // 선택 대상이 아니어야 무한 재컴팩션 루프가 없다
+        TimeSeriesCompactionStrategy tscs = strategy(mock(UnifiedCompactionStrategy.class));
+        tscs.addSSTable(sstableSpanning(NOW - 11 * HOUR, NOW - 10 * HOUR));
+
+        assertNull(tscs.nextFreezeCandidate(NOW));
+    }
+
+    @Test
+    public void farFutureWindowNeverCountsTowardFreeze()
+    {
+        // far-future 가드는 분류기 경로에서도 참조된다(스펙 §8): far-future 창은 sstable이 몇 개든 동결 후보가 아니다
+        TimeSeriesCompactionStrategy tscs = strategy(mock(UnifiedCompactionStrategy.class));
+        tscs.addSSTable(sstableAt(NOW + 3L * 24 * HOUR));
+        tscs.addSSTable(sstableAt(NOW + 3L * 24 * HOUR + 60_000));
+
+        assertNull(tscs.nextFreezeCandidate(NOW));
+        assertEquals(0, tscs.getEstimatedRemainingTasks());
+    }
+
+    @Test
+    public void freezeSkipsWhenZombieFilterLeavesSingleSurvivor()
+    {
+        UnifiedCompactionStrategy delegate = mock(UnifiedCompactionStrategy.class);
+        when(delegate.getNextBackgroundTasks(anyLong())).thenReturn(List.of());
+        ColumnFamilyStore cfs = mock(ColumnFamilyStore.class, Mockito.RETURNS_DEEP_STUBS);
+        TimeSeriesCompactionStrategy tscs = new TimeSeriesCompactionStrategy(cfs, options(), delegate);
+
+        SSTableReader old1 = sstableAt(NOW - 10 * HOUR);
+        SSTableReader old2 = sstableAt(NOW - 10 * HOUR + 60_000);
+        tscs.addSSTable(old1);
+        tscs.addSSTable(old2);
+        when(cfs.getLiveSSTables()).thenReturn(Set.of(old1));        // old2는 좀비: 트래커 기준 이미 비활성
+
+        tscs.getNextBackgroundTasksAt(NOW, 0);
+
+        // 생존자 1개짜리 동결은 무의미 — 다음 라운드에 집합이 안정되면 자연 치유된다
+        verify(cfs.getTracker(), Mockito.never()).tryModify(anyCollection(), any(OperationType.class));
+    }
+
+    @Test
+    public void tryModifyRefusalSkipsRoundAndRetriesUntilItSucceeds()
+    {
+        UnifiedCompactionStrategy delegate = mock(UnifiedCompactionStrategy.class);
+        AbstractCompactionTask delegateTask = mock(AbstractCompactionTask.class);
+        when(delegate.getNextBackgroundTasks(anyLong())).thenReturn(List.of(delegateTask));
+        ColumnFamilyStore cfs = mock(ColumnFamilyStore.class, Mockito.RETURNS_DEEP_STUBS);
+        TimeSeriesCompactionStrategy tscs = new TimeSeriesCompactionStrategy(cfs, options(), delegate);
+
+        SSTableReader old1 = sstableAt(NOW - 10 * HOUR);
+        SSTableReader old2 = sstableAt(NOW - 10 * HOUR + 60_000);
+        tscs.addSSTable(old1);
+        tscs.addSSTable(old2);
+        when(cfs.getLiveSSTables()).thenReturn(Set.of(old1, old2));
+        when(cfs.getTracker().tryModify(anyCollection(), any(OperationType.class))).thenReturn(null);
+
+        // 1·2라운드: 트래커 거부(예: CLOSING 시절 시작된 위임 컴팩션 진행 중) → 위임으로 폴스루.
+        // 2라운드째 동일 후보 재실패는 TWCS previousCandidate 가드(:100-106)의 크로스-라운드 판으로 WARN만 남긴다.
+        assertEquals(List.of(delegateTask), List.copyOf(tscs.getNextBackgroundTasksAt(NOW, 0)));
+        assertEquals(List.of(delegateTask), List.copyOf(tscs.getNextBackgroundTasksAt(NOW, 0)));
+        verify(cfs.getTracker(), Mockito.times(2)).tryModify(anyCollection(), any(OperationType.class));
+
+        // 3라운드: 경합이 풀리면 정상 동결 — 가드가 살아있는 후보를 영구히 굶기지 않는다는 증명
+        stubTracker(cfs);
+        Collection<AbstractCompactionTask> tasks = tscs.getNextBackgroundTasksAt(NOW, 0);
+        assertEquals(1, tasks.size());
+        assertTrue(List.copyOf(tasks).get(0) instanceof FreezeCompactionTask);
+    }
+
+    @Test
+    public void freezeBacklogCountsInEstimatedRemainingTasks()
+    {
+        UnifiedCompactionStrategy delegate = mock(UnifiedCompactionStrategy.class);
+        when(delegate.getNextBackgroundTasks(anyLong())).thenReturn(List.of());
+        when(delegate.getEstimatedRemainingTasks()).thenReturn(3);
+        ColumnFamilyStore cfs = mock(ColumnFamilyStore.class, Mockito.RETURNS_DEEP_STUBS);
+        stubTracker(cfs);
+        TimeSeriesCompactionStrategy tscs = new TimeSeriesCompactionStrategy(cfs, options(), delegate);
+
+        SSTableReader a1 = sstableAt(NOW - 10 * HOUR);
+        SSTableReader a2 = sstableAt(NOW - 10 * HOUR + 60_000);
+        SSTableReader b1 = sstableAt(NOW - 20 * HOUR);
+        SSTableReader b2 = sstableAt(NOW - 20 * HOUR + 60_000);
+        for (SSTableReader s : List.of(a1, a2, b1, b2))
+            tscs.addSSTable(s);
+        when(cfs.getLiveSSTables()).thenReturn(Set.of(a1, a2, b1, b2));
+
+        tscs.getNextBackgroundTasksAt(NOW, 0);                       // 백로그 계산은 배경 라운드의 부수효과
+
+        // 위임 3 + 만료 0 + FREEZING 창 2 — 백로그를 안 세면 CSM 정렬에서 다른 테이블에 밀려 동결이 기아한다
+        assertEquals(5, tscs.getEstimatedRemainingTasks());
     }
 }

@@ -46,17 +46,15 @@ import org.apache.cassandra.utils.NoSpamLogger;
  * Active windows (current, or closed less than freeze_after ago) delegate their compaction to an
  * internal {@link UnifiedCompactionStrategy}; windows past the configured retention are dropped
  * whole via {@link TimeSeriesCompactionTask}/{@link TimeSeriesCompactionController}
- * (see {@link TimeSeriesCompactionStrategyOptions#isExpiredWindow}). Freezing closed windows
- * to a single sstable and late-data isolation arrive in later increments (design spec section 10).
+ * (see {@link TimeSeriesCompactionStrategyOptions#isExpiredWindow}). Closed windows are frozen to a
+ * single sstable per window (per strategy-instance slice) by
+ * {@link FreezeCompactionTask}, which fires {@link org.apache.cassandra.db.compaction.timeseries.WindowFrozenListener}
+ * post-commit and, by running a real compaction controller, also reclaims TTL/tombstone data in closed
+ * windows without requiring {@code retention}. Late-data isolation (flush/streaming window splitting)
+ * arrives in T3 (design spec section 10).
  * <p>
  * Instances only ever see the sstable slice the CompactionStrategyManager assigns them (per
  * repair status and per disk), so all window state is derived per call and never assumed complete.
- * <p>
- * <b>Caveat (this increment):</b> a closed window (past {@code window_size + freeze_after}) is no longer
- * compacted by the delegate, so TTL/tombstone expiry within it is never re-evaluated there. The only
- * mechanism that reclaims space in a closed window is the whole-window retention drop; without
- * {@code retention} configured, TTL-expired data in a closed window is not reclaimed until the freeze
- * increment lands (design spec section 10). If your table uses TTLs, set {@code retention}.
  */
 public class TimeSeriesCompactionStrategy extends AbstractCompactionStrategy
 {
@@ -68,6 +66,13 @@ public class TimeSeriesCompactionStrategy extends AbstractCompactionStrategy
     // the set of expired-window sstables selected on the most recent background round, so
     // getEstimatedRemainingTasks() can report the pending whole-window drop without recomputing it.
     private volatile Set<SSTableReader> lastExpiredSelection = Set.of();
+    // number of FREEZING windows (>= 2 sstables) seen on the most recent background round, for
+    // getEstimatedRemainingTasks() - freezes starve behind other tables' work if the CSM cannot see them.
+    private volatile int freezeBacklog;
+    // the freeze candidate that failed tryModify on the previous round: cross-round version of TWCS's
+    // previousCandidate guard (:100-106) - warn when the same candidate is stuck two rounds running,
+    // but keep retrying (unlike TWCS's intra-call loop, skipping here would never retry at all).
+    private volatile Set<SSTableReader> previousFreezeCandidate = Set.of();
 
     public TimeSeriesCompactionStrategy(ColumnFamilyStore cfs, Map<String, String> options)
     {
@@ -132,6 +137,34 @@ public class TimeSeriesCompactionStrategy extends AbstractCompactionStrategy
             }
         }
 
+        Map.Entry<Long, Set<SSTableReader>> freeze = nextFreezeCandidate(nowMillis);
+        if (freeze != null)
+        {
+            // Same zombie filter as the expired branch: only live, non-suspect sstables.
+            Set<SSTableReader> toFreeze = new HashSet<>(AbstractCompactionStrategy.filterSuspectSSTables(freeze.getValue()));
+            toFreeze.retainAll(cfs.getLiveSSTables());
+            if (toFreeze.size() > 1)                      // a single survivor is already "frozen enough"; self-heals next round
+            {
+                LifecycleTransaction txn = cfs.getTracker().tryModify(toFreeze, OperationType.COMPACTION);
+                if (txn != null)
+                {
+                    previousFreezeCandidate = Set.of();
+                    logger.debug("Freezing window {} of {}: {} sstables -> 1", freeze.getKey(), cfs.getTableName(), toFreeze.size());
+                    return List.of(new FreezeCompactionTask(cfs, txn, gcBefore, freeze.getKey()));
+                }
+                // Refused (e.g. a delegate compaction started while the window was CLOSING is still running):
+                // skip this round, fall through to the delegate, retry next round (spec section 8).
+                if (toFreeze.equals(previousFreezeCandidate))
+                    logger.warn("Could not acquire references for freezing sstables {} which is not a problem per se," +
+                                " unless it happens frequently, in which case it must be reported. Will retry later.",
+                                toFreeze);
+                else
+                    logger.debug("Unable to mark window {} of {} for freezing; will retry next round",
+                                 freeze.getKey(), cfs.getTableName());
+                previousFreezeCandidate = toFreeze;
+            }
+        }
+
         return delegate.getNextBackgroundTasks(gcBefore);
     }
 
@@ -157,11 +190,17 @@ public class TimeSeriesCompactionStrategy extends AbstractCompactionStrategy
             if (tsOptions.isFarFutureWindow(windowStart, nowMillis))
             {
                 // Garbage/misconfigured-writer timestamps: keep them out of both the UCS delegate and the
-                // freeze machinery, and complain (throttled) so the operator investigates (design spec section 8).
-                NoSpamLogger.log(logger, NoSpamLogger.Level.WARN, 1, TimeUnit.MINUTES,
-                                 "{} has sstable(s) with max timestamp beyond now + {}ms (e.g. {} in window {}); " +
-                                 "excluding from compaction - check writer clocks or USING TIMESTAMP inputs",
-                                 cfs.getTableName(), tsOptions.maxFutureWindowMillis, sstable, windowStart);
+                // freeze machinery, and complain (throttled, keyed per table so one table's warn does not
+                // suppress another's) so the operator investigates (design spec section 8).
+                NoSpamLogger.log(logger, NoSpamLogger.Level.WARN,
+                                 cfs.getKeyspaceName() + '.' + cfs.getTableName() + ":far-future-window",
+                                 1, TimeUnit.MINUTES,
+                                 "{}.{} has sstable(s) with max timestamp beyond now + {}ms (e.g. {} in window {}); " +
+                                 "excluded from background/delegate compaction and freeze selection (maximal and " +
+                                 "user-defined compactions still include them) - check writer clocks or " +
+                                 "USING TIMESTAMP inputs",
+                                 cfs.getKeyspaceName(), cfs.getTableName(), tsOptions.maxFutureWindowMillis,
+                                 sstable, windowStart);
                 continue;
             }
             if (tsOptions.isActiveWindow(windowStart, nowMillis))
@@ -236,6 +275,33 @@ public class TimeSeriesCompactionStrategy extends AbstractCompactionStrategy
         return result;
     }
 
+    /**
+     * The oldest FREEZING window with at least two sstables, or null. Single-sstable FREEZING windows
+     * (a spanning sstable failing containment) are not candidates: rewriting one sstable cannot fix
+     * containment before T3's flush-split, and selecting it would recompact it every round forever.
+     * Side effect: refreshes {@link #freezeBacklog} with the number of eligible windows.
+     */
+    @VisibleForTesting
+    synchronized Map.Entry<Long, Set<SSTableReader>> nextFreezeCandidate(long nowMillis)
+    {
+        Map.Entry<Long, Set<SSTableReader>> oldest = null;
+        int backlog = 0;
+        for (Map.Entry<Long, Set<SSTableReader>> window : windows().entrySet())
+        {
+            if (tsOptions.isFarFutureWindow(window.getKey(), nowMillis))
+                continue;                                 // far-future guard: never judged for freezing (spec section 8)
+            if (window.getValue().size() < 2)
+                continue;
+            if (classify(window.getKey(), window.getValue(), nowMillis) != WindowState.FREEZING)
+                continue;
+            backlog++;
+            if (oldest == null)
+                oldest = window;
+        }
+        freezeBacklog = backlog;
+        return oldest;
+    }
+
     @VisibleForTesting
     UnifiedCompactionStrategy delegate()
     {
@@ -305,7 +371,9 @@ public class TimeSeriesCompactionStrategy extends AbstractCompactionStrategy
     @Override
     public int getEstimatedRemainingTasks()
     {
-        return delegate.getEstimatedRemainingTasks() + (lastExpiredSelection.isEmpty() ? 0 : 1);
+        return delegate.getEstimatedRemainingTasks()
+               + (lastExpiredSelection.isEmpty() ? 0 : 1)
+               + freezeBacklog;
     }
 
     @Override
