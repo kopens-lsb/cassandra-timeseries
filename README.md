@@ -12,8 +12,9 @@
 | **Gap-fill** | `GROUP BY time_bucket_gapfill(width, ts, start, finish)` — 빈 버킷 실체화 + `locf()`/`interpolate()` 채움 정책 | [사용법 §3](#3-빈-구간-채우기--time_bucket_gapfill) |
 | **풀텍스트 검색** | SAI `LIKE` + `index_analyzer`(ngram/standard/cjk/keyword + JSON) — 단어 중간 조각·공백 걸침·한글까지 진짜 부분문자열 매치, ALLOW FILTERING 불필요 | [fulltext-search.md](doc/timeseries/fulltext-search.md) |
 | **시계열 컴팩션 (TSCS)** | `TimeSeriesCompactionStrategy` — 창 정렬 + 창 내부 UCS 위임 + retention 창 통삭제 (T2 동결·이벤트, T3 지각격리 예정) (T1 주의: 닫힌 창의 TTL 회수는 retention 설정 필요 — T2 동결에서 구조 해결) | [설계 스펙](docs/superpowers/specs/2026-07-31-timeseries-compaction-design.md) |
-| **Gorilla(v1)+Chimp128(v2) 청크 코덱** *(계층형 저장 1단계)* | `(timestamp, double)` 무손실 압축 2종 + 버전 디스패처(`ChunkCodecs`). Gorilla: 상수 계열 0.25 B/샘플(64배). Chimp128: 양자화 워크/주기 신호에서 61~69% 추가 절감하나 상수 계열은 5배 역행 — bake-off 결과 기본 코덱은 Gorilla 유지, Chimp128은 옵트인. 청크 스토어·투명 읽기는 후속 단계 | [bake-off 결과](doc/timeseries/codec-bakeoff.md) · [설계 스펙](docs/superpowers/specs/2026-07-31-industrial-tiered-storage-design.md) |
-| **테스트 인프라** | 도커 통합 테스트 41건(릴리스 게이트), 1억 건 스케일 하네스, 3노드 jvm-dtest, GC 비교(ZGC vs G1) | [보고서들](doc/timeseries/) |
+| **Gorilla(v1)+Chimp128(v2) 청크 코덱** *(계층형 저장 1단계)* | `(timestamp, double)` 무손실 압축 2종 + 버전 디스패처(`ChunkCodecs`). Gorilla: 상수 계열 0.25 B/샘플(64배). Chimp128: 양자화 워크/주기 신호에서 61~69% 추가 절감하나 상수 계열은 5배 역행 — bake-off 결과 기본 코덱은 Gorilla 유지, Chimp128은 옵트인 | [bake-off 결과](doc/timeseries/codec-bakeoff.md) · [설계 스펙](docs/superpowers/specs/2026-07-31-industrial-tiered-storage-design.md) |
+| **계층형 저장 (청크 스토어)** *(계층형 저장 2단계)* | 테이블 확장 `timeseries_tiering` 정책 — 백그라운드 재인코더가 hot_window를 지난 창을 청크로 압축해 `<테이블>__chunks`로 이동(지각 데이터 병합, cold_window 만료, CL 쿼럼 하한). `nodetool retier`/`tieringstatus`, `system_views.timeseries_tiering`. 투명 읽기는 후속 단계(SP3) | [tiered-storage.md](doc/timeseries/tiered-storage.md) |
+| **테스트 인프라** | 도커 통합 테스트 52건(릴리스 게이트), 1억 건 스케일 하네스, 3노드 jvm-dtest, GC 비교(ZGC vs G1) | [보고서들](doc/timeseries/) |
 | **배포/CI** | Testcontainers 호환 도커 이미지, GitLab CI(빌드→테스트→이미지→통합 게이트→릴리스), 태그 릴리스 자동화 | [.gitlab-ci.yml](.gitlab-ci.yml) |
 
 ## 📖 문서
@@ -25,7 +26,8 @@
 | [Gap-Fill 설계 (gapfill-design.md)](doc/timeseries/gapfill-design.md) | `time_bucket_gapfill`의 CQL 문법, 보간 규칙, 가드레일 |
 | [Continuous Aggregates 설계 (continuous-aggregates-design.md)](doc/timeseries/continuous-aggregates-design.md) | 시간 버킷 롤업(연속 집계) 설계안 — 진행 중 |
 | **[풀텍스트 검색 (fulltext-search.md)](doc/timeseries/fulltext-search.md)** | SAI `LIKE` + `index_analyzer` — 로그/메시지 본문 부분문자열 검색 (한글 포함) |
-| [통합 테스트 보고서](doc/timeseries/integration-test-report.md) | 실제 컨테이너에서 실행한 32개 검증의 CQL·결과·소요 시간 |
+| **[계층형 저장 (tiered-storage.md)](doc/timeseries/tiered-storage.md)** | `timeseries_tiering` 정책·청크 재인코더 — 설정, 청크 조회 패턴, 운영(nodetool/가상 테이블), 불변식과 제한사항 |
+| [통합 테스트 보고서](doc/timeseries/integration-test-report.md) | 실제 컨테이너에서 실행한 52개 검증의 CQL·결과·소요 시간 |
 | [스케일 테스트 보고서 (1억 건)](doc/timeseries/scale-test-report.md) | 1억 행 적재 후 측정한 쿼리별 CQL 실행 시간 |
 | [GC 비교: ZGC generational vs G1](doc/timeseries/gc-comparison.md) | 같은 1억 건 데이터로 두 GC의 쿼리 시간·쓰기 처리량 비교 (원자료) |
 | **[아티클: 시계열 DB에서 G1GC vs Generational ZGC](doc/timeseries/g1gc-vs-zgc-article.md)** | 위 측정을 정리한 성능 비교 아티클 (환경·방법·해석·권장 설정) |
@@ -403,14 +405,14 @@ SELECT time_bucket(5m, ts), count(*) FROM logs
 
 ## 통합 테스트 (릴리스 게이트)
 
-유닛 테스트는 함수를 프로세스 안에서 검증하지만, [docker/integration-test.sh](docker/integration-test.sh)는 **실제 이미지를 띄워** 스키마 생성부터 읽기 경로·집계·네이티브 프로토콜까지 통과하는 시계열 CQL 결과를 손으로 계산한 값과 대조합니다(32개 검증).
+유닛 테스트는 함수를 프로세스 안에서 검증하지만, [docker/integration-test.sh](docker/integration-test.sh)는 **실제 이미지를 띄워** 스키마 생성부터 읽기 경로·집계·네이티브 프로토콜까지 통과하는 시계열 CQL 결과를 손으로 계산한 값과 대조합니다(52개 검증).
 
 ```bash
 docker build -t cassandra-timeseries:6.0.0 -f docker/Dockerfile .
 ./docker/integration-test.sh cassandra-timeseries:6.0.0     # CONTAINER_RUNTIME=podman 도 지원
 ```
 
-실행하면 항목·CQL·결과가 그대로 출력되고, `build/timeseries-it-report.html`(+ 같은 내용의 `.md`)에 보고서가 생성됩니다. **실행 결과 예시: [통합 테스트 보고서](doc/timeseries/integration-test-report.md)** — 32개 검증의 CQL·응답·소요 시간이 그대로 들어 있습니다.
+실행하면 항목·CQL·결과가 그대로 출력되고, `build/timeseries-it-report.html`(+ 같은 내용의 `.md`)에 보고서가 생성됩니다. **실행 결과 예시: [통합 테스트 보고서](doc/timeseries/integration-test-report.md)** — 52개 검증의 CQL·응답·소요 시간이 그대로 들어 있습니다.
 
 CI에서는 태그를 밀면 `docker-image → docker-integration-test → docker-image-publish + release` 순서로 자동 실행되며, **이 테스트가 통과해야만** 이미지 배포와 릴리스가 진행됩니다. 기본 브랜치에서는 이미지 빌드 비용 때문에 수동(manual) 실행입니다.
 

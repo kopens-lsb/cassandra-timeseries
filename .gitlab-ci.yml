@@ -62,6 +62,10 @@ timeseries-tests:
     - ant testsome -Dtest.name=org.apache.cassandra.db.timeseries.GorillaCodecTest
     - ant testsome -Dtest.name=org.apache.cassandra.db.timeseries.Chimp128CodecTest
     - ant testsome -Dtest.name=org.apache.cassandra.db.timeseries.ChunkCodecsTest
+    # tiered storage: chunk store re-encoder (SP2) — policy, re-encode cycle, nodetool commands
+    - ant testsome -Dtest.name=org.apache.cassandra.db.timeseries.tiering.TieringPolicyTest
+    - ant testsome -Dtest.name=org.apache.cassandra.db.timeseries.tiering.TieredStorageServiceTest
+    - ant testsome -Dtest.name=org.apache.cassandra.tools.nodetool.mock.TieredStorageMockTest
     # time-series compaction strategy (TSCS T1)
     - ant testsome -Dtest.name=org.apache.cassandra.db.compaction.TimeSeriesCompactionStrategyOptionsTest
     - ant testsome -Dtest.name=org.apache.cassandra.db.compaction.TimeSeriesCompactionStrategyTest
