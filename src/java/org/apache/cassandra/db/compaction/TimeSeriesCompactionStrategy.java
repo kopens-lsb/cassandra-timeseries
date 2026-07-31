@@ -33,13 +33,22 @@ import org.slf4j.Logger;
 import org.slf4j.LoggerFactory;
 
 import org.apache.cassandra.db.ColumnFamilyStore;
+import org.apache.cassandra.db.SerializationHeader;
+import org.apache.cassandra.db.commitlog.CommitLogPosition;
+import org.apache.cassandra.db.commitlog.IntervalSet;
+import org.apache.cassandra.db.compaction.timeseries.TimeWindowSplittingMultiWriter;
 import org.apache.cassandra.db.compaction.unified.Controller;
+import org.apache.cassandra.db.lifecycle.ILifecycleTransaction;
 import org.apache.cassandra.db.lifecycle.LifecycleTransaction;
 import org.apache.cassandra.exceptions.ConfigurationException;
+import org.apache.cassandra.index.Index;
+import org.apache.cassandra.io.sstable.Descriptor;
+import org.apache.cassandra.io.sstable.SSTableMultiWriter;
 import org.apache.cassandra.io.sstable.format.SSTableReader;
 import org.apache.cassandra.schema.CompactionParams;
 import org.apache.cassandra.utils.Clock;
 import org.apache.cassandra.utils.NoSpamLogger;
+import org.apache.cassandra.utils.TimeUUID;
 
 /**
  * Time-series compaction: SSTables are classified into fixed time windows by max timestamp.
@@ -393,6 +402,39 @@ public class TimeSeriesCompactionStrategy extends AbstractCompactionStrategy
     public long getMaxSSTableBytes()
     {
         return Long.MAX_VALUE;
+    }
+
+    /**
+     * Flush and streaming both create sstables through this hook (via
+     * {@code ColumnFamilyStore.createSSTableMultiWriter}); splitting them at window boundaries here
+     * upholds the "every sstable belongs to exactly one window" invariant (design spec section 4)
+     * that whole-window drops and per-window freezing rely on. Note this intentionally forgoes the
+     * UCS delegate's token sharding for flushes (plan D6).
+     */
+    @Override
+    public SSTableMultiWriter createSSTableMultiWriter(Descriptor descriptor,
+                                                       long keyCount,
+                                                       long repairedAt,
+                                                       TimeUUID pendingRepair,
+                                                       boolean isTransient,
+                                                       IntervalSet<CommitLogPosition> commitLogPositions,
+                                                       int sstableLevel,
+                                                       SerializationHeader header,
+                                                       Collection<Index.Group> indexGroups,
+                                                       ILifecycleTransaction txn)
+    {
+        return new TimeWindowSplittingMultiWriter(cfs,
+                                                  descriptor,
+                                                  keyCount,
+                                                  repairedAt,
+                                                  pendingRepair,
+                                                  isTransient,
+                                                  commitLogPositions,
+                                                  header,
+                                                  indexGroups,
+                                                  txn,
+                                                  tsOptions::windowStartFor,
+                                                  tsOptions.timestampResolution);
     }
 
     @Override
