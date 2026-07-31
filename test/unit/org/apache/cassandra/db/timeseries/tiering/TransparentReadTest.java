@@ -191,6 +191,20 @@ public class TransparentReadTest extends CQLTester
     }
 
     @Test
+    public void worksWithAnyPartitionKeyColumnName() throws Throwable
+    {
+        // Regression: the chunk lookup must use the base table's actual pk column name (the docker
+        // canonical schema uses tag_id, the tests above use tag - hardcoding either breaks the other).
+        createTable("CREATE TABLE %s (tag_id text, ts timestamp, value double, PRIMARY KEY (tag_id, ts))");
+        setPolicy("{\"hot_window\":\"2h\",\"chunk_window\":\"1h\"}");
+        execute("INSERT INTO %s (tag_id, ts, value) VALUES ('t1', ?, 1.0) USING TIMESTAMP 101", new Date(10 * 60_000L));
+        execute("INSERT INTO %s (tag_id, ts, value) VALUES ('t1', ?, 2.0) USING TIMESTAMP 102", new Date(20 * 60_000L));
+        assertEquals(1L, new TieredStorageService().runOnce(KEYSPACE, currentTable(), 5 * HOUR).windowsEncoded);
+
+        assertEquals(2, execute("SELECT value FROM %s WHERE tag_id = 't1'").size());
+    }
+
+    @Test
     public void nonTieredTableUnaffected() throws Throwable
     {
         createTable("CREATE TABLE %s (tag text, ts timestamp, value double, PRIMARY KEY (tag, ts))");

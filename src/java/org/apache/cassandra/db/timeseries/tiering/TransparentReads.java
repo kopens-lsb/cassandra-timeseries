@@ -176,9 +176,11 @@ public final class TransparentReads
         long safeStart = Math.max(startMs, -(1L << 62));
         long windowLow = policy.windowStartFor(safeStart) - policy.chunkWindowMillis;
         long windowHigh = Math.min(endMsExcl, 1L << 62);
+        // The chunk table's partition key column mirrors the base table's (whatever it is named).
+        String tagCql = metadata.partitionKeyColumns().get(0).name.toCQLString();
         String select = String.format("SELECT window_start, max_row_writetime, payload FROM %s.\"%s\" " +
-                                      "WHERE tag = ? AND window_start >= ? AND window_start < ?",
-                                      metadata.keyspace, ChunkTables.chunkTableName(metadata.name));
+                                      "WHERE %s = ? AND window_start >= ? AND window_start < ?",
+                                      metadata.keyspace, ChunkTables.chunkTableName(metadata.name), tagCql);
         List<ByteBuffer> values = Arrays.asList(key.getKey(),
                                                 TimestampType.instance.decompose(new Date(windowLow)),
                                                 TimestampType.instance.decompose(new Date(windowHigh)));
