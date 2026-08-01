@@ -19,7 +19,9 @@
 package org.apache.cassandra.db.timeseries.tiering;
 
 import java.nio.ByteBuffer;
+import java.util.ArrayList;
 import java.util.Date;
+import java.util.Iterator;
 import java.util.List;
 import java.util.SortedMap;
 import java.util.TreeMap;
@@ -107,7 +109,20 @@ public class ChunkReadSupportTest
 
     private static List<Row> decode(ByteBuffer payload)
     {
-        return ChunkReadSupport.rowsFromChunk(metadata, payload, WRITETIME, Long.MIN_VALUE, Long.MAX_VALUE, false, null);
+        return list(ChunkReadSupport.rowsFromChunk(metadata, payload, WRITETIME, Long.MIN_VALUE, Long.MAX_VALUE,
+                                                   false, null));
+    }
+
+    /**
+     * Drains a decode. {@code rowsFromChunk} hands back an iterator so a read that stops early stops
+     * building rows (see its class javadoc); these tests want the whole window either way.
+     */
+    private static List<Row> list(Iterator<Row> rows)
+    {
+        List<Row> all = new ArrayList<>();
+        while (rows.hasNext())
+            all.add(rows.next());
+        return all;
     }
 
     @Test
@@ -132,7 +147,8 @@ public class ChunkReadSupportTest
     {
         ByteBuffer payload = chunk(10, 1000);
         // [BASE+2000, BASE+5000): expect samples at +2000, +3000, +4000
-        List<Row> rows = ChunkReadSupport.rowsFromChunk(metadata, payload, WRITETIME, BASE + 2000, BASE + 5000, false, null);
+        List<Row> rows = list(ChunkReadSupport.rowsFromChunk(metadata, payload, WRITETIME, BASE + 2000, BASE + 5000,
+                                                             false, null));
         assertEquals(3, rows.size());
         assertRow(rows.get(0), BASE + 2000, 20.2);
         assertRow(rows.get(2), BASE + 4000, 20.4);
@@ -142,14 +158,15 @@ public class ChunkReadSupportTest
     public void emptyRangeYieldsNoRows()
     {
         ByteBuffer payload = chunk(10, 1000);
-        assertTrue(ChunkReadSupport.rowsFromChunk(metadata, payload, WRITETIME, BASE + 100_000, BASE + 200_000, false, null).isEmpty());
+        assertTrue(list(ChunkReadSupport.rowsFromChunk(metadata, payload, WRITETIME, BASE + 100_000, BASE + 200_000,
+                                                       false, null)).isEmpty());
     }
 
     @Test
     public void reversedEmitsDescending()
     {
-        List<Row> rows = ChunkReadSupport.rowsFromChunk(metadata, chunk(5, 1000), WRITETIME,
-                                                        Long.MIN_VALUE, Long.MAX_VALUE, true, null);
+        List<Row> rows = list(ChunkReadSupport.rowsFromChunk(metadata, chunk(5, 1000), WRITETIME,
+                                                             Long.MIN_VALUE, Long.MAX_VALUE, true, null));
         assertEquals(5, rows.size());
         assertRow(rows.get(0), BASE + 4000, 20.4);
         assertRow(rows.get(4), BASE, 20.0);
@@ -232,20 +249,27 @@ public class ChunkReadSupportTest
         assertEquals(1, rows.get(0).columnCount());
     }
 
+    /**
+     * Decoding must fail loudly -- the CALLER decides to skip-and-warn (plan R4) -- and it must fail
+     * <b>out of the call itself</b>, not out of the returned iterator. That is what keeps a corrupt
+     * window all-or-nothing now that rows are built lazily: if the failure could surface mid-iteration
+     * the caller's "skip this window" would have already published a truncated prefix of it.
+     */
     @Test
-    public void corruptPayloadThrows()
+    public void corruptPayloadThrowsBeforeTheFirstRowIsEmitted()
     {
         ByteBuffer payload = chunk(10, 1000);
         ByteBuffer corrupt = payload.duplicate();
         corrupt.put(0, (byte) 99);                                   // unknown version byte
         try
         {
-            ChunkReadSupport.rowsFromChunk(metadata, corrupt, WRITETIME, Long.MIN_VALUE, Long.MAX_VALUE, false, null);
-            fail("expected IllegalArgumentException");
+            Iterator<Row> rows = ChunkReadSupport.rowsFromChunk(metadata, corrupt, WRITETIME,
+                                                               Long.MIN_VALUE, Long.MAX_VALUE, false, null);
+            fail("expected IllegalArgumentException from the call, got an iterator: " + rows);
         }
         catch (IllegalArgumentException expected)
         {
-            // decoding must fail loudly - the CALLER decides to skip-and-warn (plan R4)
+            // the point: thrown by rowsFromChunk, not by a later hasNext()/next()
         }
     }
 }

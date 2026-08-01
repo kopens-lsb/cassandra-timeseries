@@ -37,6 +37,7 @@ import org.apache.cassandra.db.rows.Unfiltered;
 import org.apache.cassandra.db.rows.UnfilteredRowIterator;
 import org.apache.cassandra.db.rows.UnfilteredRowIterators;
 import org.apache.cassandra.schema.TableMetadata;
+import org.apache.cassandra.utils.CloseableIterator;
 import org.apache.cassandra.utils.Throwables;
 
 /**
@@ -61,6 +62,14 @@ import org.apache.cassandra.utils.Throwables;
  * position given by {@code expectedKeys}, which must list the query's partition keys in the same
  * order the hot iterator yields them (the read command/group order).
  * <p>
+ * <b>The chunk side is pulled, not handed over.</b> {@code chunkRows} yields a
+ * {@link CloseableIterator}, not a list, so a window is fetched and decoded only when the merge
+ * actually reaches it: a {@code LIMIT} satisfied from the newest window leaves every older one
+ * untouched, which is the difference between a tiered unbounded read costing one window and costing
+ * the whole retention period ({@link ChunkRowSource}). The corollary is that this class now owns a
+ * closeable per partition it is working on, and every path out -- merged, synthesized, empty, or
+ * thrown -- has to release it.
+ * <p>
  * <b>That ordering is an enforced invariant, not an assumption.</b> If the hot iterator ever yields a
  * key {@code expectedKeys} has already passed -- which is one wiring change away, since
  * {@code SinglePartitionReadQuery.Group#executeLocally} sorts by <em>token</em> while {@code queries}
@@ -75,7 +84,7 @@ public final class ChunkMergeUnfilteredIterator implements UnfilteredPartitionIt
     private final Iterator<DecoratedKey> expectedKeys;
     /** The expected keys not yet consumed, for the order check -- see {@link #outOfOrder}. */
     private final Set<DecoratedKey> pendingKeys;
-    private final Function<DecoratedKey, List<Row>> chunkRows;
+    private final Function<DecoratedKey, CloseableIterator<Row>> chunkRows;
     private final TableMetadata metadata;
     private final boolean reversed;
 
@@ -84,7 +93,7 @@ public final class ChunkMergeUnfilteredIterator implements UnfilteredPartitionIt
 
     private ChunkMergeUnfilteredIterator(UnfilteredPartitionIterator hot,
                                          List<DecoratedKey> expectedKeys,
-                                         Function<DecoratedKey, List<Row>> chunkRows,
+                                         Function<DecoratedKey, CloseableIterator<Row>> chunkRows,
                                          TableMetadata metadata,
                                          boolean reversed)
     {
@@ -99,14 +108,15 @@ public final class ChunkMergeUnfilteredIterator implements UnfilteredPartitionIt
     /**
      * @param expectedKeys the query's partition keys, in the order the hot iterator yields them
      * @param chunkRows    per-key synthetic rows (already range-filtered and ordered to match
-     *                     {@code reversed}); an empty list means "no chunks for this key"
+     *                     {@code reversed}), produced lazily; an exhausted iterator means "no chunks
+     *                     for this key". This class closes every iterator it obtains from here.
      * @param reversed     whether the read runs in reverse clustering-comparator order, i.e. the hot
      *                     iterators' {@code isReverseOrder()}; the synthetic iterator must report the
      *                     same or {@code merge} compares clusterings the wrong way round
      */
     public static UnfilteredPartitionIterator wrap(UnfilteredPartitionIterator hot,
                                                    List<DecoratedKey> expectedKeys,
-                                                   Function<DecoratedKey, List<Row>> chunkRows,
+                                                   Function<DecoratedKey, CloseableIterator<Row>> chunkRows,
                                                    TableMetadata metadata,
                                                    boolean reversed)
     {
@@ -141,7 +151,10 @@ public final class ChunkMergeUnfilteredIterator implements UnfilteredPartitionIt
             pendingKeys.remove(expected);
             if (peekedHot != null && peekedHot.partitionKey().equals(expected))
             {
-                next = merge(peekedHot, chunkRows.apply(expected));
+                // peekedHot is cleared only once merge() has taken ownership: if it throws (a corrupt
+                // or unreadable chunk fails the query from inside the first pull), close() must still
+                // find the hot partition to release.
+                next = merge(peekedHot, expected);
                 peekedHot = null;
             }
             else
@@ -152,10 +165,25 @@ public final class ChunkMergeUnfilteredIterator implements UnfilteredPartitionIt
                 if (peekedHot != null && !pendingKeys.contains(peekedHot.partitionKey()))
                     throw outOfOrder(peekedHot.partitionKey());
 
-                List<Row> synthetic = chunkRows.apply(expected);
-                if (!synthetic.isEmpty())
-                    next = synthetic(metadata, expected, reversed, synthetic);
-                // else: no hot rows and no chunks for this key - nothing to emit, try the next key
+                CloseableIterator<Row> synthetic = chunkRows.apply(expected);
+                boolean handedOn = false;
+                try
+                {
+                    // hasNext() is what fetches and decodes the first window, so it is also where a
+                    // chunk read fails. Either way the iterator is this method's to release until it
+                    // is handed to a partition iterator that will close it.
+                    if (synthetic.hasNext())
+                    {
+                        next = synthetic(metadata, expected, reversed, synthetic);
+                        handedOn = true;
+                    }
+                    // else: no hot rows and no chunks for this key - nothing to emit, try the next key
+                }
+                finally
+                {
+                    if (!handedOn)
+                        synthetic.close();
+                }
             }
         }
         return true;
@@ -219,26 +247,43 @@ public final class ChunkMergeUnfilteredIterator implements UnfilteredPartitionIt
         return failure;
     }
 
-    private UnfilteredRowIterator merge(UnfilteredRowIterator hotPartition, List<Row> synthetic)
+    private UnfilteredRowIterator merge(UnfilteredRowIterator hotPartition, DecoratedKey key)
     {
-        if (synthetic.isEmpty())
-            return hotPartition;
+        CloseableIterator<Row> synthetic = chunkRows.apply(key);
+        boolean handedOn = false;
+        try
+        {
+            if (!synthetic.hasNext())
+                return hotPartition;                      // nothing cold here: hand the hot side back
 
-        List<UnfilteredRowIterator> sources = new ArrayList<>(2);
-        sources.add(hotPartition);
-        // isReverseOrder must match the hot iterator's own, not the wrapper's idea of it, or the
-        // merge compares clusterings in one order while a source produced them in the other.
-        sources.add(synthetic(metadata, hotPartition.partitionKey(), hotPartition.isReverseOrder(), synthetic));
-        return UnfilteredRowIterators.merge(sources);
+            List<UnfilteredRowIterator> sources = new ArrayList<>(2);
+            sources.add(hotPartition);
+            // isReverseOrder must match the hot iterator's own, not the wrapper's idea of it, or the
+            // merge compares clusterings in one order while a source produced them in the other.
+            sources.add(synthetic(metadata, hotPartition.partitionKey(), hotPartition.isReverseOrder(), synthetic));
+            UnfilteredRowIterator merged = UnfilteredRowIterators.merge(sources);
+            handedOn = true;                              // merged.close() now owns `synthetic`
+            return merged;
+        }
+        finally
+        {
+            if (!handedOn)
+                synthetic.close();
+        }
     }
 
-    /** A partition made only of chunk-decoded rows: no partition deletion, no static row, no tombstones. */
+    /**
+     * A partition made only of chunk-decoded rows: no partition deletion, no static row, no
+     * tombstones. Closing it closes {@code rows} -- that is the only thing that stops the chunk
+     * source fetching windows nobody asked for, and the reason both {@code merge}'s
+     * {@link UnfilteredRowIterators#merge(List)} (which closes its sources) and this class's own
+     * {@link #close()} are enough to keep the lazy iterator from being dropped on the floor.
+     */
     private static UnfilteredRowIterator synthetic(TableMetadata metadata,
                                                    DecoratedKey key,
                                                    boolean reversed,
-                                                   List<Row> rows)
+                                                   CloseableIterator<Row> rows)
     {
-        Iterator<Row> iterator = rows.iterator();
         return new AbstractUnfilteredRowIterator(metadata,
                                                  key,
                                                  DeletionTime.LIVE,
@@ -250,7 +295,13 @@ public final class ChunkMergeUnfilteredIterator implements UnfilteredPartitionIt
             @Override
             protected Unfiltered computeNext()
             {
-                return iterator.hasNext() ? iterator.next() : endOfData();
+                return rows.hasNext() ? rows.next() : endOfData();
+            }
+
+            @Override
+            public void close()
+            {
+                rows.close();
             }
         };
     }

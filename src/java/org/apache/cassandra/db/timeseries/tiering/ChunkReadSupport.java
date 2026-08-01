@@ -22,6 +22,7 @@ import java.nio.ByteBuffer;
 import java.util.ArrayList;
 import java.util.Collections;
 import java.util.Date;
+import java.util.Iterator;
 import java.util.List;
 import java.util.Set;
 
@@ -35,6 +36,7 @@ import org.apache.cassandra.db.timeseries.ColumnarChunkCodec;
 import org.apache.cassandra.db.timeseries.ColumnarCursor;
 import org.apache.cassandra.schema.ColumnMetadata;
 import org.apache.cassandra.schema.TableMetadata;
+import org.apache.cassandra.utils.AbstractIterator;
 import org.apache.cassandra.utils.ByteBufferUtil;
 
 /**
@@ -99,6 +101,18 @@ import org.apache.cassandra.utils.ByteBufferUtil;
  * A projected row therefore carries a <em>subset</em> of the columns its iterator declares
  * ({@code metadata.regularAndStaticColumns()}), which is always legal; the illegal direction --
  * carrying a cell for an undeclared column -- is impossible here.
+ *
+ * <h2>Laziness</h2>
+ * {@link #rowsFromChunk} hands back an {@link Iterator}, not a list, so a {@code LIMIT} satisfied
+ * part-way through a window stops building rows for the rest of it (see {@link ChunkRowSource},
+ * which stops pulling). Only the ascending case is genuinely lazy -- {@link ColumnarCursor} is
+ * forward-only, so emitting newest-first needs every row of the window in hand.
+ * <p>
+ * <b>This does not weaken the corrupt-chunk contract.</b> {@link ColumnarChunkCodec#cursor} parses
+ * and decodes the <em>whole</em> payload (header, timestamps and every projected column's data
+ * section) before it returns, so a corrupt or unreadable chunk throws out of the call below --
+ * before a single row has been emitted. A window is therefore still all-or-nothing: the caller's
+ * skip-and-warn cannot end up having already published a truncated prefix of it.
  */
 public final class ChunkReadSupport
 {
@@ -124,20 +138,21 @@ public final class ChunkReadSupport
      *                          {@code SELECT one_column} pays for one column rather than all of
      *                          them. Safe because a row left with no cells still gets primary-key
      *                          liveness below -- see the class javadoc.
-     * @return synthetic rows in the requested order
+     * @return synthetic rows in the requested order, built on demand (see the class javadoc); every
+     *         decode failure has already been raised by the time this returns
      * @throws IllegalArgumentException on a corrupt payload - callers decide whether to
      *         skip-and-warn (read path, plan R4) or propagate (tests, re-encoder)
      * @throws org.apache.cassandra.db.timeseries.UnsupportedChunkFormatException when the payload
      *         names a chunk format this build does not read; callers must NOT swallow that one -
      *         it is systematic, so skipping would silently truncate history on every read
      */
-    public static List<Row> rowsFromChunk(TableMetadata metadata,
-                                          ByteBuffer payload,
-                                          long maxRowWritetime,
-                                          long startMsInclusive,
-                                          long endMsExclusive,
-                                          boolean descending,
-                                          Set<String> projection)
+    public static Iterator<Row> rowsFromChunk(TableMetadata metadata,
+                                              ByteBuffer payload,
+                                              long maxRowWritetime,
+                                              long startMsInclusive,
+                                              long endMsExclusive,
+                                              boolean descending,
+                                              Set<String> projection)
     {
         ColumnarCursor cursor = ColumnarChunkCodec.cursor(payload, projection);
         // See the class javadoc: at max_row_writetime itself the re-encoder's own range tombstone
@@ -160,7 +175,43 @@ public final class ChunkReadSupport
             }
         }
 
-        List<Row> rows = new ArrayList<>();
+        if (descending)
+        {
+            // The cursor is forward-only, so newest-first is the one order that cannot be streamed:
+            // every row of this window has to be in hand before the first one can be emitted. Exactly
+            // what this method always did, kept bit-for-bit for the order it applies to.
+            List<Row> rows = new ArrayList<>();
+            Row row;
+            while ((row = nextRow(cursor, startMsInclusive, endMsExclusive, names, columns, cellTimestamp)) != null)
+                rows.add(row);
+            Collections.reverse(rows);
+            return rows.iterator();
+        }
+
+        return new AbstractIterator<Row>()
+        {
+            @Override
+            protected Row computeNext()
+            {
+                Row row = nextRow(cursor, startMsInclusive, endMsExclusive, names, columns, cellTimestamp);
+                return row == null ? endOfData() : row;
+            }
+        };
+    }
+
+    /**
+     * Advances {@code cursor} to the next sample inside {@code [startMsInclusive, endMsExclusive)}
+     * and builds its row.
+     *
+     * @return that row, or {@code null} once the chunk is exhausted
+     */
+    private static Row nextRow(ColumnarCursor cursor,
+                               long startMsInclusive,
+                               long endMsExclusive,
+                               List<String> names,
+                               List<ColumnMetadata> columns,
+                               long cellTimestamp)
+    {
         while (cursor.advance())
         {
             long ts = cursor.timestamp();
@@ -196,10 +247,8 @@ public final class ChunkReadSupport
                 // distinction from liveness. See the class javadoc for why that is equivalent.
                 builder.addPrimaryKeyLivenessInfo(LivenessInfo.create(cellTimestamp));
             }
-            rows.add(builder.build());
+            return builder.build();
         }
-        if (descending)
-            Collections.reverse(rows);
-        return rows;
+        return null;
     }
 }

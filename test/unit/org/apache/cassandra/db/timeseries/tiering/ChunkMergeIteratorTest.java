@@ -49,6 +49,7 @@ import org.apache.cassandra.dht.Murmur3Partitioner;
 import org.apache.cassandra.schema.ColumnMetadata;
 import org.apache.cassandra.schema.TableMetadata;
 import org.apache.cassandra.utils.ByteBufferUtil;
+import org.apache.cassandra.utils.CloseableIterator;
 
 import static org.junit.Assert.assertEquals;
 import static org.junit.Assert.assertFalse;
@@ -123,6 +124,51 @@ public class ChunkMergeIteratorTest
         {
             protected Unfiltered computeNext() { return it.hasNext() ? it.next() : endOfData(); }
         };
+    }
+
+    /**
+     * The chunk side as {@link ChunkMergeUnfilteredIterator} now takes it: an iterator it pulls from
+     * and must close, rather than a list it is handed. Counts pulls and closes so a test can assert
+     * both halves of the contract.
+     */
+    private static final class LazyChunkRows implements CloseableIterator<Row>
+    {
+        private final Iterator<Row> rows;
+        private final RuntimeException failOnFirstPull;
+        int pulls;
+        int closes;
+
+        LazyChunkRows(List<Row> rows, RuntimeException failOnFirstPull)
+        {
+            this.rows = rows.iterator();
+            this.failOnFirstPull = failOnFirstPull;
+        }
+
+        @Override
+        public boolean hasNext()
+        {
+            if (failOnFirstPull != null)
+                throw failOnFirstPull;
+            return rows.hasNext();
+        }
+
+        @Override
+        public Row next()
+        {
+            pulls++;
+            return rows.next();
+        }
+
+        @Override
+        public void close()
+        {
+            closes++;
+        }
+    }
+
+    private static LazyChunkRows lazy(List<Row> rows)
+    {
+        return new LazyChunkRows(rows, null);
     }
 
     /** Wraps a partition so a test can assert it was closed. */
@@ -213,7 +259,7 @@ public class ChunkMergeIteratorTest
         DecoratedKey k = key("t1");
         UnfilteredRowIterator hotPartition = partition(k, false, List.of(row(BASE + 1, 1.0, HOT_WT)));
         UnfilteredPartitionIterator merged = ChunkMergeUnfilteredIterator.wrap(
-            partitions(List.of(hotPartition)), List.of(k), dk -> List.of(), metadata, false);
+            partitions(List.of(hotPartition)), List.of(k), dk -> lazy(List.of()), metadata, false);
 
         assertTrue(merged.hasNext());
         assertSame("a partition with no chunk rows must not be wrapped in a merge", hotPartition, merged.next());
@@ -271,7 +317,7 @@ public class ChunkMergeIteratorTest
 
         UnfilteredPartitionIterator merged = ChunkMergeUnfilteredIterator.wrap(
             partitions(md, List.of(partition(md, k, reversed, hotRows))),
-            List.of(k), dk -> chunkRows, md, reversed);
+            List.of(k), dk -> lazy(chunkRows), md, reversed);
         assertEquals(List.of(expected), drain(md, merged));
     }
 
@@ -292,7 +338,7 @@ public class ChunkMergeIteratorTest
             partitions(List.of(partition(k2, false, List.of(row(BASE + 2, 2.0, HOT_WT))),
                                partition(k1, false, List.of(row(BASE + 1, 1.0, HOT_WT))))),
             List.of(k1, k2),                                 // ...but the expected order is t1, t2
-            dk -> List.of(row(BASE, 0.0, CHUNK_WT)), metadata, false);
+            dk -> lazy(List.of(row(BASE, 0.0, CHUNK_WT))), metadata, false);
 
         try
         {
@@ -312,7 +358,7 @@ public class ChunkMergeIteratorTest
         List<Row> chunk = List.of(row(BASE + 1, 10.0, CHUNK_WT), row(BASE + 3, 30.0, CHUNK_WT));
         UnfilteredPartitionIterator merged = ChunkMergeUnfilteredIterator.wrap(
             partitions(List.of(partition(k, false, List.of(row(BASE + 2, 20.0, HOT_WT), row(BASE + 4, 40.0, HOT_WT))))),
-            List.of(k), dk -> chunk, metadata, false);
+            List.of(k), dk -> lazy(chunk), metadata, false);
         assertEquals(List.of("t1 1:10.0 2:20.0 3:30.0 4:40.0"), drain(merged));
     }
 
@@ -323,7 +369,7 @@ public class ChunkMergeIteratorTest
         List<Row> chunk = List.of(row(BASE + 1, 999.0, CHUNK_WT));
         UnfilteredPartitionIterator merged = ChunkMergeUnfilteredIterator.wrap(
             partitions(List.of(partition(k, false, List.of(row(BASE + 1, 1.0, HOT_WT))))),
-            List.of(k), dk -> chunk, metadata, false);
+            List.of(k), dk -> lazy(chunk), metadata, false);
         assertEquals(List.of("t1 1:1.0"), drain(merged));
     }
 
@@ -334,7 +380,7 @@ public class ChunkMergeIteratorTest
         List<Row> chunk = List.of(row(BASE + 1, 10.0, CHUNK_WT), row(BASE + 2, 20.0, CHUNK_WT));
         UnfilteredPartitionIterator merged = ChunkMergeUnfilteredIterator.wrap(
             partitions(List.of()),                                   // hot has nothing at all
-            List.of(k), dk -> chunk, metadata, false);
+            List.of(k), dk -> lazy(chunk), metadata, false);
         assertEquals(List.of("t1 1:10.0 2:20.0"), drain(merged));
     }
 
@@ -350,7 +396,7 @@ public class ChunkMergeIteratorTest
         UnfilteredPartitionIterator merged = ChunkMergeUnfilteredIterator.wrap(
             partitions(List.of(partition(k1, false, List.of(row(BASE + 1, 1.0, HOT_WT))),
                                partition(k3, false, List.of(row(BASE + 3, 3.0, HOT_WT))))),
-            List.of(k1, k2, k3), chunks::get, metadata, false);
+            List.of(k1, k2, k3), dk -> lazy(chunks.get(dk)), metadata, false);
         assertEquals(List.of("t1 1:1.0", "t2 5:50.0", "t3 3:3.0"), drain(merged));
     }
 
@@ -388,7 +434,7 @@ public class ChunkMergeIteratorTest
         // outside it.
         List<Row> chunk = List.of(row(BASE + 2, 99.0, CHUNK_WT), row(BASE + 4, 44.0, CHUNK_WT));
         UnfilteredPartitionIterator merged = ChunkMergeUnfilteredIterator.wrap(
-            partitions(List.of(hotPartition)), List.of(k), dk -> chunk, metadata, false);
+            partitions(List.of(hotPartition)), List.of(k), dk -> lazy(chunk), metadata, false);
 
         String out = drain(merged).get(0);
         // The markers pass through, so the deletion information reaches Filter/reconciliation...
@@ -413,7 +459,7 @@ public class ChunkMergeIteratorTest
 
         UnfilteredPartitionIterator merged = ChunkMergeUnfilteredIterator.wrap(
             partitions(List.of(k2Hot)), List.of(k1, k2),
-            dk -> dk.equals(k1) ? List.of(row(BASE + 1, 1.0, CHUNK_WT)) : List.of(), metadata, false);
+            dk -> lazy(dk.equals(k1) ? List.of(row(BASE + 1, 1.0, CHUNK_WT)) : List.of()), metadata, false);
 
         assertTrue(merged.hasNext());
         merged.next().close();                           // take k1's synthetic partition and stop
@@ -423,6 +469,119 @@ public class ChunkMergeIteratorTest
         assertTrue("close() must release the partition it was still holding", k2Hot.closed);
     }
 
+    /**
+     * The chunk iterator is a resource now (closing it is what stops the source fetching windows the
+     * query will never emit), so every way out of {@code hasNext} has to release it -- including the
+     * three that produce no partition at all: an empty chunk side merged with a hot partition, an
+     * empty chunk side with no hot partition, and a chunk read that throws on the first pull.
+     */
+    @Test
+    public void everyChunkIteratorIsClosedEvenWhenItProducesNoPartition()
+    {
+        DecoratedKey k = key("t1");
+        UnfilteredRowIterator hotPartition = partition(k, false, List.of(row(BASE + 1, 1.0, HOT_WT)));
+
+        // (a) hot partition handed straight back because there is nothing cold for the key.
+        LazyChunkRows empty = lazy(List.of());
+        UnfilteredPartitionIterator merged = ChunkMergeUnfilteredIterator.wrap(
+            partitions(List.of(hotPartition)), List.of(k), dk -> empty, metadata, false);
+        assertTrue(merged.hasNext());
+        assertSame("a partition with no chunk rows must not be wrapped in a merge", hotPartition, merged.next());
+        assertEquals("the chunk iterator must be closed even though it yielded nothing", 1, empty.closes);
+
+        // (b) no hot partition either: the key is skipped, and its chunk iterator still closed.
+        LazyChunkRows skipped = lazy(List.of());
+        UnfilteredPartitionIterator none = ChunkMergeUnfilteredIterator.wrap(
+            partitions(List.of()), List.of(k), dk -> skipped, metadata, false);
+        assertFalse(none.hasNext());
+        assertEquals(1, skipped.closes);
+
+        // (c) the first pull throws -- a corrupt or unreadable chunk failing the query from inside
+        // the merge. The iterator is still this class's to release at that point.
+        LazyChunkRows exploding = new LazyChunkRows(List.of(), new IllegalStateException("chunk read failed"));
+        UnfilteredPartitionIterator failing = ChunkMergeUnfilteredIterator.wrap(
+            partitions(List.of()), List.of(k), dk -> exploding, metadata, false);
+        try
+        {
+            failing.hasNext();
+            fail("expected the chunk read failure to propagate");
+        }
+        catch (IllegalStateException expected)
+        {
+            assertEquals("chunk read failed", expected.getMessage());
+        }
+        assertEquals("a chunk iterator that threw must still be closed", 1, exploding.closes);
+    }
+
+    /**
+     * A limit stops the read while a merged partition is still open. Closing the wrapper must reach
+     * through to the chunk iterator -- otherwise the chunk source goes on being pullable, and the
+     * early termination that makes an unbounded tiered read affordable is only advisory.
+     */
+    @Test
+    public void closeReachesTheChunkIteratorInsideAMergedPartition()
+    {
+        DecoratedKey k = key("t1");
+        LazyChunkRows cold = lazy(List.of(row(BASE + 1, 10.0, CHUNK_WT), row(BASE + 3, 30.0, CHUNK_WT)));
+        UnfilteredPartitionIterator merged = ChunkMergeUnfilteredIterator.wrap(
+            partitions(List.of(partition(k, false, List.of(row(BASE + 2, 20.0, HOT_WT))))),
+            List.of(k), dk -> cold, metadata, false);
+
+        assertTrue(merged.hasNext());
+        UnfilteredRowIterator partition = merged.next();
+        partition.next();                                // one row, then stop: the limit is satisfied
+        assertEquals("the merged partition must still be open here", 0, cold.closes);
+        partition.close();
+        assertEquals("closing the merged partition must close the chunk iterator", 1, cold.closes);
+        merged.close();
+    }
+
+    /**
+     * The same, one level up: {@code close()} on the wrapper itself, with a synthesized (chunk-only)
+     * partition still held in {@code next}. This is the leak the earlier fix was about -- the class
+     * closes what it holds -- extended to the resource laziness introduced.
+     */
+    @Test
+    public void closeReleasesAChunkIteratorItIsStillHolding()
+    {
+        DecoratedKey k1 = key("t1");                     // fully chunked, synthesized into `next`
+        DecoratedKey k2 = key("t2");
+        LazyChunkRows cold = lazy(List.of(row(BASE + 1, 1.0, CHUNK_WT)));
+        UnfilteredPartitionIterator merged = ChunkMergeUnfilteredIterator.wrap(
+            partitions(List.of(partition(k2, false, List.of(row(BASE + 5, 5.0, HOT_WT))))),
+            List.of(k1, k2), dk -> dk.equals(k1) ? cold : lazy(List.of()), metadata, false);
+
+        assertTrue(merged.hasNext());                    // builds k1's synthetic partition into `next`
+        assertEquals(0, cold.closes);
+        merged.close();                                  // ...and never consumes it
+        assertEquals("close() must release the chunk iterator it was still holding", 1, cold.closes);
+    }
+
+    /**
+     * The point of the whole lazy path: a consumer that stops early stops pulling, so the chunk
+     * source is never asked for the rows (and therefore the windows) it would have decoded to build
+     * them. Asserted on pulls here; {@code TransparentReadTest} asserts the same thing end to end in
+     * the unit that actually costs -- payload fetches.
+     */
+    @Test
+    public void aConsumerThatStopsEarlyStopsPullingChunkRows()
+    {
+        DecoratedKey k = key("t1");
+        LazyChunkRows cold = lazy(List.of(row(BASE + 1, 10.0, CHUNK_WT),
+                                          row(BASE + 2, 20.0, CHUNK_WT),
+                                          row(BASE + 3, 30.0, CHUNK_WT)));
+        UnfilteredPartitionIterator merged = ChunkMergeUnfilteredIterator.wrap(
+            partitions(List.of()), List.of(k), dk -> cold, metadata, false);
+
+        assertTrue(merged.hasNext());
+        try (UnfilteredRowIterator partition = merged.next())
+        {
+            partition.next();                            // take exactly one row
+        }
+        assertEquals("only the rows actually consumed may be pulled from the chunk side", 1, cold.pulls);
+        merged.close();
+    }
+
     @Test
     public void keyWithNoDataAnywhereIsSkipped()
     {
@@ -430,7 +589,7 @@ public class ChunkMergeIteratorTest
         DecoratedKey k2 = key("t2");
         UnfilteredPartitionIterator merged = ChunkMergeUnfilteredIterator.wrap(
             partitions(List.of(partition(k2, false, List.of(row(BASE + 1, 1.0, HOT_WT))))),
-            List.of(k1, k2), dk -> List.of(), metadata, false);
+            List.of(k1, k2), dk -> lazy(List.of()), metadata, false);
         assertEquals(List.of("t2 1:1.0"), drain(merged));
         assertFalse(merged.hasNext());
     }

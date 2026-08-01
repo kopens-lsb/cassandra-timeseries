@@ -457,6 +457,121 @@ public class TransparentReadTest extends CQLTester
         assertNull(TransparentReads.chunkProjection(null));
     }
 
+    /**
+     * Six closed hourly windows of three samples each, plus one hot row. Enough windows that "how
+     * many did this query actually pay for" is a meaningful question.
+     */
+    private void loadSixWindowsAndReencode() throws Throwable
+    {
+        createTable("CREATE TABLE %s (tag text, ts timestamp, value double, PRIMARY KEY (tag, ts))");
+        setPolicy("{\"hot_window\":\"2h\",\"chunk_window\":\"1h\"}");
+        long writetime = 100L;
+        for (int window = 0; window < 6; window++)
+            for (int sample = 0; sample < 3; sample++)
+                execute("INSERT INTO %s (tag, ts, value) VALUES ('t1', ?, ?) USING TIMESTAMP ?",
+                        new Date(window * HOUR + sample * 10 * 60_000L), window * 10.0 + sample, writetime++);
+        // now = 9h, hot_window = 2h: everything below 7h is cold, this one is not.
+        execute("INSERT INTO %s (tag, ts, value) VALUES ('t1', ?, 99.0) USING TIMESTAMP 200",
+                new Date(7 * HOUR + 10 * 60_000L));
+        assertEquals(6L, new TieredStorageService().runOnce(KEYSPACE, currentTable(), 9 * HOUR).windowsEncoded);
+    }
+
+    /** Runs {@code query} and reports how many chunk payloads the read had to fetch to answer it. */
+    private long payloadReadsFor(String query, Object... values) throws Throwable
+    {
+        long before = ChunkRowSource.payloadReads.get();
+        execute(query, values);
+        return ChunkRowSource.payloadReads.get() - before;
+    }
+
+    /**
+     * The reason the read path is lazy at all. A query with <b>no clustering restriction</b> names
+     * every chunk in the partition -- that is what {@code LIMIT 1000} on the newest rows, or a
+     * {@code LIMIT 1} probe, looks like to the chunk table -- and {@code LIMIT} cannot run until the
+     * merge's inputs exist. Fetching and decoding every window up front therefore made an unbounded
+     * tiered read cost the whole retention period for a handful of rows.
+     * <p>
+     * Nothing about the <em>results</em> changes when that is fixed, which is exactly why this test
+     * has to count instead: without it, a future change quietly restores the eager fetch and only a
+     * benchmark notices.
+     */
+    @Test
+    public void unboundedLimitedReadDecodesOnlyTheWindowsItNeeds() throws Throwable
+    {
+        loadSixWindowsAndReencode();
+
+        // Ascending: the first window alone satisfies LIMIT 2, so the other five are never fetched.
+        assertEquals("an unbounded LIMIT 2 must not pay for the whole partition's chunks",
+                     1, payloadReadsFor("SELECT value FROM %s WHERE tag = 't1' LIMIT 2"));
+
+        // Descending: emission order is reversed, so it is the NEWEST cold window that gets decoded
+        // -- one window either way, and the right one.
+        assertEquals(1, payloadReadsFor("SELECT value FROM %s WHERE tag = 't1' ORDER BY ts DESC LIMIT 2"));
+
+        // The control: a query that really does want everything still reads every window, so the
+        // count above is early termination and not a lookup that silently stopped finding chunks.
+        assertEquals(6, payloadReadsFor("SELECT value FROM %s WHERE tag = 't1'"));
+    }
+
+    /**
+     * ...and the rows are the same rows. Early termination is only correct if it terminates after
+     * emitting exactly what the eager version emitted, in the same order, in both directions.
+     */
+    @Test
+    public void limitedReadsReturnTheSameRowsTheyAlwaysDid() throws Throwable
+    {
+        loadSixWindowsAndReencode();
+
+        UntypedResultSet asc = execute("SELECT value FROM %s WHERE tag = 't1' LIMIT 2");
+        assertEquals(2, asc.size());
+        double[] expectedAsc = { 0.0, 1.0 };              // window 0, samples 0 and 1
+        int i = 0;
+        for (UntypedResultSet.Row row : asc)
+            assertEquals(expectedAsc[i++], row.getDouble("value"), 0.0);
+
+        // Newest first: the hot row, then the newest cold sample (window 5, sample 2 = 52.0).
+        UntypedResultSet desc = execute("SELECT value FROM %s WHERE tag = 't1' ORDER BY ts DESC LIMIT 2");
+        assertEquals(2, desc.size());
+        double[] expectedDesc = { 99.0, 52.0 };
+        i = 0;
+        for (UntypedResultSet.Row row : desc)
+            assertEquals(expectedDesc[i++], row.getDouble("value"), 0.0);
+
+        // And an unlimited read is still every row, in order.
+        UntypedResultSet all = execute("SELECT value FROM %s WHERE tag = 't1'");
+        assertEquals(19, all.size());
+        i = 0;
+        for (UntypedResultSet.Row row : all)
+        {
+            double expected = i == 18 ? 99.0 : (i / 3) * 10.0 + (i % 3);
+            assertEquals("row " + i, expected, row.getDouble("value"), 0.0);
+            i++;
+        }
+    }
+
+    /**
+     * A bounded query must not have become lazier than it is entitled to be: every window its range
+     * can reach is read, and the ones beyond the range are not touched at all.
+     * <p>
+     * "Can reach" is the look-back, not the range: a chunk of width W starting at S holds
+     * {@code [S, S+W)}, so the window listing starts at {@code startMs - widestChunkWindow} and the
+     * range {@code [1h, 3h)} lists windows 0, 1 and 2. Window 0 contributes nothing (all of its rows
+     * are below 1h) but it has to be decoded to establish that -- the chunk table records where a
+     * window starts, not how wide it is. That is the bound the read path has always used; it is
+     * asserted here so that "3" stays a deliberate cost rather than a number nobody chose.
+     */
+    @Test
+    public void boundedReadStillReadsExactlyTheWindowsItsRangeCanReach() throws Throwable
+    {
+        loadSixWindowsAndReencode();
+
+        assertEquals("a range over two windows reads those two plus the one the look-back admits",
+                     3, payloadReadsFor("SELECT value FROM %s WHERE tag = 't1' AND ts >= ? AND ts < ?",
+                                        new Date(HOUR), new Date(3 * HOUR)));
+        assertEquals(6, execute("SELECT value FROM %s WHERE tag = 't1' AND ts >= ? AND ts < ?",
+                                new Date(HOUR), new Date(3 * HOUR)).size());
+    }
+
     /** @return what {@link TransparentReads#maybeWrap} does to {@code hot} for a full-partition read of 't1'. */
     private static UnfilteredPartitionIterator maybeWrapFullPartitionRead(TableMetadata metadata,
                                                                           UnfilteredPartitionIterator hot)

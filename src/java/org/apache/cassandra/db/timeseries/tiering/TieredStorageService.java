@@ -127,8 +127,11 @@ public class TieredStorageService implements TieredStorageServiceMBean
 {
     private static final Logger logger = LoggerFactory.getLogger(TieredStorageService.class);
 
-    /** Network page size for the paged scans this cycle issues (tag enumeration, per-window row reads, cold-expiry candidates). */
-    private static final int PAGE_SIZE = 5000;
+    /**
+     * Network page size for the paged scans this cycle issues (tag enumeration, per-window row reads,
+     * cold-expiry candidates), and for the read path's chunk-window listing ({@link ChunkRowSource}).
+     */
+    static final int PAGE_SIZE = 5000;
 
     public static final String MBEAN_NAME = "org.apache.cassandra.db:type=TieredStorage";
 
@@ -1116,11 +1119,12 @@ public class TieredStorageService implements TieredStorageServiceMBean
      * Runs {@code query} to completion across as many pages as needed (network page size
      * {@link #PAGE_SIZE}), via {@link QueryProcessor#instance} directly rather than the static
      * {@link QueryProcessor#process(String, ConsistencyLevel, List)} convenience method, since that
-     * overload has no way to carry a {@link PagingState} between calls. Only ever used for queries this
-     * class has already bounded to at most one tag/one window/one candidate-list -- never for an
-     * unbounded per-tag row scan (see the class javadoc).
+     * overload has no way to carry a {@link PagingState} between calls. Only ever used for queries
+     * already bounded to at most one tag/one window/one candidate-list -- never for an unbounded
+     * per-tag row scan (see the class javadoc). {@link ChunkRowSource} shares it for the read path's
+     * chunk-window listing, which is bounded the same way (one tag, one time range, no payloads).
      */
-    private static List<UntypedResultSet.Row> pagedSelect(String query, ConsistencyLevel cl, List<ByteBuffer> values)
+    static List<UntypedResultSet.Row> pagedSelect(String query, ConsistencyLevel cl, List<ByteBuffer> values)
     {
         return pagedSelect(query, cl, values, Integer.MAX_VALUE);
     }
