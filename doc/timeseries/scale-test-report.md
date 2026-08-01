@@ -2,12 +2,6 @@
 
 image cassandra-timeseries:6.0.0-it · single node in a container · 2026-07-29 18:31 UTC
 
-> **과거 실측 기록입니다 — 예제로 삼지 마십시오.** 이 실행은 `scale.metrics
-> (series text, ts timestamp, value double)`, 즉 `double` 컬럼 1개짜리 형태에서 측정한 것입니다.
-> 그 뒤 벤치마크는 실 운영 형태(`tm_tag_point`)로 옮겼습니다 — [계층화 벤치마크](tiering-benchmark.md)
-> 참고. 여기 수치는 그때 그 형태에서 나온 값이며, 형태가 다르면 재현되지 않습니다. 돌리지 않은
-> 형태로 고쳐 쓰지 않고 그대로 둡니다.
-
 - **100,000,000** — rows loaded
 - **1,000** — partitions (100,000 rows each)
 - **393 s** — load time (254,452 rows/s)
