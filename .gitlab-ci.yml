@@ -138,7 +138,14 @@ docker-image:
 
 # Release gate: boot the image that is about to be published and run the time-series CQL
 # integration test against it (docker/integration-test.sh). Nothing is published or released
-# unless this passes. Needs a Docker daemon, hence the dind service.
+# unless this passes.
+#
+# Needs a Docker daemon, and uses the HOST's via the socket the runner already mounts
+# (/var/run/docker.sock) rather than a docker:dind service. dind requires the runner to be
+# configured `privileged = true`, which this runner is not — and making a shared runner privileged
+# to serve one job is a bad trade. The socket works here because integration-test.sh never talks to
+# the Cassandra container over the network: it starts the container and drives every command through
+# `docker exec`, so the container being a sibling of this job rather than a child changes nothing.
 docker-integration-test:
   stage: integration
   timeout: 60m
@@ -146,14 +153,8 @@ docker-integration-test:
     - job: docker-image
       artifacts: true
   image: docker:27-cli
-  services:
-    - name: docker:27-dind
-      alias: docker
   variables:
-    DOCKER_HOST: tcp://docker:2376
-    DOCKER_TLS_CERTDIR: "/certs"
-    DOCKER_CERT_PATH: "/certs/client"
-    DOCKER_TLS_VERIFY: 1
+    DOCKER_HOST: unix:///var/run/docker.sock
   before_script: []
   # Mirrors docker-image's rules — see the comment on docker-image-publish.
   rules:
