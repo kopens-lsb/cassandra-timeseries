@@ -17,11 +17,15 @@
  */
 package org.apache.cassandra.db.timeseries.tiering;
 
+import java.util.List;
 import java.util.Set;
 
 import com.google.common.collect.ImmutableMap;
 import com.google.common.collect.ImmutableSet;
 
+import org.apache.cassandra.cql3.CqlBuilder;
+import org.apache.cassandra.cql3.QueryProcessor;
+import org.apache.cassandra.db.ConsistencyLevel;
 import org.apache.cassandra.db.compaction.UnifiedCompactionStrategy;
 import org.apache.cassandra.db.marshal.ByteType;
 import org.apache.cassandra.db.marshal.BytesType;
@@ -30,8 +34,6 @@ import org.apache.cassandra.db.marshal.LongType;
 import org.apache.cassandra.db.marshal.TimestampType;
 import org.apache.cassandra.schema.ColumnMetadata;
 import org.apache.cassandra.schema.CompactionParams;
-import org.apache.cassandra.schema.Schema;
-import org.apache.cassandra.schema.SchemaTransformations;
 import org.apache.cassandra.schema.TableMetadata;
 import org.apache.cassandra.schema.TableParams;
 
@@ -107,11 +109,98 @@ public final class ChunkTables
     }
 
     /**
-     * Idempotently ensures {@code base}'s chunk table exists, creating it via the normal
-     * CMS-serialized schema path if not (precedent: {@code CQLSSTableWriter.java:715}).
+     * Renders {@link #chunkTableMetadata} as the {@code CREATE TABLE IF NOT EXISTS} DDL that
+     * {@link #ensureChunkTable} executes -- the whole partition key in the base table's own order, the
+     * {@value #CLUSTERING_COLUMN} clustering column with its order, the four chunk payload columns, and
+     * the one table option the chunk table sets (its compaction strategy). Everything else is left to
+     * the CQL defaults, deliberately: the chunk table must not inherit the base table's
+     * {@code default_time_to_live}, TTL-bearing params or extensions.
+     * <p>
+     * The DDL is generated from the {@link TableMetadata} rather than from {@code base} directly, so
+     * the statement and the metadata cannot drift apart.
+     * <p>
+     * Every identifier is emitted through {@link CqlBuilder}, i.e. {@code ColumnIdentifier.maybeQuote}:
+     * the keyspace, the table and every mirrored key column may be mixed-case, a reserved word, or
+     * contain a quote, and all three sides have to survive that. (This is why the statement is built
+     * here rather than interpolated at the call site.)
+     */
+    public static String createChunkTableStatement(TableMetadata base)
+    {
+        TableMetadata chunk = chunkTableMetadata(base);
+        List<ColumnMetadata> keyColumns = chunk.partitionKeyColumns();
+        List<ColumnMetadata> clusteringColumns = chunk.clusteringColumns();
+
+        CqlBuilder builder = new CqlBuilder(512);
+        builder.append("CREATE TABLE IF NOT EXISTS ")
+               .appendQuotingIfNeeded(chunk.keyspace)
+               .append('.')
+               .appendQuotingIfNeeded(chunk.name)
+               .append(" (");
+
+        for (ColumnMetadata column : keyColumns)
+            appendColumnDefinition(builder, column);
+        for (ColumnMetadata column : clusteringColumns)
+            appendColumnDefinition(builder, column);
+        // Columns iterates in name order, which is deterministic; the create order of regular columns
+        // has no semantic effect, but a stable one keeps the emitted DDL byte-identical run to run.
+        for (ColumnMetadata column : chunk.regularColumns())
+            appendColumnDefinition(builder, column);
+
+        builder.append("PRIMARY KEY (");
+        // A single-column partition key must NOT be parenthesised -- "PRIMARY KEY ((k), c)" is legal but
+        // "PRIMARY KEY (k, c)" is what a composite-vs-simple key actually distinguishes for readers.
+        if (keyColumns.size() > 1)
+            builder.append('(')
+                   .appendWithSeparators(keyColumns, (b, c) -> b.append(c.name), ", ")
+                   .append(')');
+        else
+            builder.append(keyColumns.get(0).name);
+        for (ColumnMetadata column : clusteringColumns)
+            builder.append(", ").append(column.name);
+        builder.append("))");
+
+        builder.append(" WITH CLUSTERING ORDER BY (")
+               .appendWithSeparators(clusteringColumns, (b, c) -> c.appendNameAndOrderTo(b), ", ")
+               .append(')')
+               .append(" AND compaction = ")
+               .append(chunk.params.compaction.asMap());
+
+        return builder.toString();
+    }
+
+    private static void appendColumnDefinition(CqlBuilder builder, ColumnMetadata column)
+    {
+        // Name and type only. Deliberately not ColumnMetadata.appendCqlTo, which would also carry a
+        // mirrored key column's column mask and CHECK constraints across to the chunk table --
+        // chunkTableMetadata copies neither.
+        builder.append(column.name)
+               .append(' ')
+               .append(column.type)
+               .append(", ");
+    }
+
+    /**
+     * Idempotently ensures {@code base}'s chunk table exists, creating it by executing real
+     * {@code CREATE TABLE IF NOT EXISTS} DDL through the ordinary CQL path.
+     * <p>
+     * It has to be real DDL. TCM serializes a committed schema change into the cluster metadata log
+     * <b>as CQL text</b> ({@code SchemaTransformation.SchemaTransformationSerializer}), and a
+     * programmatic {@code SchemaTransformations.addTable(...)} does not override
+     * {@link org.apache.cassandra.schema.SchemaTransformation#cql()}, whose default return value is the
+     * literal string {@code "null"}. Submitting one therefore writes an entry that nothing can ever
+     * read back: every peer fetching the log, and this node replaying its own log after a restart,
+     * fails with {@code SyntaxException: no viable alternative at input 'null'} -- which stalls schema
+     * propagation cluster-wide from that entry onward. A {@code CreateTableStatement} parsed from text
+     * carries that text in {@code cql()}, so it round-trips. (The precedent this used to cite,
+     * {@code CQLSSTableWriter}, is the <em>offline</em> SSTable writer: no peers, no log replay.)
+     * <p>
+     * {@link QueryProcessor#process} rather than {@code executeInternal}: schema statements must go to
+     * the CMS, not just to local state. The consistency level is irrelevant to a DDL statement (schema
+     * agreement is the metadata log's job, not the read/write path's) and is never consulted. The
+     * internal {@code QueryState} carries no user, so no authorization, guardrail or auto-grant applies.
      */
     public static void ensureChunkTable(TableMetadata base)
     {
-        Schema.instance.submit(SchemaTransformations.addTable(chunkTableMetadata(base), true));
+        QueryProcessor.process(createChunkTableStatement(base), ConsistencyLevel.ONE);
     }
 }

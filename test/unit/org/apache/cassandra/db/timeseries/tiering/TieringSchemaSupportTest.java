@@ -20,15 +20,30 @@ package org.apache.cassandra.db.timeseries.tiering;
 import java.util.Date;
 import java.util.List;
 
+import com.google.common.collect.ImmutableList;
+
 import org.junit.Test;
 import org.slf4j.LoggerFactory;
 
+import org.apache.cassandra.cql3.CQLStatement;
 import org.apache.cassandra.cql3.CQLTester;
+import org.apache.cassandra.cql3.QueryProcessor;
 import org.apache.cassandra.cql3.UntypedResultSet;
 import org.apache.cassandra.db.timeseries.tiering.TieredStorageService.TierRunStats;
+import org.apache.cassandra.io.util.DataInputBuffer;
+import org.apache.cassandra.io.util.DataOutputBuffer;
 import org.apache.cassandra.schema.ColumnMetadata;
+import org.apache.cassandra.schema.Keyspaces;
 import org.apache.cassandra.schema.Schema;
+import org.apache.cassandra.schema.SchemaTransformation;
 import org.apache.cassandra.schema.TableMetadata;
+import org.apache.cassandra.service.ClientState;
+import org.apache.cassandra.tcm.ClusterMetadata;
+import org.apache.cassandra.tcm.ClusterMetadataService;
+import org.apache.cassandra.tcm.Transformation;
+import org.apache.cassandra.tcm.log.Entry;
+import org.apache.cassandra.tcm.membership.NodeVersion;
+import org.apache.cassandra.tcm.serialization.Version;
 import org.apache.cassandra.utils.ByteBufferUtil;
 
 import ch.qos.logback.classic.Level;
@@ -155,6 +170,165 @@ public class TieringSchemaSupportTest extends CQLTester
                     "WITH CLUSTERING ORDER BY (timestamp DESC) AND default_time_to_live = 5356800");
 
         assertNull(TieringPolicy.unsupportedSchemaError(metadata()));
+    }
+
+    // ---- the chunk-table DDL, and its round trip through the cluster metadata log ----
+
+    /**
+     * The single-node reduction of the SP4 Task 5 defect. TCM serializes a committed schema change into
+     * the cluster metadata log <b>as CQL text</b>, so whatever {@code ensureChunkTable} submits has to
+     * come back out of {@code SchemaTransformationSerializer.deserialize} as the same schema change --
+     * on a peer, and on this node when it replays its own log after a restart. A programmatic
+     * {@code SchemaTransformations.addTable} does not: its {@code cql()} is the literal string
+     * {@code "null"}, which nothing can parse.
+     */
+    @Test
+    public void chunkTableDdlSurvivesTheClusterMetadataLogSerializer() throws Throwable
+    {
+        createTable("CREATE TABLE %s (tag text, ts timestamp, value double, PRIMARY KEY (tag, ts))");
+        assertChunkTableEntryIsReadable(metadata());
+    }
+
+    @Test
+    public void compositeKeyChunkTableDdlSurvivesTheClusterMetadataLogSerializer() throws Throwable
+    {
+        createTable("CREATE TABLE %s (asset_id text, date text, hour int, ts timestamp, value double, " +
+                    "PRIMARY KEY ((asset_id, date, hour), ts))");
+        assertChunkTableEntryIsReadable(metadata());
+    }
+
+    @Test
+    public void mixedCaseAndReservedIdentifiersSurviveTheChunkTableDdl() throws Throwable
+    {
+        // A quoted identifier in every position the DDL has to quote: a mixed-case table name, a
+        // mixed-case key column, and a key column that is a CQL reserved word.
+        createTable(KEYSPACE,
+                    "CREATE TABLE %s (\"Asset\" text, \"table\" int, ts timestamp, value double, " +
+                    "PRIMARY KEY ((\"Asset\", \"table\"), ts))",
+                    "\"MixedCase\"");
+        TableMetadata base = Schema.instance.getTableMetadata(KEYSPACE, "MixedCase");
+        assertNotNull(base);
+        assertNull(TieringPolicy.unsupportedSchemaError(base));
+
+        String ddl = ChunkTables.createChunkTableStatement(base);
+        assertTrue(ddl, ddl.contains('"' + ChunkTables.chunkTableName("MixedCase") + '"'));
+        assertTrue(ddl, ddl.contains("\"Asset\""));
+        assertTrue(ddl, ddl.contains("\"table\""));
+
+        assertChunkTableEntryIsReadable(base);
+
+        ChunkTables.ensureChunkTable(base);
+        TableMetadata chunk = Schema.instance.getTableMetadata(KEYSPACE, ChunkTables.chunkTableName("MixedCase"));
+        assertNotNull("no chunk table was created for a mixed-case base table", chunk);
+        assertSameShape(ChunkTables.chunkTableMetadata(base), chunk);
+    }
+
+    /**
+     * What {@link ChunkTables#ensureChunkTable} actually commits, read back the way a node reads it.
+     * The assertions above test the generated DDL in isolation; this one holds {@code ensureChunkTable}
+     * itself to it, by round-tripping every entry in this node's log through
+     * {@code Transformation.Kind.toVersionedBytes}/{@code fromVersionedBytes} -- the exact per-entry
+     * work {@code SystemKeyspaceStorage} does when it persists an entry and when
+     * {@code LocalLog.replayPersisted} reads it back at startup. Against a programmatic
+     * {@code SchemaTransformations.addTable} the read side throws
+     * {@code SyntaxException: no viable alternative at input 'null'}: a peer that cannot catch up, and
+     * a node that will not come back up.
+     */
+    @Test
+    public void ensureChunkTableCommitsAReadableClusterMetadataLogEntry() throws Throwable
+    {
+        createTable("CREATE TABLE %s (asset_id text, date text, hour int, ts timestamp, value double, " +
+                    "PRIMARY KEY ((asset_id, date, hour), ts))");
+        ChunkTables.ensureChunkTable(metadata());
+
+        ImmutableList<Entry> entries = ClusterMetadataService.instance()
+                                                             .log()
+                                                             .storage()
+                                                             .getPersistedLogState()
+                                                             .entries;
+        assertTrue("no cluster metadata log entries were recorded at all", !entries.isEmpty());
+        for (Entry entry : entries)
+        {
+            Transformation.Kind kind = entry.transform.kind();
+            kind.fromVersionedBytes(kind.toVersionedBytes(entry.transform));
+        }
+    }
+
+    @Test
+    public void ddlCreatedChunkTableMatchesChunkTableMetadata() throws Throwable
+    {
+        createTable("CREATE TABLE %s (asset_id text, date text, hour int, ts timestamp, value double, " +
+                    "PRIMARY KEY ((asset_id, date, hour), ts)) " +
+                    "WITH CLUSTERING ORDER BY (ts DESC) AND default_time_to_live = 604800");
+
+        ChunkTables.ensureChunkTable(metadata());
+        TableMetadata chunk = Schema.instance.getTableMetadata(KEYSPACE, ChunkTables.chunkTableName(currentTable()));
+        assertNotNull(chunk);
+        assertSameShape(ChunkTables.chunkTableMetadata(metadata()), chunk);
+
+        // The chunk table must not inherit the base table's TTL: a chunk that expired on its own would
+        // take the only surviving copy of the rows it encodes with it.
+        assertEquals(0, chunk.params.defaultTimeToLive);
+        // The base clustering order is the base's business; the chunk table is always ASC on
+        // window_start, because every chunk query the re-encoder and the read path issue says so.
+        assertEquals("ASC", chunk.clusteringColumns().get(0).clusteringOrder().toString());
+
+        // Still idempotent, sweep after sweep -- CREATE TABLE IF NOT EXISTS, not a fresh table each time.
+        ChunkTables.ensureChunkTable(metadata());
+        assertEquals(chunk.id,
+                     Schema.instance.getTableMetadata(KEYSPACE, ChunkTables.chunkTableName(currentTable())).id);
+    }
+
+    /**
+     * Asserts that the log entry {@link ChunkTables#ensureChunkTable} would write for {@code base} can
+     * be read back: serialized exactly as TCM serializes it, then deserialized exactly as a peer (or
+     * this node, replaying its own log at startup) deserializes it, and still enacting the same change.
+     */
+    private static void assertChunkTableEntryIsReadable(TableMetadata base) throws Exception
+    {
+        String ddl = ChunkTables.createChunkTableStatement(base);
+        CQLStatement statement = QueryProcessor.getStatement(ddl, ClientState.forInternalCalls());
+        assertTrue(ddl, statement instanceof SchemaTransformation);
+
+        SchemaTransformation transformation = (SchemaTransformation) statement;
+        // The defect in one assertion: SchemaTransformation.cql() defaults to the literal "null", and
+        // this is the exact string SchemaTransformationSerializer.serialize writes into the log.
+        assertEquals(ddl, transformation.cql());
+
+        Version version = NodeVersion.CURRENT.serializationVersion();
+        SchemaTransformation decoded;
+        try (DataOutputBuffer out = new DataOutputBuffer())
+        {
+            SchemaTransformation.serializer.serialize(transformation, out, version);
+            try (DataInputBuffer in = new DataInputBuffer(out.buffer(), false))
+            {
+                decoded = SchemaTransformation.serializer.deserialize(in, version);
+            }
+        }
+
+        Keyspaces after = decoded.apply(ClusterMetadata.current());
+        assertNotNull("the re-parsed cluster metadata log entry did not create the chunk table",
+                      after.getNullable(base.keyspace).getTableNullable(ChunkTables.chunkTableName(base.name)));
+    }
+
+    private static void assertSameShape(TableMetadata expected, TableMetadata actual)
+    {
+        assertColumnsMatch("partition key", expected.partitionKeyColumns(), actual.partitionKeyColumns());
+        assertColumnsMatch("clustering", expected.clusteringColumns(), actual.clusteringColumns());
+        assertColumnsMatch("regular",
+                           ImmutableList.copyOf(expected.regularColumns()),
+                           ImmutableList.copyOf(actual.regularColumns()));
+        assertEquals(expected.params.compaction, actual.params.compaction);
+    }
+
+    private static void assertColumnsMatch(String kind, List<ColumnMetadata> expected, List<ColumnMetadata> actual)
+    {
+        assertEquals(kind + " arity", expected.size(), actual.size());
+        for (int i = 0; i < expected.size(); i++)
+        {
+            assertEquals(kind + " column " + i + " name", expected.get(i).name, actual.get(i).name);
+            assertEquals(kind + " column " + i + " type", expected.get(i).type, actual.get(i).type);
+        }
     }
 
     // ---- composite partition keys, end to end ----
