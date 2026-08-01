@@ -103,6 +103,13 @@ timeseries-tests:
     # which peers cannot parse, freezing schema propagation cluster-wide, and which the writing node
     # itself cannot replay at startup. This is the only automated proof of both; ~70s, worth it.
     - ant test-jvm-dtest-some -Dtest.name=org.apache.cassandra.distributed.test.timeseries.ChunkTableSchemaPropagationTest
+    # tiered storage across 3 nodes at RF=3: primary-range partitioning of the re-encoder (every tag
+    # encoded exactly once, no gaps and no double-encoding), coordinator-independent transparent
+    # reads, survival of the late row against the distributed range delete, node restart, and
+    # whole-dataset fidelity. Catches races a single node cannot have -- it was this suite that
+    # exposed the schema-agreement window between CREATE TABLE returning and every replica being
+    # able to serve a read of the new table.
+    - ant test-jvm-dtest-some -Dtest.name=org.apache.cassandra.distributed.test.timeseries.TieredStorageDistributedTest
 
 # Build the Testcontainers-compatible Docker image (see docker/) and publish it as a loadable tarball to
 # the GitLab GENERIC PACKAGE registry — this instance has no container registry configured (no
