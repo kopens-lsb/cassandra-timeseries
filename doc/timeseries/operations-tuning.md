@@ -7,6 +7,26 @@
 관련 문서: [계층형 저장](tiered-storage.md) · [계층화 벤치마크](tiering-benchmark.md) ·
 [코덱 bake-off](codec-bakeoff.md)
 
+대상 테이블의 형태(이 문서의 모든 예제가 이 스키마 위에서 돕니다):
+
+```sql
+CREATE TABLE pp.tm_tag_point (
+    tag_id     text,
+    timestamp  timestamp,
+    area_id    text static, asset_id text static, line_id text static,
+    opc_id     text static, site_id  text static, tag_name text static, type text static,
+    attribute  frozen<map<text,text>>, error_code int, latency int, quality int,
+    value      text, value_boolean boolean, value_numeric double,
+    PRIMARY KEY (tag_id, timestamp)
+) WITH CLUSTERING ORDER BY (timestamp DESC);
+```
+
+튜닝에 영향을 주는 성질 셋: ① `DESC` 클러스터링(최신부터 읽는 조회가 주력), ② static 7개는
+**청크화 대상이 아니므로** 계층화 후에도 베이스 테이블에 남는다 — 용량 산수는 클러스터링 행만
+따진다, ③ 판독값이 `value_boolean`/`value_numeric` 중 어디에 들어가는지는 static `type`이 정하고,
+`value`(text)는 그 문자열 사본이다. `quality`(192)·`error_code`(0)·`attribute`(`{}`)는 상수라
+청크에서 0바이트가 된다.
+
 ## 1. 왜 튜닝이 필요한가 — 용량 산수부터
 
 | | 행당 | 하루 | 62일(현재) | 5년 | **10년(3,650일)** |
@@ -136,8 +156,20 @@ ALTER TABLE pp.tm_tag_point__chunks WITH
 
 ```sql
 SELECT * FROM system_views.timeseries_tiering;   -- 정책 + 실행 통계 (창/행/바이트/지각 병합/만료)
-SELECT count(*) FROM pp.tm_tag_point WHERE tag_id='TAG_...';  -- 압축 후에도 같은 값 (투명 읽기)
+
+-- 압축 후에도 같은 값 (투명 읽기). 클러스터링 범위를 반드시 함께 건다.
+SELECT count(*) FROM pp.tm_tag_point
+ WHERE tag_id='TAG_...' AND timestamp >= '2026-07-01 00:00:00+0000'
+                        AND timestamp <  '2026-07-02 00:00:00+0000';
+
+-- static은 계층화와 무관하게 그대로 남는다 (레인지 딜리트가 닿지 않음)
+SELECT site_id, tag_name, type FROM pp.tm_tag_point WHERE tag_id='TAG_...' LIMIT 1;
 ```
+
+> **세어서 확인할 때의 함정 둘.** ① 클러스터링 범위 없이 `count(*)`를 하면, 그 태그의 행이 전부
+> 청크로 옮겨지고 청크까지 만료된 상태에서도 **1**이 나옵니다 — static만 있는 행이 남기 때문입니다.
+> ② 파티션 키 없는 풀스캔 `SELECT count(*)`는 병합하지 않습니다(범위 스캔은 핫 로우만 봅니다).
+> 전량 청크화된 테이블에서 **0**이 나오는 것이 정상이며, 계층화가 데이터를 잃은 것이 아닙니다.
 ```bash
 nodetool tieringstatus                                  # 테이블별 정책·마지막 실행·누적 통계
 nodetool retier <ks> <table>                            # 수동 1사이클 (동기)

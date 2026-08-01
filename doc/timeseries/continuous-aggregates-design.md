@@ -29,11 +29,21 @@ pre-aggregated buckets instead of re-scanning raw data every query. This is Time
 aggregate". Example intent:
 
 ```
-raw:    metrics(series, ts, value)                      -- millions of rows/day
-rollup: metrics_1h(series, bucket, avg, min, max, count) -- one row per series per hour, auto-maintained
+raw:    pp.tm_tag_point(tag_id, timestamp, latency, value_numeric, ...)  -- millions of rows/day
+rollup: pp.tm_tag_point_1h(tag_id, bucket, avg, min, max, count)        -- one row per tag per hour, auto-maintained
 ```
 
-A query then hits `metrics_1h` directly (cheap), and recent/not-yet-rolled-up data can optionally be unioned from raw.
+A query then hits `tm_tag_point_1h` directly (cheap), and recent/not-yet-rolled-up data can optionally be unioned from raw.
+
+Two properties of the real shape that a rollup design must respect:
+
+- **Only some columns can be rolled up numerically.** `value` is `text` (a string copy of the reading), so
+  it has no `avg`/`min`/`max`. The roll-uppable columns on this table are `latency` (`int`) and, for tags
+  whose static `type` is numeric, `value_numeric` (`double`). A rollup definition therefore names columns
+  explicitly rather than "aggregate everything".
+- **Static columns do not belong in the rollup.** `site_id`/`tag_name`/`type` are per-tag, not per-bucket;
+  the rollup table should either omit them or carry them as statics of its own `tag_id` partition, not
+  re-derive them per bucket.
 
 ## 2. Why Cassandra can't reuse Materialized Views
 

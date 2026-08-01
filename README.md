@@ -15,21 +15,33 @@
 
 ```sql
 -- 시간별 평균 + 빈 구간 자동 채움 — 업스트림에서는 앱이 100k행을 받아 직접 계산해야 하는 작업
-SELECT time_bucket_gapfill(1h, ts, '2024-01-01', '2024-01-02'), locf(avg(value))
-FROM ts.metrics WHERE series='cpu' GROUP BY series, time_bucket_gapfill(1h, ts, '2024-01-01', '2024-01-02');
+SELECT time_bucket_gapfill(1h, timestamp, '2026-07-01', '2026-07-02'), locf(avg(latency))
+FROM pp.tm_tag_point
+WHERE tag_id='TAG-001' AND timestamp >= '2026-07-01' AND timestamp < '2026-07-02'
+GROUP BY tag_id, time_bucket_gapfill(1h, timestamp, '2026-07-01', '2026-07-02')
+ORDER BY timestamp ASC;
 ```
 
 **2. 오래된 데이터는 자동 압축, 조회는 그대로.** 계층형 저장이 지난 데이터를 컬럼 지향 청크로 압축해 옮기고, `SELECT`는 압축 여부를 몰라도 됩니다(투명 읽기가 자동 병합).
 
-**3. 압축이 조회까지 빠르게 만듭니다.** 1억 건 실측(단일 노드, 동일 하드웨어·동일 CQL·동일 결과값) — [벤치마크 전문](doc/timeseries/tiering-benchmark.md):
+**3. 계층화는 저장 공간을 버는 기능입니다 — 조회 속도를 버는 기능이 아닙니다.** 1억 건 실측(단일 노드,
+동일 이미지·동일 노드 설정·동일 CQL·동일 결과값) — [벤치마크 전문](doc/timeseries/tiering-benchmark.md):
 
 | 항목 | 업스트림 방식(행 저장) | 이 포크(계층화) | 효과 |
 | --- | --- | --- | --- |
-| 저장 용량 | 1.47 GB | **0.70 GB** | **2.1× 절감** (풀정밀 double = 압축 최악 조건; 양자화된 실제 산업 데이터는 [코덱 실측](doc/timeseries/codec-bakeoff.md) 기준 10배 이상). 코덱 통합(Chimp128 단일화) 이전 실측이라 재측정 필요 |
-| 단일 시리즈 집계 (10만 행) | 329~524 ms | **39~100 ms** | **5~8× 빠름** |
-| 100 시리즈 시간별 평균 (1,000만 행) | 39.9 s | **5.6 s** | **7.1× 빠름** |
-| 대시보드 종합 쿼리(OHLC+p95) | 512 ms | **150 ms** | **3.4× 빠름** |
+| 저장 용량 | 1.7 GB | **1.1 GB** | **35% 절감** — 단, 이 데이터셋은 `double` 컬럼 **1개**뿐이라 v3의 핵심 이득(상수·전부-null 컬럼 O(1) 처리)이 하나도 적용되지 않는 **최악 조건**입니다 |
+| 단일 파티션 집계 | 300~524 ms | 409~488 ms | **0.72~1.13×** — 대체로 동률, 일부 느림 |
+| 100 시리즈 시간별 평균 | 39.9 s | 44.1 s | **0.90×** — 느림 |
+| gapfill 5m + interpolate | 100 ms | **45 ms** | **2.2× 빠름** — 유일한 실질 개선 |
 | 재인코딩 처리량 | — | 265k rows/s | 1억 건을 6분 만에 압축 |
+
+> **이전 판의 "질의 5~8× 가속" 주장은 철회했습니다.** 그 수치는 계층화 질의 패스가 하네스 버그로
+> **한 번도 완주한 적이 없는** 상태에서 실린 것이라 출처가 확인되지 않으며, 하네스를 고쳐 다시 재니
+> 위 표처럼 나왔습니다. 계층화의 값어치는 **디스크와 보존 기간**이지 지연 시간이 아닙니다.
+>
+> 위 수치는 압축에 **가장 불리한 모양**(고엔트로피 double 1개)에서 잰 것입니다. 실 운영 테이블
+> (`tm_tag_point` — 일반 컬럼 8개 중 상수 3개 + 전부-null 1개)에서는 단위 측정 기준 **9 B/행 → 3.39 B/행
+> (2.7×)** 이며, 같은 모양의 대규모 실측을 진행 중입니다.
 
 > 조회가 빨라지는 이유: 파티션당 10만 행을 SSTable에서 훑는 대신 **압축 청크 28개(~0.7MB)만 읽어 디코드**하기 때문입니다. IO·역직렬화가 지배적인 시계열 집계에서는 압축이 곧 속도입니다.
 
@@ -59,7 +71,7 @@ FROM ts.metrics WHERE series='cpu' GROUP BY series, time_bucket_gapfill(1h, ts, 
 | [Gap-Fill 설계 (gapfill-design.md)](doc/timeseries/gapfill-design.md) | `time_bucket_gapfill`의 CQL 문법, 보간 규칙, 가드레일 |
 | [Continuous Aggregates 설계 (continuous-aggregates-design.md)](doc/timeseries/continuous-aggregates-design.md) | 시간 버킷 롤업(연속 집계) 설계안 — 진행 중 |
 | **[풀텍스트 검색 (fulltext-search.md)](doc/timeseries/fulltext-search.md)** | SAI `LIKE` + `index_analyzer` — 로그/메시지 본문 부분문자열 검색 (한글 포함) |
-| **[계층화 벤치마크 (tiering-benchmark.md)](doc/timeseries/tiering-benchmark.md)** | 1억 건 전/후 실측 — 저장 2.1×↓(풀정밀 최악 케이스), 재인코딩 265k rows/s, 동일 결과로 질의 5~8× 가속. 저장 수치는 코덱 통합 이전 실측 |
+| **[계층화 벤치마크 (tiering-benchmark.md)](doc/timeseries/tiering-benchmark.md)** | 1억 건 전/후 실측 — 저장 35%↓(`double` 1개짜리 최악 조건), 재인코딩 265k rows/s, 질의는 동률~30% 느림(§ 핵심 3 참고) |
 | **[운영 튜닝 가이드 (operations-tuning.md)](doc/timeseries/operations-tuning.md)** | 장기 보존(10년) 전환 실전 가이드 — 용량 산수, 적용 순서, 원본·**청크 테이블** 튜닝값과 근거, TTL과 계층화의 관계, 점검 목록 |
 | **[계층형 저장 (tiered-storage.md)](doc/timeseries/tiered-storage.md)** | `timeseries_tiering` 정책·청크 재인코더 — 설정, 청크 조회 패턴, 운영(nodetool/가상 테이블), 불변식과 제한사항 |
 | **[청크 포맷 v3 (columnar-chunks.md)](doc/timeseries/columnar-chunks.md)** | 컬럼 지향 청크의 **와이어 포맷 규격** — 헤더·디렉토리·null 비트맵·타입별 인코딩, 결정성/멱등성 규칙, 스키마 진화, 크기 한계, 행당 바이트 실측 |
@@ -103,32 +115,55 @@ FROM ts.metrics WHERE series='cpu' GROUP BY series, time_bucket_gapfill(1h, ts, 
 
 ## 1. 스키마와 샘플 데이터
 
-시계열의 정석 스키마입니다. 시리즈당 파티션 하나, 시간으로 클러스터링. 컴팩션은 이 포크의 시계열 전용 전략 `TimeSeriesCompactionStrategy`(TSCS)를 씁니다 — SSTable을 시간 창으로 정렬하고, 닫힌 창은 창당 1 SSTable로 동결하며, 보존기간이 지난 창은 컴팩션 없이 통째 삭제합니다. 현재 창 내부의 컴팩션 선택은 UCS 컨트롤러에 위임되므로 UCS의 쓰기 최적 특성은 그대로 유지됩니다.
+아래 예제는 모두 산업 현장의 실제 태그 테이블 `tm_tag_point` 위에서 돕니다 — 태그당 파티션 하나, 시간으로 클러스터링, **최신 데이터가 앞**(`DESC`). 컴팩션은 이 포크의 시계열 전용 전략 `TimeSeriesCompactionStrategy`(TSCS)를 씁니다 — SSTable을 시간 창으로 정렬하고, 닫힌 창은 창당 1 SSTable로 동결하며, 보존기간이 지난 창은 컴팩션 없이 통째 삭제합니다. 현재 창 내부의 컴팩션 선택은 UCS 컨트롤러에 위임되므로 UCS의 쓰기 최적 특성은 그대로 유지됩니다.
 
 ```sql
-CREATE KEYSPACE IF NOT EXISTS ts
+CREATE KEYSPACE IF NOT EXISTS pp
   WITH replication = {'class': 'SimpleStrategy', 'replication_factor': 1};
 
-USE ts;
+USE pp;
 
-CREATE TABLE metrics (
-    series text,            -- 예: 'cpu.host1'
-    ts     timestamp,
-    value  double,
-    PRIMARY KEY (series, ts)
-) WITH CLUSTERING ORDER BY (ts ASC)
+CREATE TABLE tm_tag_point (
+    tag_id     text,                              -- 파티션 키: 태그 하나 = 파티션 하나
+    timestamp  timestamp,
+    area_id    text static, asset_id text static, line_id text static,
+    opc_id     text static, site_id  text static, tag_name text static,
+    type       text static,                       -- 'boolean' | 'long' | 'double' | ...
+    attribute  frozen<map<text,text>>,
+    error_code int,
+    latency    int,                               -- 수집 지연, 항상 존재
+    quality    int,
+    value      text,                              -- 판독값의 문자열 사본
+    value_boolean boolean,                        -- type='boolean'일 때 채워짐
+    value_numeric double,                         -- type이 숫자형일 때 채워짐
+    PRIMARY KEY (tag_id, timestamp)
+) WITH CLUSTERING ORDER BY (timestamp DESC)
    AND compaction = {'class': 'TimeSeriesCompactionStrategy',
-                     'window_size': '1h',          -- 시간 창 폭
+                     'window_size': '1d',          -- 시간 창 폭 (계층화 chunk_window와 일치)
                      'freeze_after': '2h',         -- 창이 닫히고 이 시간 후 창당 1 SSTable로 동결
                      'scaling_parameters': 'T4',   -- 현재 창 내부는 UCS 위임 (쓰기 최적 4-way)
-                     'retention': '30d'}           -- 창 상한이 30일을 지나면 통째 삭제
-   AND default_time_to_live = 2592000;   -- 30일 (retention과 병행 시 먼저 도래하는 쪽 적용)
+                     'retention': '62d'}           -- 창 상한이 62일을 지나면 통째 삭제
+   AND default_time_to_live = 5356800;   -- 62일 (retention과 병행 시 먼저 도래하는 쪽 적용)
 
-INSERT INTO metrics (series, ts, value) VALUES ('cpu', '2024-01-01 09:05:00+0000', 10);
-INSERT INTO metrics (series, ts, value) VALUES ('cpu', '2024-01-01 09:35:00+0000', 30);
-INSERT INTO metrics (series, ts, value) VALUES ('cpu', '2024-01-01 10:15:00+0000', 50);
-INSERT INTO metrics (series, ts, value) VALUES ('cpu', '2024-01-01 10:45:00+0000', 70);
+-- static은 태그당 한 번만 씁니다 (샘플마다가 아니라).
+INSERT INTO tm_tag_point (tag_id, area_id, asset_id, line_id, opc_id, site_id, tag_name, type)
+     VALUES ('TAG-001', 'A1', 'AS1', 'L1', 'OPC1', 'S1', 'boiler.temp', 'double');
+
+INSERT INTO tm_tag_point (tag_id, timestamp, attribute, error_code, latency, quality, value, value_numeric)
+     VALUES ('TAG-001', '2024-01-01 09:05:00+0000', {}, 0,  17, 192, '20.1', 20.1);
+INSERT INTO tm_tag_point (tag_id, timestamp, attribute, error_code, latency, quality, value, value_numeric)
+     VALUES ('TAG-001', '2024-01-01 09:35:00+0000', {}, 0, 431, 192, '20.8', 20.8);
+INSERT INTO tm_tag_point (tag_id, timestamp, attribute, error_code, latency, quality, value, value_numeric)
+     VALUES ('TAG-001', '2024-01-01 10:15:00+0000', {}, 0,   3, 192, '21.4', 21.4);
+INSERT INTO tm_tag_point (tag_id, timestamp, attribute, error_code, latency, quality, value, value_numeric)
+     VALUES ('TAG-001', '2024-01-01 10:45:00+0000', {}, 0, 902, 192, '22.0', 22.0);
 ```
+
+### 1.0 어느 컬럼을 집계할 수 있나 — 이 스키마 최대의 함정
+
+**`value`는 `text`라서 수치 집계가 불가능합니다.** `avg(value)`·`percentile(value, 0.95)`·`delta(value, timestamp)`는 전부 거부됩니다(수치 타입만 허용: `tinyint`/`smallint`/`int`/`bigint`/`varint`/`float`/`double`/`decimal`/`counter`). 거부보다 위험한 건 **통과하는 쪽**입니다 — `min(value)`/`max(value)`/`count(value)`는 `text`에도 동작하지만 **사전순**으로 비교하므로, `'9.1'`과 `'20.76'` 중 `max`는 `'9.1'`입니다.
+
+산술이 가능한 컬럼은 `latency`(`int`, 항상 존재 — 예제·스모크 테스트의 기본값), `value_numeric`(`double`, 수치형 태그에서만), 그리고 상수인 `error_code`·`quality`입니다. 예외는 `first`/`last`/`approx_count_distinct` — 타입을 가리지 않으므로 `first(value, timestamp)`는 `text`를 그대로 돌려줍니다.
 
 ### 1.1 TSCS 컴팩션 옵션 요약
 
@@ -147,63 +182,79 @@ INSERT INTO metrics (series, ts, value) VALUES ('cpu', '2024-01-01 10:45:00+0000
 ### 2.1 각 행에 버킷 붙이기 (스칼라로 사용)
 
 ```sql
-SELECT ts, time_bucket(1h, ts) AS bucket, value
-FROM   metrics
-WHERE  series = 'cpu';
+SELECT timestamp, time_bucket(1h, timestamp) AS bucket, latency, value
+FROM   tm_tag_point
+WHERE  tag_id = 'TAG-001';
 ```
+
+기간 인자는 **따옴표 없는 CQL duration 리터럴**(`1h`)입니다 — `time_bucket('1h', ts)`처럼 문자열로 주면 시그니처가 맞지 않아 실패합니다. 반면 origin/start/finish는 `timestamp`라서 따옴표를 씁니다.
 
 ### 2.2 `GROUP BY`로 고정 간격 다운샘플링
 
 ```sql
--- 시간별 평균 / 최소 / 최대 / 개수
-SELECT time_bucket(1h, ts) AS bucket,
-       avg(value), min(value), max(value), count(value)
-FROM   metrics
-WHERE  series = 'cpu'
-GROUP  BY series, time_bucket(1h, ts);
+-- 시간별 평균 / 최소 / 최대 / 개수 (수집 지연)
+SELECT time_bucket(1h, timestamp) AS bucket,
+       avg(latency), min(latency), max(latency), count(latency)
+FROM   tm_tag_point
+WHERE  tag_id = 'TAG-001'
+GROUP  BY tag_id, time_bucket(1h, timestamp);
+
+-- 판독값 자체 (수치형 태그)
+SELECT time_bucket(1h, timestamp) AS bucket, avg(value_numeric)
+FROM   tm_tag_point
+WHERE  tag_id = 'TAG-001'
+GROUP  BY tag_id, time_bucket(1h, timestamp);
 
 -- 다른 간격: 5분, 1일
-SELECT time_bucket(5m, ts) AS bucket, avg(value) FROM metrics
-  WHERE series = 'cpu' GROUP BY series, time_bucket(5m, ts);
+SELECT time_bucket(5m, timestamp) AS bucket, avg(latency) FROM tm_tag_point
+  WHERE tag_id = 'TAG-001' GROUP BY tag_id, time_bucket(5m, timestamp);
 
-SELECT time_bucket(1d, ts) AS bucket, avg(value) FROM metrics
-  WHERE series = 'cpu' GROUP BY series, time_bucket(1d, ts);
+SELECT time_bucket(1d, timestamp) AS bucket, avg(latency) FROM tm_tag_point
+  WHERE tag_id = 'TAG-001' GROUP BY tag_id, time_bucket(1d, timestamp);
 ```
 
-`time_bucket`은 `GROUP BY`의 **마지막 요소**(파티션 키 컬럼 뒤)로 와야 그룹핑이 읽기 경로로 내려갑니다.
+`time_bucket`은 `GROUP BY`의 **마지막 요소**(파티션 키 컬럼 뒤)로 와야 그룹핑이 읽기 경로로 내려갑니다. `DESC` 테이블에서도 그대로 동작하며, 버킷이 최신순으로 나올 뿐입니다. `int` 컬럼의 `avg`는 `int`로 절삭된다는 업스트림 규칙이 그대로 적용됩니다.
 
 ### 2.3 기준점(origin)을 옮긴 버킷
 
 ```sql
 -- 30분 밀린 1시간 버킷: [08:30, 09:30), [09:30, 10:30), ...
-SELECT time_bucket(1h, ts, '2024-01-01 00:30:00+0000') AS bucket, avg(value)
-FROM   metrics
-WHERE  series = 'cpu'
-GROUP  BY series, time_bucket(1h, ts, '2024-01-01 00:30:00+0000');
+SELECT time_bucket(1h, timestamp, '2024-01-01 00:30:00+0000') AS bucket, avg(latency)
+FROM   tm_tag_point
+WHERE  tag_id = 'TAG-001'
+GROUP  BY tag_id, time_bucket(1h, timestamp, '2024-01-01 00:30:00+0000');
 ```
 
 ## 3. 빈 구간 채우기 — `time_bucket_gapfill`
 
 일반 `time_bucket`은 **데이터가 있는 버킷만** 반환합니다. `time_bucket_gapfill`은 `[start, finish)` 범위의 **모든** 버킷에 대해 행을 만들어 주므로, 대시보드가 끊김 없는 시간축을 얻습니다. 데이터가 없는 버킷의 집계값은 기본적으로 null입니다.
 
+> **⚠️ `DESC` 테이블에서는 `ORDER BY timestamp ASC`가 필수입니다.** gap-fill의 densify는 버킷이 **오름차순**으로 도착한다고 가정하는데, 이를 강제하는 검사가 없습니다. `DESC` 클러스터링 테이블에서 정렬 없이 실행하면 행이 최신순으로 들어와 채움이 거꾸로 적용되며 **에러도 나지 않습니다**. `ORDER BY timestamp ASC`를 붙이면 `DESC` 선언과 `ASC` 요청이 상쇄되어 읽기 자체가 오름차순이 되고, 이것이 densify가 원하는 형태입니다. 이 조합은 아직 테스트로 덮여 있지 않습니다 — [gapfill-design.md §4](doc/timeseries/gapfill-design.md) 참고.
+
 ```sql
-SELECT time_bucket_gapfill(1h, ts, '2024-01-01 00:00:00+0000', '2024-01-02 00:00:00+0000'),
-       avg(value)
-FROM   metrics
-WHERE  series = 'cpu'
-GROUP  BY series, time_bucket_gapfill(1h, ts, '2024-01-01 00:00:00+0000', '2024-01-02 00:00:00+0000');
+SELECT time_bucket_gapfill(1h, timestamp, '2024-01-01 00:00:00+0000', '2024-01-02 00:00:00+0000'),
+       avg(latency)
+FROM   tm_tag_point
+WHERE  tag_id = 'TAG-001'
+  AND  timestamp >= '2024-01-01 00:00:00+0000' AND timestamp < '2024-01-02 00:00:00+0000'
+GROUP  BY tag_id, time_bucket_gapfill(1h, timestamp, '2024-01-01 00:00:00+0000', '2024-01-02 00:00:00+0000')
+ORDER  BY timestamp ASC;
 ```
+
+`WHERE timestamp >= <start>`는 장식이 아닙니다 — 스캔되는 행 중 gap-fill `start`보다 **오래된** 것이 하나라도 있으면 *"The floor function starting time is greater than the provided time"*으로 실패합니다.
 
 ### 3.1 `locf()` — 직전 값 이어가기
 
 집계를 `locf(...)`로 감싸면 빈 버킷이 null 대신 **직전 비어있지 않은 버킷의 값**을 그대로 이어받습니다(last-observation-carried-forward).
 
 ```sql
-SELECT time_bucket_gapfill(1h, ts, '2024-01-01 00:00:00+0000', '2024-01-02 00:00:00+0000'),
-       locf(avg(value))   -- 빈 버킷은 직전 시간의 평균을 반복
-FROM   metrics
-WHERE  series = 'cpu'
-GROUP  BY series, time_bucket_gapfill(1h, ts, '2024-01-01 00:00:00+0000', '2024-01-02 00:00:00+0000');
+SELECT time_bucket_gapfill(1h, timestamp, '2024-01-01 00:00:00+0000', '2024-01-02 00:00:00+0000'),
+       locf(avg(latency))   -- 빈 버킷은 직전 시간의 평균을 반복
+FROM   tm_tag_point
+WHERE  tag_id = 'TAG-001'
+  AND  timestamp >= '2024-01-01 00:00:00+0000' AND timestamp < '2024-01-02 00:00:00+0000'
+GROUP  BY tag_id, time_bucket_gapfill(1h, timestamp, '2024-01-01 00:00:00+0000', '2024-01-02 00:00:00+0000')
+ORDER  BY timestamp ASC;
 ```
 
 `locf`는 실제 데이터가 있는 행에는 아무 영향이 없습니다(인자를 그대로 반환). 첫 실제 값보다 앞선 버킷은 이어받을 값이 없으므로 null로 남습니다.
@@ -213,99 +264,103 @@ GROUP  BY series, time_bucket_gapfill(1h, ts, '2024-01-01 00:00:00+0000', '2024-
 빈 버킷을 앞뒤 값 사이에서 선형 보간하려면 `interpolate(...)`를 씁니다(결과 타입은 `double`).
 
 ```sql
-SELECT time_bucket_gapfill(1h, ts, '2024-01-01 00:00:00+0000', '2024-01-02 00:00:00+0000'),
-       interpolate(avg(value))   -- 빈 버킷은 양옆 값 사이를 직선으로 채움
-FROM   metrics
-WHERE  series = 'cpu'
-GROUP  BY series, time_bucket_gapfill(1h, ts, '2024-01-01 00:00:00+0000', '2024-01-02 00:00:00+0000');
+SELECT time_bucket_gapfill(1h, timestamp, '2024-01-01 00:00:00+0000', '2024-01-02 00:00:00+0000'),
+       interpolate(avg(value_numeric))   -- 빈 버킷은 양옆 값 사이를 직선으로 채움
+FROM   tm_tag_point
+WHERE  tag_id = 'TAG-001'
+  AND  timestamp >= '2024-01-01 00:00:00+0000' AND timestamp < '2024-01-02 00:00:00+0000'
+GROUP  BY tag_id, time_bucket_gapfill(1h, timestamp, '2024-01-01 00:00:00+0000', '2024-01-02 00:00:00+0000')
+ORDER  BY timestamp ASC;
 ```
 
 첫 실제 값 이전 / 마지막 실제 값 이후의 빈 버킷은 보간할 대상이 없으므로 null로 남습니다.
 
-### 3.3 여러 시리즈
+### 3.3 여러 태그
 
-시리즈별로 독립적으로 채워집니다. 파티션 키를 `SELECT`와 `GROUP BY` 양쪽에 포함하세요.
+태그별로 독립적으로 채워집니다. 파티션 키를 `SELECT`와 `GROUP BY` 양쪽에 포함하세요.
 
 ```sql
-SELECT series, time_bucket_gapfill(1h, ts, '2024-01-01 00:00:00+0000', '2024-01-02 00:00:00+0000'), avg(value)
-FROM   metrics WHERE series IN ('cpu', 'mem')
-GROUP  BY series, time_bucket_gapfill(1h, ts, '2024-01-01 00:00:00+0000', '2024-01-02 00:00:00+0000');
+SELECT tag_id, time_bucket_gapfill(1h, timestamp, '2024-01-01 00:00:00+0000', '2024-01-02 00:00:00+0000'),
+       avg(latency)
+FROM   tm_tag_point WHERE tag_id IN ('TAG-001', 'TAG-002')
+  AND  timestamp >= '2024-01-01 00:00:00+0000' AND timestamp < '2024-01-02 00:00:00+0000'
+GROUP  BY tag_id, time_bucket_gapfill(1h, timestamp, '2024-01-01 00:00:00+0000', '2024-01-02 00:00:00+0000')
+ORDER  BY timestamp ASC;
 ```
+
+`IN` + `ORDER BY`는 파티션을 **가로지르는** 후처리 정렬을 걸기 때문에 결과가 태그별이 아니라 버킷 기준 전역 순서로 나옵니다. 이 스키마에서는 태그 하나씩 도는 쪽이 다루기 쉽습니다.
 
 ### 3.4 제약 사항
 
 - 폭(width)은 **고정 길이**여야 합니다(월 단위 성분 불가).
-- 버킷 컬럼에 별칭(alias)을 붙이지 마세요.
+- 버킷 컬럼과 `locf(...)`/`interpolate(...)`에 **별칭(alias)을 붙이지 마세요** — 결과 메타데이터의 함수 이름으로 찾기 때문에, 별칭을 붙이면 gap-fill이 조용히 아무 일도 하지 않습니다.
+- 채울 집계는 **수치 컬럼**이어야 합니다 — `latency` 또는 `value_numeric`, `value`(text)는 불가.
 - 버킷 범위를 가로지르는 페이징은 피하세요.
 - 범위 ÷ 폭이 **1,000,000 버킷**을 넘으면 쿼리가 거부됩니다.
 
 ## 4. 최초/최종 값 — `first`, `last`
 
-```sql
--- 시리즈 시가/종가
-SELECT first(value, ts) AS day_open,
-       last(value, ts)  AS day_close
-FROM   metrics
-WHERE  series = 'cpu';
-```
-
-시간별 OHLC(시가/고가/저가/종가) 캔들:
+`first`/`last`는 값 타입을 가리지 않으므로 `text`인 `value`에도 그대로 쓸 수 있습니다 — 이 컬럼으로 서버에서 할 수 있는 몇 안 되는 일 중 하나입니다.
 
 ```sql
-SELECT time_bucket(1h, ts) AS bucket,
-       first(value, ts) AS open,
-       max(value)       AS high,
-       min(value)       AS low,
-       last(value, ts)  AS close
-FROM   metrics
-WHERE  series = 'cpu'
-GROUP  BY series, time_bucket(1h, ts);
+-- 태그의 최초/최종 판독값 (text 그대로 반환)
+SELECT first(value, timestamp) AS first_reading,
+       last(value, timestamp)  AS last_reading
+FROM   tm_tag_point
+WHERE  tag_id = 'TAG-001';
 ```
 
-`first`/`last`는 **삽입 순서가 아니라 타임스탬프 인자 기준**으로 정렬하므로, 순서가 뒤바뀐 쓰기가 있어도 시가/종가가 정확합니다.
+시간별 OHLC(시가/고가/저가/종가) 캔들 — 여기서는 **수치 컬럼**을 써야 합니다. `text`에 `max`/`min`을 걸면 사전순 비교가 됩니다:
+
+```sql
+SELECT time_bucket(1h, timestamp) AS bucket,
+       first(value_numeric, timestamp) AS open,
+       max(value_numeric)              AS high,
+       min(value_numeric)              AS low,
+       last(value_numeric, timestamp)  AS close
+FROM   tm_tag_point
+WHERE  tag_id = 'TAG-001'
+GROUP  BY tag_id, time_bucket(1h, timestamp);
+```
+
+`first`/`last`는 **삽입 순서가 아니라 타임스탬프 인자 기준**으로 정렬하므로, 순서가 뒤바뀐 쓰기가 있어도, 그리고 `DESC` 클러스터링이어도 시가/종가가 정확합니다.
 
 ## 5. 변화량 — `delta`, `rate`, `derivative`
 
 ```sql
-SELECT time_bucket(1h, ts) AS bucket,
-       delta(value, ts)      AS change,
-       rate(value, ts)       AS per_second,
-       derivative(value, ts) AS slope_per_second
-FROM   metrics
-WHERE  series = 'cpu'
-GROUP  BY series, time_bucket(1h, ts);
+SELECT time_bucket(1h, timestamp) AS bucket,
+       delta(value_numeric, timestamp)      AS change,
+       rate(value_numeric, timestamp)       AS per_second,
+       derivative(value_numeric, timestamp) AS slope_per_second
+FROM   tm_tag_point
+WHERE  tag_id = 'TAG-001'
+GROUP  BY tag_id, time_bucket(1h, timestamp);
 ```
 
 - `delta` = 버킷 내 마지막 샘플 − 첫 샘플
 - `rate` = `delta` ÷ 경과 초 (양 끝점 기준 변화율)
 - `derivative` = 최소제곱 회귀 기울기. 모든 점을 사용하므로 시계열이 비선형일 때 `rate`와 값이 달라집니다.
 
-### 5.1 카운터 처리량 — `counter_rate`
+두 번째 인자는 `timestamp` 또는 `bigint`(epoch 밀리초)여야 합니다 — `int`·`timeuuid` 시각 컬럼은 거부됩니다. 수치형이 아닌 태그라면 `value_numeric` 대신 `latency`를 넣으세요.
 
-단조 증가 카운터에는 `rate()`가 아니라 `counter_rate()`를 쓰세요. `rate()`는 카운터 리셋을 큰 음수 계단으로 오해합니다.
+### 5.1 리셋 보정 처리량 — `counter_rate`
 
-```sql
-CREATE TABLE counters (
-    series text, ts timestamp, total counter,
-    PRIMARY KEY (series, ts)
-);                                     -- counter 테이블은 TTL 불가. 쿼리 형태만 참고.
-
--- 분당 초당 요청 수
-SELECT time_bucket(1m, ts) AS minute, counter_rate(total, ts) AS req_per_sec
-FROM   counters
-WHERE  series = 'api.requests'
-GROUP  BY series, time_bucket(1m, ts);
-```
-
-### 5.2 `bigint` epoch 컬럼
-
-`delta`/`rate`/`derivative`는 `timestamp`뿐 아니라 `bigint`(epoch 밀리초) 타임스탬프도 받습니다.
+`counter_delta`/`counter_rate`는 **수치 컬럼**이면 되고 CQL `counter` 타입을 요구하지 않습니다 — 단조 증가하는 `int`/`bigint` 게이지면 충분하며, 테스트가 덮고 있는 것도 이 형태입니다. 리셋 가능성이 있으면 `rate()` 대신 이쪽을 쓰세요. `rate()`는 리셋을 큰 음수 계단으로 오해합니다.
 
 ```sql
-SELECT rate(value, ts_millis) AS per_second
-FROM   metrics_epoch
-WHERE  series = 'cpu';
+CREATE TABLE tag_counters (
+    tag_id text, timestamp timestamp, total bigint,
+    PRIMARY KEY (tag_id, timestamp)
+) WITH CLUSTERING ORDER BY (timestamp DESC);
+
+-- 분당 초당 이벤트 수 (리셋 보정)
+SELECT time_bucket(1m, timestamp) AS minute, counter_rate(total, timestamp) AS per_sec
+FROM   tag_counters
+WHERE  tag_id = 'TAG-001'
+GROUP  BY tag_id, time_bucket(1m, timestamp);
 ```
+
+`tm_tag_point`에는 단조 증가 컬럼이 없어 별도 테이블을 씁니다. CQL `counter` **타입**을 쓴 테이블은 **계층화가 아예 불가능**하다는 점도 함께 고려하세요 — 재인코더가 행을 삭제 후 재삽입하는데 삭제된 카운터는 다시 쓸 수 없기 때문입니다. `bigint` 게이지가 계층화 호환 선택지입니다.
 
 ## 6. 백분위 · SLO — `percentile`
 
@@ -426,15 +481,13 @@ SELECT time_bucket(5m, ts), count(*) FROM logs
 TWCS의 시간 정렬·통삭제와 UCS의 창 내부 컴팩션을 결합한 전용 전략입니다. 테이블 생성(또는 ALTER) 시 지정합니다:
 
 ```sql
-CREATE TABLE ts.sensor (
-  tag_id text, timestamp timestamp, value double,
-  PRIMARY KEY (tag_id, timestamp)
-) WITH compaction = {
+ALTER TABLE pp.tm_tag_point WITH compaction = {
   'class': 'TimeSeriesCompactionStrategy',
-  'window_size': '1h',           -- 시간 창 폭 (계층화 chunk_window와 맞추길 권장)
+  'window_size': '1d',           -- 시간 창 폭 (계층화 chunk_window와 반드시 일치)
   'freeze_after': '2h',          -- 창이 닫히고 이 시간이 지나면 동결(창당 1 SSTable로 수렴)
   'scaling_parameters': 'T4',    -- 현재 창 내부는 UCS에 위임 (UCS 문법 그대로)
-  'retention': '30d',            -- 선택: 창 상한이 now-30d를 지나면 컴팩션 없이 통째 삭제
+  'target_sstable_size': '256MiB',
+  'retention': '62d',            -- 선택: 창 상한이 now-62d를 지나면 컴팩션 없이 통째 삭제
   'max_future_window': '1d'      -- 선택: 미래 타임스탬프 가드 (기본 1d)
 };
 ```
@@ -445,23 +498,35 @@ CREATE TABLE ts.sensor (
 
 ## 12. 계층형 저장(tiered storage) 설정
 
-오래된 창을 컬럼 지향 청크(일반 컬럼 전부를 창의 타임스탬프 축 하나에 담습니다)로 압축해 `<테이블>__chunks`로 옮기고, **SELECT는 그대로**(투명 읽기가 핫+콜드 자동 병합) 쓰는 기능입니다. 테이블 `extensions`에 JSON 정책을 hex로 넣습니다:
+오래된 창을 컬럼 지향 청크(일반 컬럼 전부를 창의 타임스탬프 축 하나에 담습니다)로 압축해 `<테이블>__chunks`로 옮기고, **SELECT는 그대로**(투명 읽기가 핫+콜드 자동 병합) 쓰는 기능입니다. 테이블 `extensions`에 JSON 정책을 문자열로 넣습니다:
 
 ### 12.1 대상 스키마
 
 **시간축(`timestamp` 클러스터링 컬럼)이 하나인 시계열 테이블이면 형태를 가리지 않습니다.** 파티션 키는 복합이어도 되고, 일반 컬럼은 개수·타입 무관, static 컬럼은 몇 개든 그대로 보존됩니다 (static 셀은 청크화 대상이 아니고, 재인코더의 클러스터링 레인지 딜리트가 건드리지 않습니다).
 
+아래는 릴리스 게이트가 실제로 계층화를 검증하는 산업 현장 테이블입니다 — static 7개 + 일반 컬럼 8개, `DESC` 클러스터링:
+
 ```sql
-CREATE TABLE ts.tag_point (
-    tag_id     text,                    -- 파티션 키: 개수 무관 (복합 키 가능)
-    timestamp  timestamp,               -- 클러스터링 1개, timestamp (ASC/DESC 모두 가능)
-    site_id    text STATIC,             -- static 컬럼: 개수·타입 무관, 그대로 보존
-    attribute  frozen<map<text,text>>,  -- 일반 컬럼: 개수·타입 무관
-    quality    int,
-    value      double,
+CREATE TABLE pp.tm_tag_point (
+    tag_id     text,                              -- 파티션 키: 개수 무관 (복합 키 가능)
+    timestamp  timestamp,                         -- 클러스터링 1개, timestamp (ASC/DESC 모두 가능)
+    area_id    text static, asset_id text static, line_id text static,
+    opc_id     text static, site_id  text static, tag_name text static,
+    type       text static,                       -- static: 개수·타입 무관, 계층화 후에도 그대로 보존
+    attribute  frozen<map<text,text>>,            -- 항상 {} → CONSTANT (0바이트)
+    error_code int,                               -- 항상 0 → CONSTANT
+    latency    int,                               -- 고엔트로피 → zigzag varint 델타
+    quality    int,                               -- 항상 192 → CONSTANT
+    value      text,                              -- 판독값의 문자열 사본
+    value_boolean boolean,                        -- type=boolean 태그에서만 채워짐
+    value_numeric double,                         -- type이 숫자형일 때만 채워짐
     PRIMARY KEY (tag_id, timestamp)
 ) WITH CLUSTERING ORDER BY (timestamp DESC);
 ```
+
+**`DESC` 클러스터링이 산업 현장의 기본 관용구**입니다(최신부터 읽는 조회가 압도적). 투명 읽기의 경계 산술이 오름차순을 가정하면 콜드 행 0개를 **에러 없이** 돌려주므로, 양쪽 바운드와 양쪽 정렬이 통합 테스트에 고정돼 있습니다.
+
+판독값이 `value_boolean`에 들어가는지 `value_numeric`에 들어가는지는 **static `type`이 정합니다.** static이라 태그 단위로 고정되고, 청크 1개 = 태그 1개 × 창 1개이므로 한 청크 안에서 각 값 컬럼은 전부 채워져 있거나 전부 비어 있거나 둘 중 하나입니다 — 쓰이는 쪽은 전용 코덱, 쓰이지 않는 쪽은 ALL_NULL로 0바이트. `value`(text)는 그 판독값의 문자열 사본입니다(`value_numeric = 20.76` ↔ `value = '20.76'`).
 
 지원되지 않는 형태에 정책을 걸면 60초마다 **사유를 밝힌** ERROR 로그를 남기고 건너뜁니다. 거부 대상은 다섯 가지뿐입니다:
 
@@ -486,8 +551,8 @@ CREATE TABLE ts.tag_point (
 정책 JSON을 테이블 `extensions`에 그대로 넣으면 끝입니다 (hex 변환 불필요):
 
 ```sql
-ALTER TABLE ts.sensor WITH extensions = {
-  'timeseries_tiering': '{"hot_window":"1d","chunk_window":"6h","cold_window":"365d","interval":"1h"}'
+ALTER TABLE pp.tm_tag_point WITH extensions = {
+  'timeseries_tiering': '{"hot_window":"2d","chunk_window":"1d","cold_window":"3650d","interval":"1h"}'
 };
 
 -- 적용 확인 (정책과 실행 통계가 함께 보입니다)
@@ -500,15 +565,22 @@ SELECT * FROM system_views.timeseries_tiering;
 적용 후에는 60초 스위퍼가 `interval` 주기로 알아서 압축합니다. **바로 확인하고 싶으면** 수동으로 한 사이클 실행:
 
 ```bash
-nodetool retier ts sensor      # 1회 재인코딩 (동기 실행)
-nodetool tieringstatus         # 테이블별 정책·마지막 실행·누적 통계
+nodetool retier pp tm_tag_point   # 1회 재인코딩 (동기 실행, 청크 테이블이 이때 자동 생성됨)
+nodetool tieringstatus            # 테이블별 정책·마지막 실행·누적 통계
 ```
 
 ```sql
 -- 압축 결과 확인: 청크가 생기고, SELECT 결과는 그대로 (투명 읽기)
-SELECT count(*) FROM ts.sensor__chunks WHERE tag_id='pump-01';
-SELECT count(*) FROM ts.sensor        WHERE tag_id='pump-01';   -- 압축 전과 동일한 값
+SELECT count(*) FROM pp.tm_tag_point__chunks WHERE tag_id='TAG-001';
+SELECT count(*) FROM pp.tm_tag_point
+ WHERE tag_id='TAG-001' AND timestamp >= '2026-07-01 00:00:00+0000'
+                        AND timestamp <  '2026-07-02 00:00:00+0000';   -- 압축 전과 동일한 값
+
+-- static은 청크화 대상이 아니라 계층화 후에도 베이스 테이블에 그대로 남습니다
+SELECT site_id, tag_name, type FROM pp.tm_tag_point WHERE tag_id='TAG-001' LIMIT 1;
 ```
+
+> 계층화 여부를 세어서 확인할 때는 **반드시 클러스터링 범위를 거세요.** 클러스터링 행이 하나도 남지 않은 파티션에 범위 없이 `count(*)`를 하면 static만 있는 행 때문에 `1`이 나옵니다. 그리고 파티션 키 없는 풀스캔 `SELECT count(*)`는 애초에 병합하지 않으므로(범위 스캔은 핫 로우만 봅니다) 전량 청크화된 테이블에서 **0**을 돌려줍니다.
 
 ### 12.3 정책 필드
 
@@ -527,10 +599,10 @@ SELECT count(*) FROM ts.sensor        WHERE tag_id='pump-01';   -- 압축 전과
 ```sql
 -- 정책 변경: 같은 방식으로 새 JSON을 넣으면 다음 사이클부터 적용
 -- 완전히 끄기: 확장에서 키 제거 (이미 만들어진 청크는 그대로 남습니다)
-ALTER TABLE ts.sensor WITH extensions = {};
+ALTER TABLE pp.tm_tag_point WITH extensions = {};
 ```
 
-끈 뒤에도 **투명 읽기는 정책이 있어야 동작**하므로, 청크가 남은 상태에서 정책만 제거하면 과거 데이터가 조회되지 않습니다. 되돌리려면 정책을 다시 넣으세요(청크는 그대로 재사용됩니다).
+**정책을 제거해도 이미 청크에 들어간 데이터는 계속 보입니다.** 투명 읽기의 병합 판단은 현재 정책이 아니라 **실제 청크 커버리지**를 기준으로 하므로, 확장 제거는 *새 인코딩을 멈출 뿐*입니다. 같은 이유로 그 구간의 `DELETE`도 계속 거부됩니다(콜드 불변성). `hot_window`를 늘리거나 `chunk_window`를 줄여도 마찬가지로 과거 데이터가 숨겨지지 않습니다. 콜드 데이터를 실제로 없애는 방법은 `cold_window` 만료 또는 청크 테이블 `DROP`뿐입니다.
 
 운영 참고: 지각 데이터는 이미 청크화된 창에 들어와도 다음 사이클에 자동 병합됩니다(같은 타임스탬프면 나중에 들어온 행이 이김). 상세·제한사항(범위 스캔·페이징 등): [tiered-storage.md](doc/timeseries/tiered-storage.md) · 실측: [벤치마크](doc/timeseries/tiering-benchmark.md)
 

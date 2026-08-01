@@ -34,8 +34,8 @@ filled. Today the user must post-process client-side.
 
 ```sql
 -- 10:00 bucket is simply absent if no samples landed in it
-SELECT time_bucket(1h, ts) AS bucket, avg(value)
-FROM metrics WHERE series='cpu' GROUP BY series, time_bucket(1h, ts);
+SELECT time_bucket(1h, timestamp) AS bucket, avg(latency)
+FROM pp.tm_tag_point WHERE tag_id='TAG-001' GROUP BY tag_id, time_bucket(1h, timestamp);
 ```
 
 We want a continuous bucket series over `[start, finish)` with a fill policy:
@@ -68,14 +68,25 @@ and localizes the engine change to the grouping selector.
 **(A) `time_bucket_gapfill` + `locf()`/`interpolate()` (recommended)**
 
 ```sql
-SELECT time_bucket_gapfill(1h, ts, '2024-01-01 00:00:00+0000', '2024-01-02 00:00:00+0000') AS bucket,
-       locf(avg(value))        AS v_locf,
-       interpolate(avg(value)) AS v_linear
-FROM   metrics
-WHERE  series = 'cpu'
-  AND  ts >= '2024-01-01 00:00:00+0000' AND ts < '2024-01-02 00:00:00+0000'
-GROUP  BY series, time_bucket_gapfill(1h, ts, '2024-01-01 00:00:00+0000', '2024-01-02 00:00:00+0000');
+SELECT time_bucket_gapfill(1h, timestamp, '2026-07-01 00:00:00+0000', '2026-07-02 00:00:00+0000'),
+       locf(avg(latency)),
+       interpolate(avg(latency))
+FROM   pp.tm_tag_point
+WHERE  tag_id = 'TAG-001'
+  AND  timestamp >= '2026-07-01 00:00:00+0000' AND timestamp < '2026-07-02 00:00:00+0000'
+GROUP  BY tag_id, time_bucket_gapfill(1h, timestamp, '2026-07-01 00:00:00+0000', '2026-07-02 00:00:00+0000')
+ORDER  BY timestamp ASC;
 ```
+
+Three things this example is careful about, all load-bearing:
+
+- **The aggregate must be numeric.** On this table that is `latency` (`int`, always present) or, for tags
+  whose static `type` is numeric, `value_numeric` (`double`) — **not** `value`, which is `text`.
+- **`start` must not be later than any scanned row**, or the query throws *"The floor function starting
+  time is greater than the provided time"*. Hence the matching `WHERE timestamp >= <start>`.
+- **`ORDER BY timestamp ASC` is mandatory on a `DESC`-clustered table** — see §4 below. Note also that the
+  bucket column and the `locf`/`interpolate` selectors must **not** be aliased: the spec is located by
+  matching the function name in the result metadata, so an alias makes gap-fill silently do nothing.
 
 - `time_bucket_gapfill(width, ts, start, finish)` behaves like `time_bucket` for grouping but also
   declares the **dense range**; the engine emits every bucket in `[start, finish)` even when empty.
@@ -93,8 +104,22 @@ to `Cql.g` (which AGENTS.md says to treat with care). Deferred unless (A) proves
 - **Per-partition only.** locf/interpolate carry state across buckets *within a single partition key*
   (one series). They must reset at partition boundaries. This mirrors how `GroupMaker` already tracks
   group transitions.
-- **Ordering.** Requires buckets in ascending time order within the partition (clustering order). Must
-  reject or handle `ORDER BY ts DESC` for interpolation, or buffer+sort.
+- **Ordering — the sharp edge on the production schema.** `TimeBucketGapFiller.densify` assumes rows
+  arrive grouped by partition and, within a partition, by **ascending** bucket. Nothing enforces it:
+  `densify` runs unconditionally in `SelectStatement.process`, before `orderResults`, with no check on
+  the clustering order or the `ORDER BY` clause. Fed descending buckets it emits every synthetic bucket
+  first and then passes the real rows through — **wrong output, no error.**
+
+  This matters because the production idiom is `CLUSTERING ORDER BY (timestamp DESC)`. On such a table a
+  gap-fill query **must** carry `ORDER BY timestamp ASC`: a DESC declaration plus an ASC request cancel
+  out into a reversed slice filter (`SelectStatement.isReversed` computes
+  `reversed != def.isReversedType()`), so the storage engine hands `densify` ascending rows, which is
+  exactly what it wants. Without the clause the rows arrive newest-first and the fill is applied
+  backwards.
+
+  Status: no test covers gap-fill on a DESC-clustered table in either direction — every gap-fill test in
+  the tree uses an ASC table. Rejecting the unsafe combination outright (rather than relying on the
+  operator to add `ORDER BY`) is still open, and is the single highest-value follow-up here.
 - **Distributed path.** Aggregation runs at the coordinator over merged rows; the synthesized buckets
   and locf/linear fill are applied there, after merge — so no replica-side protocol change. Confirm the
   paged path: gap-fill interacts with paging (a bucket spanning a page boundary must not be filled

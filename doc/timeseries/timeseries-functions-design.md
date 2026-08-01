@@ -74,11 +74,11 @@ alongside the value* must take both as arguments.
 - Returns the bucket-start `timestamp`/`date` for the given value.
 - Semantics identical to `floor(timestamp, duration[, origin])` — implemented
   as an alias so it reuses the existing read-path GROUP BY pushdown.
-- Example:
+- Example (the duration is a bare CQL duration literal, not a quoted string):
   ```sql
-  SELECT time_bucket('1h', ts) AS hour, avg(value)
-  FROM metrics WHERE series_id = ? AND ts >= ? AND ts < ?
-  GROUP BY series_id, time_bucket('1h', ts);
+  SELECT time_bucket(1h, timestamp) AS hour, avg(latency)
+  FROM pp.tm_tag_point WHERE tag_id = ? AND timestamp >= ? AND timestamp < ?
+  GROUP BY tag_id, time_bucket(1h, timestamp);
   ```
 - Implementation: thin registration in a new `TimeSeriesFcts` delegating to
   `TimeFcts.FloorTimestampFunction` / `FloorDateFunction`. Must register the

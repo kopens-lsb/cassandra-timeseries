@@ -64,28 +64,62 @@
 거부는 **그 테이블의 계층화 전체**를 멈추며, 콜드 청크 만료도 함께 멈춥니다(§1.3). `transactional_mode`
 줄은 특히 함정이 많으니 §1.2를 반드시 읽으십시오.
 
-```sql
--- 가장 단순한 형태
-CREATE TABLE ts.sensor (
-    tag_id    text,
-    timestamp timestamp,
-    value     double,
-    PRIMARY KEY (tag_id, timestamp)
-);
+아래는 이 문서 전체에서 쓰는 실 운영 테이블입니다 — static 7개 + 일반 컬럼 8개(혼합 타입, frozen 맵
+포함) + `DESC` 클러스터링. [docker/integration-test.sh](../../docker/integration-test.sh)가 릴리스
+게이트에서 이 형태 그대로 계층화를 검증합니다.
 
--- 실 운영형: 복합 파티션 키 + static 다수 + 일반 컬럼 다수(혼합 타입) + DESC
-CREATE TABLE ts.tag_point (
+```sql
+CREATE TABLE pp.tm_tag_point (
     tag_id     text,
     timestamp  timestamp,
-    site_id    text STATIC,
-    tag_name   text STATIC,
-    attribute  frozen<map<text,text>>,
-    quality    int,
-    latency    int,
-    value      text,
+    area_id    text static, asset_id text static, line_id text static,
+    opc_id     text static, site_id  text static, tag_name text static, type text static,
+    attribute     frozen<map<text,text>>,        -- 항상 {} → CONSTANT
+    error_code    int,                           -- 항상 0 → CONSTANT
+    latency       int,                           -- 고엔트로피 작은 정수 → zigzag varint 델타
+    quality       int,                           -- 항상 192 → CONSTANT
+    value         text,                          -- 판독값의 문자열 사본 (사전/raw)
+    value_boolean boolean,                       -- type=boolean 태그에서만 채워짐 (1비트 팩)
+    value_numeric double,                        -- type이 숫자형일 때만 채워짐 (Chimp128)
     PRIMARY KEY (tag_id, timestamp)
 ) WITH CLUSTERING ORDER BY (timestamp DESC);
 ```
+
+**어느 값 컬럼이 판독값을 담는지는 static `type`이 정합니다.** `type=boolean`이면 `value_boolean`,
+`type`이 숫자형(`long`/`double` 등)이면 `value_numeric`에 들어가고, 쓰이지 않는 쪽은 `null`입니다.
+(`type=string`은 확인하지 못했습니다 — 두 타입 컬럼 모두 null일 것으로 **추정**됩니다.)
+
+`type`이 **static**, 즉 태그 단위로 고정된 속성이라는 점이 여기서 그대로 이득이 됩니다. 청크 1개는
+태그 1개 × 창 1개이므로, 한 청크 안에서 각 값 컬럼은 **전부 채워져 있거나 전부 비어 있거나** 둘 중
+하나이지 섞이지 않습니다. 즉 어느 청크든 깨끗하게 한쪽 경우에 떨어집니다 — 쓰이는 쪽은 전용 코덱
+(Chimp128 / 1비트 팩)을 타고, 쓰이지 않는 쪽은 ALL_NULL로 **0바이트**입니다.
+
+`value`(text)는 그 판독값의 **문자열 사본**입니다 — 같은 값이 타입 컬럼에 한 번, 텍스트로 또 한 번
+저장됩니다(`value_numeric = 20.76` ↔ `value = '20.76'`). 조금 놀랍지만 실제 스키마의 성질이며,
+아래 §3.3처럼 청크에서 값을 꺼낼 때 어느 쪽을 읽을지 결정하는 근거가 됩니다.
+
+`DESC` 클러스터링은 산업 현장의 기본 관용구입니다(최신 데이터부터 읽는 조회가 압도적으로 많음).
+투명 읽기의 경계 산술이 오름차순을 가정하면 **콜드 행 0개를 에러 없이** 돌려주는 버그가 되므로,
+양쪽 방향 바운드(`timestamp <`/`>`)와 양쪽 정렬(`ORDER BY timestamp ASC`/기본 DESC)이 모두 통합
+테스트에 고정돼 있습니다.
+
+static은 청크화되지 않습니다 — 재인코더의 레인지 딜리트는 클러스터링 구간만 지우고
+`Clustering.STATIC_CLUSTERING`을 건드리지 않으므로, 그 태그의 클러스터링 행이 **전부** 청크로
+옮겨진 뒤에도 static은 베이스 테이블에 그대로 남습니다:
+
+```sql
+-- 창 전체가 청크로 옮겨진 뒤 (원본 행은 물리적으로 없음)
+SELECT count(*) FROM pp.tm_tag_point
+ WHERE tag_id='TAG-001' AND timestamp >= '2026-07-01 00:00:00+0000'
+                        AND timestamp <  '2026-07-01 01:00:00+0000';   -- 투명 읽기로 원래 행 수
+
+-- static은 계층화와 무관하게 그대로
+SELECT site_id, tag_name, type FROM pp.tm_tag_point WHERE tag_id='TAG-001' LIMIT 1;
+```
+
+> 클러스터링 행이 하나도 없는(= 전부 청크로 갔고 청크도 지워진) 파티션에 `LIMIT`·클러스터링 제한
+> 없이 `SELECT count(*)`를 하면 **1**이 나옵니다 — static만 있는 행이 남아 있기 때문입니다. 계층화
+> 여부를 세어서 판단할 때는 반드시 클러스터링 범위를 함께 거세요.
 
 재인코더는 **일반 컬럼 전부**를 청크 1개에 담습니다 — 창의 타임스탬프 축을 한 번만 저장하고, 컬럼마다
 독립 섹션에 그 컬럼의 **직렬화 바이트 그대로** 넣습니다. `null` 셀은 `null`로 그대로 왕복하며(기본값으로
@@ -150,8 +184,8 @@ Accord **쓰기**는 안전합니다. `CQL3CasRequest.createWriteFragments`를 �
 **그대로 문자열로** 넣으면 됩니다 — CQL 한 줄이면 끝입니다:
 
 ```sql
-ALTER TABLE ts.sensor WITH extensions = {
-  'timeseries_tiering': '{"hot_window":"1h","chunk_window":"1h","interval":"5m"}'
+ALTER TABLE pp.tm_tag_point WITH extensions = {
+  'timeseries_tiering': '{"hot_window":"2d","chunk_window":"1d","cold_window":"3650d","interval":"1h"}'
 };
 ```
 
@@ -260,11 +294,14 @@ ALTER TABLE ts.sensor WITH extensions = {
 -- [a, b) 구간의 콜드 데이터: 구간에 걸친 창들을 window_start 범위로 가져온다.
 -- 첫 창은 a를 chunk_window 경계로 내림한 값부터 시작해야 a 직전 경계에 걸친 청크를 놓치지 않는다.
 SELECT window_start, codec, samples, payload
-FROM   ts.sensor__chunks
-WHERE  tag_id = 'pump-01'
+FROM   pp.tm_tag_point__chunks
+WHERE  tag_id = 'TAG-001'
   AND  window_start >= '2026-07-01 00:00:00+0000'   -- floor(a, chunk_window)
   AND  window_start <  '2026-07-08 00:00:00+0000';  -- b
 ```
+
+청크 테이블은 베이스 테이블의 **파티션 키만** 미러링하므로 `tm_tag_point`의 static 7개는 여기
+없습니다 — static은 애초에 청크화 대상이 아니고 베이스 테이블에 남아 있습니다(§1).
 
 ### 3.3 페이로드 디코딩 (JVM 클라이언트)
 
@@ -275,15 +312,25 @@ WHERE  tag_id = 'pump-01'
 import org.apache.cassandra.db.timeseries.ColumnarChunkCodec;
 import org.apache.cassandra.db.timeseries.ColumnarCursor;
 
-ColumnarCursor cursor = ColumnarChunkCodec.cursor(payload, Set.of("value_numeric", "quality"));
+ColumnarCursor cursor = ColumnarChunkCodec.cursor(payload, Set.of("value", "latency"));
 while (cursor.advance())
 {
-    long ts = cursor.timestamp();                       // epoch millis
-    ByteBuffer v = cursor.getBytes("value_numeric");    // null = 그 행에서 null인 셀
+    long ts = cursor.timestamp();                   // epoch millis
+    ByteBuffer v = cursor.getBytes("value");        // null = 그 행에서 null인 셀
+    ByteBuffer l = cursor.getBytes("latency");
     if (v != null)
-        handle(ts, DoubleType.instance.compose(v));     // 베이스 컬럼 타입으로 compose
+        handle(ts, UTF8Type.instance.compose(v),    // value는 text — 숫자로 쓰려면 직접 파싱
+                   l == null ? null : Int32Type.instance.compose(l));
 }
 ```
+
+프로젝션을 `{"value", "latency"}`로 좁히면 나머지 6개 컬럼의 데이터 섹션은 디코드하지 않습니다.
+수치형 태그(static `type`이 `int`/`long`/`float`/`double`)를 읽을 때는 `value_numeric`을 프로젝션에
+넣고 `DoubleType.instance.compose(...)`로 복원하면 됩니다.
+
+`value`는 **`text`**라는 점에 주의하세요 — 숫자처럼 보여도 바이트는 UTF-8 문자열이므로, 숫자로
+다루려면 클라이언트에서 직접 파싱해야 합니다. 계층화는 어느 컬럼이든 바이트 그대로 왕복시킬 뿐,
+타입을 바꿔 주지 않습니다.
 
 `getBytes`가 돌려주는 것은 **베이스 컬럼 타입의 직렬화 바이트 그대로**이므로, 그 컬럼의
 `AbstractType.compose(...)`로 그대로 복원하면 됩니다. `hasColumn`은 그 컬럼이 이 청크(그리고 프로젝션)에
@@ -431,8 +478,10 @@ WARN을 남깁니다. 반대로 **일부** 컬럼만 `null`인 행은 정상이�
 
 ### 5.1.1 지각 행 병합은 **컬럼 단위**입니다
 
-이미 청크에 들어간 타임스탬프에 대해 베이스 행이 다시 나타나면(`UPDATE t SET quality = ? WHERE ...`),
-그 행이 **실제로 셀을 가진 컬럼만** 청크 값을 덮어씁니다. 나머지 컬럼은 청크에 있던 값을 그대로
+이미 청크에 들어간 타임스탬프에 대해 베이스 행이 다시 나타나면
+(`UPDATE pp.tm_tag_point SET latency = 431 WHERE tag_id = 'TAG-001' AND timestamp = ?`),
+그 행이 **실제로 셀을 가진 컬럼만** 청크 값을 덮어씁니다. 나머지 컬럼(`value`, `quality`, …)은
+청크에 있던 값을 그대로
 유지합니다 — CQL의 셀 단위 last-write-wins와 같은 규칙이며, 행 단위로 통째 교체하면 `UPDATE`가
 언급하지 않은 컬럼이 전부 지워집니다. (같은 이유로 콜드 구간의 **삭제**는 병합으로 표현할 수 없어
 아예 거부됩니다 — §5.1.2.)
@@ -445,13 +494,19 @@ WARN을 남깁니다. 반대로 **일부** 컬럼만 `null`인 행은 정상이�
 
 | 거부되는 쓰기 | 예 |
 | --- | --- |
-| 파티션 전체 삭제 | `DELETE FROM t WHERE tag = ?` (클러스터링 경계가 없으므로 반드시 콜드 구간을 덮습니다) |
-| 레인지 삭제 | `DELETE FROM t WHERE tag = ? AND ts >= ? AND ts < ?` |
-| 행 삭제 | `DELETE FROM t WHERE tag = ? AND ts = ?` |
-| 셀 삭제 | `DELETE value FROM t WHERE ...`, `UPDATE t SET value = null WHERE ...`, `INSERT ... VALUES (..., null)` |
+| 파티션 전체 삭제 | `DELETE FROM pp.tm_tag_point WHERE tag_id = ?` (클러스터링 경계가 없으므로 반드시 콜드 구간을 덮습니다) |
+| 레인지 삭제 | `DELETE FROM pp.tm_tag_point WHERE tag_id = ? AND timestamp >= ? AND timestamp < ?` |
+| 행 삭제 | `DELETE FROM pp.tm_tag_point WHERE tag_id = ? AND timestamp = ?` |
+| 셀 삭제 | `DELETE latency FROM pp.tm_tag_point WHERE ...`, `UPDATE pp.tm_tag_point SET latency = null WHERE ...`, `INSERT ... VALUES (..., null)` |
+
+static 컬럼(`site_id`, `tag_name`, …)에 대한 쓰기·삭제는 이 규칙 **밖**입니다 — 청크화 대상이 아니라
+콜드 경계 판정에 걸리지 않으므로 언제든 갱신·삭제할 수 있습니다. 반대로 파티션 전체 `DELETE`는 static까지
+지우려는 것이더라도 클러스터링 경계가 없어 거부되므로, static만 지우려면 `DELETE site_id FROM ...`처럼
+컬럼을 지목하십시오.
 
 **허용되는 것**: 핫 윈도 안에 완전히 들어가는 삭제는 평소와 똑같이 동작합니다. 그리고 콜드 클러스터링에
-**실제 값을 쓰는 것**(지각 `UPDATE t SET quality = 7`, 과거 시각으로의 `INSERT`)도 그대로 허용됩니다 —
+**실제 값을 쓰는 것**(지각 `UPDATE pp.tm_tag_point SET latency = 7 ...`, 과거 시각으로의 `INSERT`)도
+그대로 허용됩니다 —
 다음 사이클이 컬럼 단위로 청크에 병합합니다(§5.1.1). 거부되는 것은 콜드 데이터를 **지우는** 쓰기뿐입니다.
 
 **왜 문서화가 아니라 거부인가.** 청크화된 창의 베이스 행은 이미 삭제됐고 청크가 유일한 사본입니다.
@@ -540,10 +595,10 @@ WARN을 남깁니다. 반대로 **일부** 컬럼만 `null`인 행은 정상이�
    있습니다. 클라이언트가 `USING TIMESTAMP`로 **이미 스윕된 maxWt 이하의** writetime을 지정해 행을
    넣으면, 그 행은 기존 레인지 톰스톤보다 오래된 것으로 취급되어 재인코딩 없이 사라질 수 있습니다.
    계층화 대상 테이블에는 클라이언트 지정 타임스탬프를 쓰지 마세요.
-3. **베이스 행이 전부 사라진 태그의 청크 만료**: 태그 열거가 베이스 테이블 `DISTINCT` 스캔이므로,
-   모든 행이 재인코딩·삭제된 뒤 새 쓰기가 없는 태그는 더 이상 열거되지 않고, 그 태그의 콜드 청크는
-   `cold_window`가 지나도 만료되지 않습니다 (후속 서브프로젝트에서 청크 테이블 기준 만료로 해결
-   예정).
+3. ~~**베이스 행이 전부 사라진 태그의 청크 만료**~~ — **해결됨.** `cold_window` 만료는 베이스
+   테이블이 아니라 **청크 테이블**에서 태그를 열거하므로, 모든 행이 재인코딩·삭제된 뒤 새 쓰기가
+   없는 태그의 콜드 청크도 정상 만료됩니다. (인코딩 쪽 태그 열거는 여전히 베이스 테이블
+   `DISTINCT` 스캔이지만, 인코딩할 행이 없는 태그에는 할 일도 없습니다.)
 4. **잘못된 정책 JSON**: 파싱에 실패하는 정책이 걸린 테이블은 고칠 때까지 60초 스위프마다 ERROR
    로그를 남깁니다 (조용히 무시되어 잊히는 것보다 시끄러운 쪽을 선택).
 5. **동명 테이블 DROP + CREATE**: 실행 통계가 `keyspace.table` 이름 키의 인메모리 맵이라, 같은
