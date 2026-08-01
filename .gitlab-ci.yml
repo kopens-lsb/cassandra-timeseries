@@ -225,32 +225,36 @@ release:
   image: registry.gitlab.com/gitlab-org/release-cli:latest
   rules:
     - if: $CI_COMMIT_TAG
+  # Upload the artifacts to the generic package registry before creating the release.
+  # Job artifacts expire (expire_in above), which would leave a published release pointing at
+  # dead links; packages do not. The web artifact routes (/-/jobs/...) additionally authenticate
+  # by browser session only -- they ignore PRIVATE-TOKEN and serve the login page with HTTP 200,
+  # so `curl -o x.jar` writes HTML. The package route accepts a token and a session alike.
   needs:
     - job: build-jar
-      artifacts: false
+      artifacts: true
     - job: docker-integration-test
       artifacts: false
   script:
-    - echo "Releasing $CI_COMMIT_TAG"
+    - |
+      PKG="$CI_API_V4_URL/projects/$CI_PROJECT_ID/packages/generic/cassandra-timeseries/$CI_COMMIT_TAG"
+      for f in "apache-cassandra-timeseries-${CI_COMMIT_TAG}.jar" "apache-cassandra-timeseries-${CI_COMMIT_TAG}-bin.tar.gz"; do
+        echo "uploading $f"
+        curl --fail --silent --show-error --header "JOB-TOKEN: $CI_JOB_TOKEN" \
+             --upload-file "build/$f" "$PKG/$f"
+      done
   release:
     tag_name: "$CI_COMMIT_TAG"
     description: "Industrial time-series Cassandra (base Apache Cassandra 6.0.0) — $CI_COMMIT_TAG"
     assets:
       links:
-        # The /api/v4 artifact route, over an explicit https:// built from CI_SERVER_HOST.
-        #
-        # Two things were wrong with the previous $CI_PROJECT_URL/-/jobs/artifacts/... form.
-        # $CI_PROJECT_URL resolves to http:// on this instance, and /-/jobs/artifacts/ is a *web*
-        # route that authenticates by session cookie -- a session established over https is not
-        # presented to an http URL, so clicking the link returned the login page. It returns it
-        # with HTTP 200, so `curl -o release.jar` writes an 11 KB HTML file named .jar and only
-        # fails later, in lib/.
-        #
-        # The API route accepts a PRIVATE-TOKEN header as well as a session, so the same URL works
-        # from a browser and from a script. It takes a ref name rather than a SHA: the tag and the
-        # mirror branch share the name, but they are kept at the same commit, so either resolution
-        # yields the same artifact.
+        # Generic package registry, not job artifacts. Artifacts expire (see build-jar's
+        # expire_in), which would leave a published release pointing at dead links; packages do
+        # not. The web artifact routes (/-/jobs/...) are worse still: they authenticate by browser
+        # session only, ignore PRIVATE-TOKEN, and serve the login page with HTTP 200 -- so
+        # `curl -o release.jar` writes an 11 KB HTML file named .jar and nothing fails until it is
+        # in lib/ and the node will not start. The package route accepts a token and a session alike.
         - name: "apache-cassandra-timeseries-${CI_COMMIT_TAG}-bin.tar.gz"
-          url: "https://$CI_SERVER_HOST/api/v4/projects/$CI_PROJECT_ID/jobs/artifacts/$CI_COMMIT_TAG/raw/build/apache-cassandra-timeseries-${CI_COMMIT_TAG}-bin.tar.gz?job=build-jar"
+          url: "$CI_API_V4_URL/projects/$CI_PROJECT_ID/packages/generic/cassandra-timeseries/$CI_COMMIT_TAG/apache-cassandra-timeseries-${CI_COMMIT_TAG}-bin.tar.gz"
         - name: "apache-cassandra-timeseries-${CI_COMMIT_TAG}.jar"
-          url: "https://$CI_SERVER_HOST/api/v4/projects/$CI_PROJECT_ID/jobs/artifacts/$CI_COMMIT_TAG/raw/build/apache-cassandra-timeseries-${CI_COMMIT_TAG}.jar?job=build-jar"
+          url: "$CI_API_V4_URL/projects/$CI_PROJECT_ID/packages/generic/cassandra-timeseries/$CI_COMMIT_TAG/apache-cassandra-timeseries-${CI_COMMIT_TAG}.jar"
