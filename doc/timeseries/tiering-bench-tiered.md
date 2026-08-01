@@ -1,332 +1,470 @@
-# time-series CQL scale test
+# tm_tag_point scale test
 
-image `cassandra-timeseries:6.0.0 (tiered)` · single node in a container · 2026-07-31 12:49 UTC
+image `cassandra-timeseries:6.0.0-tmtag (tiered)` · table `scale.tm_tag_point` · single node in a container · 2026-08-01 11:45 UTC
 
-- **99,999,000** rows loaded
-- **3,000** partitions (33,333 rows each)
+- **30,000,000** rows loaded
+- **600** tags (partitions), **50,000 rows per tag** = 13.9 h of history at 1 sample/1s
 - **0 s** load time (0 rows/s)
 
 ## Query times
 
 | section | query | first result row | CQL time |
 |---|---|---|---|
-| single partition (33333 rows) | count(*) | `100000` | **39 ms** |
-| single partition (33333 rows) | time_bucket 1h + avg/min/max | `2024-01-01 00:00:00 \| 55.17 \| 10.0006 \| 95.9995` | **78 ms** |
-| single partition (33333 rows) | time_bucket 5m + avg | `2024-01-01 00:00:00 \| 64.5966` | **60 ms** |
-| single partition (33333 rows) | first/last/delta/rate per hour | `2024-01-01 00:00:00 \| 50 \| 82.698 \| 32.698 \| 0.0090853` | **100 ms** |
-| single partition (33333 rows) | derivative per hour | `2024-01-01 00:00:00 \| -0.0128558` | **63 ms** |
-| single partition (33333 rows) | percentile p50/p95/p99 (whole partition) | `53.3253 \| 92.7757 \| 95.0416` | **83 ms** |
-| single partition (33333 rows) | variance/stddev (whole partition) | `805.694 \| 28.3847` | **44 ms** |
-| single partition (33333 rows) | histogram 20 buckets | `[0, 0, 0, 8627, 10363, 6234, 5173, 4609, 4284, 4093, 3977, 3` | **51 ms** |
-| single partition (33333 rows) | approx_count_distinct | `99741` | **56 ms** |
-| single partition (33333 rows) | integral + time_weighted_average | `5.31023e+06 \| 53.1029` | **64 ms** |
-| gap-fill | gapfill 1h + locf over the full span | `2024-01-01 00:00:00 \| 55.17` | **60 ms** |
-| gap-fill | gapfill 5m + interpolate over 6h | `2024-01-01 00:00:00 \| 64.5966` | **19 ms** |
-| multi-partition | 10 series, hourly avg (333330 rows) | `sensor-000000 \| 2024-01-01 00:00:00 \| 55.17` | **565 ms** |
-| multi-partition | 100 series, hourly avg (3333300 rows) | `sensor-000000 \| 2024-01-01 00:00:00 \| 55.17` | **5,600 ms** |
-| multi-partition | 100 series, p95 per series | `sensor-000000 \| 92.7757` | **4,971 ms** |
-| dashboard query | OHLC + change + p95 per hour | `2024-01-01 00:00:00 \| 3600 \| 50 \| 82.698 \| 10.0006 \| 95` | **150 ms** |
-| full table scan (100000000 rows) | count(*) over the whole table | `0` | **5 ms** |
+| single partition, aggregates over value_numeric (tag-000001, type='double', 50,000 rows scanned) | count(*) [50,000 rows] | `50000` | **346 ms** |
+| single partition, aggregates over value_numeric (tag-000001, type='double', 50,000 rows scanned) | time_bucket 1h + avg/min/max(value_numeric) [50,000 rows] | `2024-01-01 13:00:00 \| 13.7759 \| 13.3 \| 14.12` | **189 ms** |
+| single partition, aggregates over value_numeric (tag-000001, type='double', 50,000 rows scanned) | time_bucket 5m + avg(value_numeric) [50,000 rows] | `2024-01-01 13:50:00 \| 13.377` | **241 ms** |
+| single partition, aggregates over value_numeric (tag-000001, type='double', 50,000 rows scanned) | first/last/delta/rate(value_numeric) per hour [50,000 rows] | `2024-01-01 13:00:00 \| 13.73 \| 13.36 \| -0.37 \| -0.000115661` | **214 ms** |
+| single partition, aggregates over value_numeric (tag-000001, type='double', 50,000 rows scanned) | derivative(value_numeric) per hour [50,000 rows] | `2024-01-01 13:00:00 \| -7.21185e-05` | **159 ms** |
+| single partition, aggregates over value_numeric (tag-000001, type='double', 50,000 rows scanned) | percentile p50/p95/p99(value_numeric) [50,000 rows] | `13.54 \| 14.19 \| 14.34` | **174 ms** |
+| single partition, aggregates over value_numeric (tag-000001, type='double', 50,000 rows scanned) | variance/stddev(value_numeric) [50,000 rows] | `0.166332 \| 0.407838` | **156 ms** |
+| single partition, aggregates over value_numeric (tag-000001, type='double', 50,000 rows scanned) | histogram(value_numeric, 0, 100, 20) [50,000 rows] | `[0, 0, 0, 50000, 0, 0, 0,~` | **190 ms** |
+| single partition, aggregates over value_numeric (tag-000001, type='double', 50,000 rows scanned) | approx_count_distinct(value_numeric) [50,000 rows] | `186` | **151 ms** |
+| single partition, aggregates over value_numeric (tag-000001, type='double', 50,000 rows scanned) | integral + time_weighted_average(value_numeric) [50,000 rows] | `676893 \| 13.5381` | **4,666 ms** |
+| single partition, aggregates over value_numeric (tag-000001, type='double', 50,000 rows scanned) | SECONDARY: time_bucket 1h + avg/min/max(latency) [50,000 rows] | `2024-01-01 13:00:00 \| 491 \| 1 \| 999` | **169 ms** |
+| row reads (all 16 columns vs. projections) -- type-independent | newest 1000 rows, SELECT * -- type='boolean' tag (tag-000000) | `tag-000000 \| 2024-01-01 13:53:19 \| area-a \| asset-0000 \| line-01 \` | **212 ms** |
+| row reads (all 16 columns vs. projections) -- type-independent | newest 1000 rows, SELECT * -- type='double' tag (tag-000001) | `tag-000001 \| 2024-01-01 13:53:19 \| area-b \| asset-0001 \| line-02 \` | **167 ms** |
+| row reads (all 16 columns vs. projections) -- type-independent | 1 hour of rows, SELECT * (all columns) [3,600 rows] | `tag-000001 \| 2024-01-01 00:59:59 \| area-b \| asset-0001 \| line-02 \` | **199 ms** |
+| row reads (all 16 columns vs. projections) -- type-independent | 1 hour of rows, project timestamp+value only [3,600 rows] | `2024-01-01 00:59:59 \| 13.58` | **40 ms** |
+| row reads (all 16 columns vs. projections) -- type-independent | 1 hour of rows, project timestamp+value_numeric only [3,600 rows] | `2024-01-01 00:59:59 \| 13.58` | **64 ms** |
+| row reads (all 16 columns vs. projections) -- type-independent | static columns only (1 row) | `tag-000001 \| busan \| area-b \| line-02 \| asset-0001 \| opc-01 \| PL` | **95 ms** |
+| row reads (all 16 columns vs. projections) -- type-independent | column presence, type='boolean' tag [50,000 rows] | `50000 \| 50000 \| 0 \| 50000 \| 50000 \| 50000` | **325 ms** |
+| row reads (all 16 columns vs. projections) -- type-independent | column presence, type='double' tag [50,000 rows] | `50000 \| 50000 \| 50000 \| 0 \| 50000 \| 50000` | **263 ms** |
+| gap-fill (locf/interpolate over avg(value_numeric), numeric tag tag-000001) | gapfill 1h + locf over the full 13h span [50,000 rows] | `2024-01-01 00:00:00 \| 13.63` | **143 ms** |
+| gap-fill (locf/interpolate over avg(value_numeric), numeric tag tag-000001) | gapfill 5m + interpolate over 6h [21,600 rows] | `2024-01-01 00:00:00 \| 13.7812` | **46 ms** |
+| multi-partition (numeric-typed tags only -- 109 of 600 tags are numeric) | 10 numeric tags, hourly avg(value_numeric) [500,000 rows] | `tag-000001 \| 2024-01-01 13:00:00 \| 13.7759` | **1,904 ms** |
+| multi-partition (numeric-typed tags only -- 109 of 600 tags are numeric) | 100 numeric tags, hourly avg(value_numeric) [5,000,000 rows] | `tag-000001 \| 2024-01-01 13:00:00 \| 13.7759` | **17,282 ms** |
+| multi-partition (numeric-typed tags only -- 109 of 600 tags are numeric) | 100 numeric tags, p95(value_numeric) per tag [5,000,000 rows] | `tag-000001 \| 14.19` | **15,349 ms** |
+| dashboard query (numeric tag tag-000001) | OHLC + change + p95 of value_numeric per hour [50,000 rows] | `2024-01-01 13:00:00 \| 3200 \| 13.73 \| 13.36 \| 13.3 \| 14.12 \| 13.7` | **352 ms** |
+| full table scan (30,000,000 rows) -- WRONG ANSWER on a tiered table (known limitation) | count(*) over the whole table | `600` | **53 ms** |
 
 ## Details
 
-### single partition (33333 rows)
+### single partition, aggregates over value_numeric (tag-000001, type='double', 50,000 rows scanned)
 
-**count(*)** — `39 ms`
+**count(*) [50,000 rows]** — `346 ms`
 
 ```sql
-SELECT count(*) FROM scale.metrics WHERE series='sensor-000000';
+SELECT count(*) FROM scale.tm_tag_point WHERE tag_id='tag-000001';
 ```
 
 ```
 count
 -----
-100000
+50000
 (1 rows)
 ```
 
-**time_bucket 1h + avg/min/max** — `78 ms`
+**time_bucket 1h + avg/min/max(value_numeric) [50,000 rows]** — `189 ms`
 
 ```sql
-SELECT time_bucket(1h, ts), avg(value), min(value), max(value) FROM scale.metrics WHERE series='sensor-000000' GROUP BY series, time_bucket(1h, ts);
+SELECT time_bucket(1h, timestamp), avg(value_numeric), min(value_numeric), max(value_numeric) FROM scale.tm_tag_point WHERE tag_id='tag-000001' GROUP BY tag_id, time_bucket(1h, timestamp);
 ```
 
 ```
-system_time_bucket_1h__ts | system_avg_value | system_min_value | system_max_value
---------------------------+------------------+------------------+-----------------
-2024-01-01 00:00:00 | 55.17 | 10.0006 | 95.9995
-2024-01-01 01:00:00 | 57.8219 | 10.0006 | 96
-2024-01-01 02:00:00 | 56.6966 | 10.0002 | 95.9997
-2024-01-01 03:00:00 | 52.6745 | 10 | 95.9992
-2024-01-01 04:00:00 | 48.9073 | 10.0002 | 95.9996
-2024-01-01 05:00:00 | 48.3472 | 10.0006 | 95.9999
-2024-01-01 06:00:00 | 51.4319 | 10.0001 | 96
-2024-01-01 07:00:00 | 55.742 | 10 | 95.9997
-... (28 rows total)
+system_time_bucket_1h__timestamp | system_avg_value_numeric | system_min_value_numeric | system_max_value_numeric
+---------------------------------+--------------------------+--------------------------+-------------------------
+2024-01-01 13:00:00 | 13.7759 | 13.3 | 14.12
+2024-01-01 12:00:00 | 13.8408 | 13.5 | 14.11
+2024-01-01 11:00:00 | 14.151 | 13.66 | 14.44
+2024-01-01 10:00:00 | 14.0014 | 13.68 | 14.35
+2024-01-01 09:00:00 | 13.9908 | 13.79 | 14.21
+2024-01-01 08:00:00 | 13.7399 | 13.4 | 14.08
+... (14 rows total)
 ```
 
-**time_bucket 5m + avg** — `60 ms`
+**time_bucket 5m + avg(value_numeric) [50,000 rows]** — `241 ms`
 
 ```sql
-SELECT time_bucket(5m, ts), avg(value) FROM scale.metrics WHERE series='sensor-000000' GROUP BY series, time_bucket(5m, ts);
+SELECT time_bucket(5m, timestamp), avg(value_numeric) FROM scale.tm_tag_point WHERE tag_id='tag-000001' GROUP BY tag_id, time_bucket(5m, timestamp);
 ```
 
 ```
-system_time_bucket_5m__ts | system_avg_value
---------------------------+-----------------
-2024-01-01 00:00:00 | 64.5966
-2024-01-01 00:05:00 | 83.834
-2024-01-01 00:10:00 | 92.2979
-2024-01-01 00:15:00 | 87.0327
-2024-01-01 00:20:00 | 69.8789
-2024-01-01 00:25:00 | 46.83
-2024-01-01 00:30:00 | 25.9388
-2024-01-01 00:35:00 | 14.481
-... (334 rows total)
+system_time_bucket_5m__timestamp | system_avg_value_numeric
+---------------------------------+-------------------------
+2024-01-01 13:50:00 | 13.377
+2024-01-01 13:45:00 | 13.459
+2024-01-01 13:40:00 | 13.5931
+2024-01-01 13:35:00 | 13.8646
+2024-01-01 13:30:00 | 14.0038
+2024-01-01 13:25:00 | 14.0415
+... (167 rows total)
 ```
 
-**first/last/delta/rate per hour** — `100 ms`
+**first/last/delta/rate(value_numeric) per hour [50,000 rows]** — `214 ms`
 
 ```sql
-SELECT time_bucket(1h, ts), first(value, ts), last(value, ts), delta(value, ts), rate(value, ts) FROM scale.metrics WHERE series='sensor-000000' GROUP BY series, time_bucket(1h, ts);
+SELECT time_bucket(1h, timestamp), first(value_numeric, timestamp), last(value_numeric, timestamp), delta(value_numeric, timestamp), rate(value_numeric, timestamp) FROM scale.tm_tag_point WHERE tag_id='tag-000001' GROUP BY tag_id, time_bucket(1h, timestamp);
 ```
 
 ```
-system_time_bucket_1h__ts | system_first_value__ts | system_last_value__ts | system_delta_value__ts | system_rate_value__ts
---------------------------+------------------------+-----------------------+------------------------+----------------------
-2024-01-01 00:00:00 | 50 | 82.698 | 32.698 | 0.0090853
-2024-01-01 01:00:00 | 83.7467 | 91.647 | 7.9003 | 0.00219514
-2024-01-01 02:00:00 | 92.6263 | 70.3239 | -22.3024 | -0.00619682
-2024-01-01 03:00:00 | 71.25 | 29.9977 | -41.2524 | -0.0114622
-2024-01-01 04:00:00 | 30.9284 | 12.3392 | -18.5893 | -0.00516512
-2024-01-01 05:00:00 | 13.3288 | 25.7469 | 12.418 | 0.00345041
-2024-01-01 06:00:00 | 26.8036 | 61.2852 | 34.4816 | 0.00958089
-2024-01-01 07:00:00 | 55.3645 | 85.6836 | 30.3191 | 0.00842432
-... (28 rows total)
+system_time_bucket_1h__timestamp | system_first_value_numeric__timestamp | system_last_value_numeric__timestamp | system_delta_value_numeric__timestamp | system_rate_value_numeric__timestamp
+---------------------------------+---------------------------------------+--------------------------------------+---------------------------------------+-------------------------------------
+2024-01-01 13:00:00 | 13.73 | 13.36 | -0.37 | -0.000115661
+2024-01-01 12:00:00 | 14.05 | 13.73 | -0.32 | -8.89136e-05
+2024-01-01 11:00:00 | 14.19 | 14.05 | -0.14 | -3.88997e-05
+2024-01-01 10:00:00 | 13.9 | 14.19 | 0.29 | 8.05779e-05
+2024-01-01 09:00:00 | 14.04 | 13.91 | -0.13 | -3.61211e-05
+2024-01-01 08:00:00 | 13.4 | 14.05 | 0.65 | 0.000180606
+... (14 rows total)
 ```
 
-**derivative per hour** — `63 ms`
+**derivative(value_numeric) per hour [50,000 rows]** — `159 ms`
 
 ```sql
-SELECT time_bucket(1h, ts), derivative(value, ts) FROM scale.metrics WHERE series='sensor-000000' GROUP BY series, time_bucket(1h, ts);
+SELECT time_bucket(1h, timestamp), derivative(value_numeric, timestamp) FROM scale.tm_tag_point WHERE tag_id='tag-000001' GROUP BY tag_id, time_bucket(1h, timestamp);
 ```
 
 ```
-system_time_bucket_1h__ts | system_derivative_value__ts
---------------------------+----------------------------
-2024-01-01 00:00:00 | -0.0128558
-2024-01-01 01:00:00 | -0.00280025
-2024-01-01 02:00:00 | 0.00945131
-2024-01-01 03:00:00 | 0.0142998
-2024-01-01 04:00:00 | 0.00794522
-2024-01-01 05:00:00 | -0.00463271
-2024-01-01 06:00:00 | -0.0135792
-2024-01-01 07:00:00 | -0.0118909
-... (28 rows total)
+system_time_bucket_1h__timestamp | system_derivative_value_numeric__timestamp
+---------------------------------+-------------------------------------------
+2024-01-01 13:00:00 | -7.21185e-05
+2024-01-01 12:00:00 | -5.88177e-05
+2024-01-01 11:00:00 | -0.00016502
+2024-01-01 10:00:00 | 0.000131532
+2024-01-01 09:00:00 | -2.67674e-05
+2024-01-01 08:00:00 | 0.000128848
+... (14 rows total)
 ```
 
-**percentile p50/p95/p99 (whole partition)** — `83 ms`
+**percentile p50/p95/p99(value_numeric) [50,000 rows]** — `174 ms`
 
 ```sql
-SELECT percentile(value, 0.5), percentile(value, 0.95), percentile(value, 0.99) FROM scale.metrics WHERE series='sensor-000000';
+SELECT percentile(value_numeric, 0.5), percentile(value_numeric, 0.95), percentile(value_numeric, 0.99) FROM scale.tm_tag_point WHERE tag_id='tag-000001';
 ```
 
 ```
-system_percentile_value__0_5 | system_percentile_value__0_95 | system_percentile_value__0_99
------------------------------+-------------------------------+------------------------------
-53.3253 | 92.7757 | 95.0416
+system_percentile_value_numeric__0_5 | system_percentile_value_numeric__0_95 | system_percentile_value_numeric__0_99
+-------------------------------------+---------------------------------------+--------------------------------------
+13.54 | 14.19 | 14.34
 (1 rows)
 ```
 
-**variance/stddev (whole partition)** — `44 ms`
+**variance/stddev(value_numeric) [50,000 rows]** — `156 ms`
 
 ```sql
-SELECT variance(value), stddev(value) FROM scale.metrics WHERE series='sensor-000000';
+SELECT variance(value_numeric), stddev(value_numeric) FROM scale.tm_tag_point WHERE tag_id='tag-000001';
 ```
 
 ```
-system_variance_value | system_stddev_value
-----------------------+--------------------
-805.694 | 28.3847
+system_variance_value_numeric | system_stddev_value_numeric
+------------------------------+----------------------------
+0.166332 | 0.407838
 (1 rows)
 ```
 
-**histogram 20 buckets** — `51 ms`
+**histogram(value_numeric, 0, 100, 20) [50,000 rows]** — `190 ms`
 
 ```sql
-SELECT histogram(value, 0, 100, 20) FROM scale.metrics WHERE series='sensor-000000';
+SELECT histogram(value_numeric, 0, 100, 20) FROM scale.tm_tag_point WHERE tag_id='tag-000001';
 ```
 
 ```
-system_histogram_value__0__100__20
-----------------------------------
-[0, 0, 0, 8627, 10363, 6234, 5173, 4609, 4284, 4093, 3977, 3975, 4043, 4119, 4309, 4609, 5090, 6057, 9277, 10137, 1024, 0]
+system_histogram_value_numeric__0__100__20
+------------------------------------------
+[0, 0, 0, 50000, 0, 0, 0,~
 (1 rows)
 ```
 
-**approx_count_distinct** — `56 ms`
+**approx_count_distinct(value_numeric) [50,000 rows]** — `151 ms`
 
 ```sql
-SELECT approx_count_distinct(value) FROM scale.metrics WHERE series='sensor-000000';
+SELECT approx_count_distinct(value_numeric) FROM scale.tm_tag_point WHERE tag_id='tag-000001';
 ```
 
 ```
-system_approx_count_distinct_value
-----------------------------------
-99741
+system_approx_count_distinct_value_numeric
+------------------------------------------
+186
 (1 rows)
 ```
 
-**integral + time_weighted_average** — `64 ms`
+**integral + time_weighted_average(value_numeric) [50,000 rows]** — `4,666 ms`
 
 ```sql
-SELECT integral(value, ts), time_weighted_average(value, ts) FROM scale.metrics WHERE series='sensor-000000';
+SELECT integral(value_numeric, timestamp), time_weighted_average(value_numeric, timestamp) FROM scale.tm_tag_point WHERE tag_id='tag-000001';
 ```
 
 ```
-system_integral_value__ts | system_time_weighted_average_value__ts
---------------------------+---------------------------------------
-5.31023e+06 | 53.1029
+system_integral_value_numeric__timestamp | system_time_weighted_average_value_numeric__timestamp
+-----------------------------------------+------------------------------------------------------
+676893 | 13.5381
 (1 rows)
 ```
 
-### gap-fill
-
-**gapfill 1h + locf over the full span** — `60 ms`
+**SECONDARY: time_bucket 1h + avg/min/max(latency) [50,000 rows]** — `169 ms`
 
 ```sql
-SELECT time_bucket_gapfill(1h, ts, '2024-01-01 00:00:00+0000', '2024-01-01 09:15:33+0000'), locf(avg(value)) FROM scale.metrics WHERE series='sensor-000000' GROUP BY series, time_bucket_gapfill(1h, ts, '2024-01-01 00:00:00+0000', '2024-01-01 09:15:33+0000');
+SELECT time_bucket(1h, timestamp), avg(latency), min(latency), max(latency) FROM scale.tm_tag_point WHERE tag_id='tag-000001' GROUP BY tag_id, time_bucket(1h, timestamp);
 ```
 
 ```
-system_time_bucket_gapfill_1h__ts___2024_01_01_00_00_00_0000____2024_01_01_09_15_33_0000 | system_locf_system_avg_value
------------------------------------------------------------------------------------------+-----------------------------
-2024-01-01 00:00:00 | 55.17
-2024-01-01 01:00:00 | 57.8219
-2024-01-01 02:00:00 | 56.6966
-2024-01-01 03:00:00 | 52.6745
-2024-01-01 04:00:00 | 48.9073
-2024-01-01 05:00:00 | 48.3472
-2024-01-01 06:00:00 | 51.4319
-2024-01-01 07:00:00 | 55.742
-... (28 rows total)
+system_time_bucket_1h__timestamp | system_avg_latency | system_min_latency | system_max_latency
+---------------------------------+--------------------+--------------------+-------------------
+2024-01-01 13:00:00 | 491 | 1 | 999
+2024-01-01 12:00:00 | 500 | 1 | 999
+2024-01-01 11:00:00 | 499 | 1 | 999
+2024-01-01 10:00:00 | 496 | 1 | 999
+2024-01-01 09:00:00 | 501 | 1 | 999
+2024-01-01 08:00:00 | 498 | 1 | 999
+... (14 rows total)
 ```
 
-**gapfill 5m + interpolate over 6h** — `19 ms`
+### row reads (all 16 columns vs. projections) -- type-independent
+
+**newest 1000 rows, SELECT * -- type='boolean' tag (tag-000000)** — `212 ms`
 
 ```sql
-SELECT time_bucket_gapfill(5m, ts, '2024-01-01 00:00:00+0000', '2024-01-01 06:00:00+0000'), interpolate(avg(value)) FROM scale.metrics WHERE series='sensor-000000' AND ts >= '2024-01-01 00:00:00+0000' AND ts < '2024-01-01 06:00:00+0000' GROUP BY series, time_bucket_gapfill(5m, ts, '2024-01-01 00:00:00+0000', '2024-01-01 06:00:00+0000');
+SELECT * FROM scale.tm_tag_point WHERE tag_id='tag-000000' LIMIT 1000;
 ```
 
 ```
-system_time_bucket_gapfill_5m__ts___2024_01_01_00_00_00_0000____2024_01_01_06_00_00_0000 | system_interpolate_system_avg_value
------------------------------------------------------------------------------------------+------------------------------------
-2024-01-01 00:00:00 | 64.5966
-2024-01-01 00:05:00 | 83.834
-2024-01-01 00:10:00 | 92.2979
-2024-01-01 00:15:00 | 87.0327
-2024-01-01 00:20:00 | 69.8789
-2024-01-01 00:25:00 | 46.83
-2024-01-01 00:30:00 | 25.9388
-2024-01-01 00:35:00 | 14.481
+tag_id | timestamp | area_id | asset_id | line_id | opc_id | site_id | tag_name | type | attribute | error_code | latency | quality | value | value_boolean | value_numeric
+-------+-----------+---------+----------+---------+--------+---------+----------+------+-----------+------------+---------+---------+-------+---------------+--------------
+tag-000000 | 2024-01-01 13:53:19 | area-a | asset-0000 | line-01 | opc-00 | seoul | PLANT/seoul/line-01/TAG_0~ | boolean | {} | 0 | 977 | 192 | false | False | None
+tag-000000 | 2024-01-01 13:53:18 | area-a | asset-0000 | line-01 | opc-00 | seoul | PLANT/seoul/line-01/TAG_0~ | boolean | {} | 0 | 273 | 192 | true | True | None
+tag-000000 | 2024-01-01 13:53:17 | area-a | asset-0000 | line-01 | opc-00 | seoul | PLANT/seoul/line-01/TAG_0~ | boolean | {} | 0 | 777 | 192 | true | True | None
+tag-000000 | 2024-01-01 13:53:16 | area-a | asset-0000 | line-01 | opc-00 | seoul | PLANT/seoul/line-01/TAG_0~ | boolean | {} | 0 | 122 | 192 | true | True | None
+tag-000000 | 2024-01-01 13:53:15 | area-a | asset-0000 | line-01 | opc-00 | seoul | PLANT/seoul/line-01/TAG_0~ | boolean | {} | 0 | 263 | 192 | true | True | None
+tag-000000 | 2024-01-01 13:53:14 | area-a | asset-0000 | line-01 | opc-00 | seoul | PLANT/seoul/line-01/TAG_0~ | boolean | {} | 0 | 268 | 192 | true | True | None
+... (1000 rows total)
+```
+
+**newest 1000 rows, SELECT * -- type='double' tag (tag-000001)** — `167 ms`
+
+```sql
+SELECT * FROM scale.tm_tag_point WHERE tag_id='tag-000001' LIMIT 1000;
+```
+
+```
+tag_id | timestamp | area_id | asset_id | line_id | opc_id | site_id | tag_name | type | attribute | error_code | latency | quality | value | value_boolean | value_numeric
+-------+-----------+---------+----------+---------+--------+---------+----------+------+-----------+------------+---------+---------+-------+---------------+--------------
+tag-000001 | 2024-01-01 13:53:19 | area-b | asset-0001 | line-02 | opc-01 | busan | PLANT/busan/line-02/TAG_0~ | double | {} | 0 | 326 | 192 | 13.36 | None | 13.36
+tag-000001 | 2024-01-01 13:53:18 | area-b | asset-0001 | line-02 | opc-01 | busan | PLANT/busan/line-02/TAG_0~ | double | {} | 0 | 215 | 192 | 13.37 | None | 13.37
+tag-000001 | 2024-01-01 13:53:17 | area-b | asset-0001 | line-02 | opc-01 | busan | PLANT/busan/line-02/TAG_0~ | double | {} | 0 | 734 | 192 | 13.36 | None | 13.36
+tag-000001 | 2024-01-01 13:53:16 | area-b | asset-0001 | line-02 | opc-01 | busan | PLANT/busan/line-02/TAG_0~ | double | {} | 0 | 108 | 192 | 13.36 | None | 13.36
+tag-000001 | 2024-01-01 13:53:15 | area-b | asset-0001 | line-02 | opc-01 | busan | PLANT/busan/line-02/TAG_0~ | double | {} | 0 | 551 | 192 | 13.35 | None | 13.35
+tag-000001 | 2024-01-01 13:53:14 | area-b | asset-0001 | line-02 | opc-01 | busan | PLANT/busan/line-02/TAG_0~ | double | {} | 0 | 912 | 192 | 13.35 | None | 13.35
+... (1000 rows total)
+```
+
+**1 hour of rows, SELECT * (all columns) [3,600 rows]** — `199 ms`
+
+```sql
+SELECT * FROM scale.tm_tag_point WHERE tag_id='tag-000001' AND timestamp >= '2024-01-01 00:00:00+0000' AND timestamp < '2024-01-01 01:00:00+0000';
+```
+
+```
+tag_id | timestamp | area_id | asset_id | line_id | opc_id | site_id | tag_name | type | attribute | error_code | latency | quality | value | value_boolean | value_numeric
+-------+-----------+---------+----------+---------+--------+---------+----------+------+-----------+------------+---------+---------+-------+---------------+--------------
+tag-000001 | 2024-01-01 00:59:59 | area-b | asset-0001 | line-02 | opc-01 | busan | PLANT/busan/line-02/TAG_0~ | double | {} | 0 | 64 | 192 | 13.58 | None | 13.58
+tag-000001 | 2024-01-01 00:59:58 | area-b | asset-0001 | line-02 | opc-01 | busan | PLANT/busan/line-02/TAG_0~ | double | {} | 0 | 618 | 192 | 13.57 | None | 13.57
+tag-000001 | 2024-01-01 00:59:57 | area-b | asset-0001 | line-02 | opc-01 | busan | PLANT/busan/line-02/TAG_0~ | double | {} | 0 | 31 | 192 | 13.56 | None | 13.56
+tag-000001 | 2024-01-01 00:59:56 | area-b | asset-0001 | line-02 | opc-01 | busan | PLANT/busan/line-02/TAG_0~ | double | {} | 0 | 148 | 192 | 13.56 | None | 13.56
+tag-000001 | 2024-01-01 00:59:55 | area-b | asset-0001 | line-02 | opc-01 | busan | PLANT/busan/line-02/TAG_0~ | double | {} | 0 | 182 | 192 | 13.55 | None | 13.55
+tag-000001 | 2024-01-01 00:59:54 | area-b | asset-0001 | line-02 | opc-01 | busan | PLANT/busan/line-02/TAG_0~ | double | {} | 0 | 127 | 192 | 13.54 | None | 13.54
+... (3600 rows total)
+```
+
+**1 hour of rows, project timestamp+value only [3,600 rows]** — `40 ms`
+
+```sql
+SELECT timestamp, value FROM scale.tm_tag_point WHERE tag_id='tag-000001' AND timestamp >= '2024-01-01 00:00:00+0000' AND timestamp < '2024-01-01 01:00:00+0000';
+```
+
+```
+timestamp | value
+----------+------
+2024-01-01 00:59:59 | 13.58
+2024-01-01 00:59:58 | 13.57
+2024-01-01 00:59:57 | 13.56
+2024-01-01 00:59:56 | 13.56
+2024-01-01 00:59:55 | 13.55
+2024-01-01 00:59:54 | 13.54
+... (3600 rows total)
+```
+
+**1 hour of rows, project timestamp+value_numeric only [3,600 rows]** — `64 ms`
+
+```sql
+SELECT timestamp, value_numeric FROM scale.tm_tag_point WHERE tag_id='tag-000001' AND timestamp >= '2024-01-01 00:00:00+0000' AND timestamp < '2024-01-01 01:00:00+0000';
+```
+
+```
+timestamp | value_numeric
+----------+--------------
+2024-01-01 00:59:59 | 13.58
+2024-01-01 00:59:58 | 13.57
+2024-01-01 00:59:57 | 13.56
+2024-01-01 00:59:56 | 13.56
+2024-01-01 00:59:55 | 13.55
+2024-01-01 00:59:54 | 13.54
+... (3600 rows total)
+```
+
+**static columns only (1 row)** — `95 ms`
+
+```sql
+SELECT tag_id, site_id, area_id, line_id, asset_id, opc_id, tag_name, type FROM scale.tm_tag_point WHERE tag_id='tag-000001' LIMIT 1;
+```
+
+```
+tag_id | site_id | area_id | line_id | asset_id | opc_id | tag_name | type
+-------+---------+---------+---------+----------+--------+----------+-----
+tag-000001 | busan | area-b | line-02 | asset-0001 | opc-01 | PLANT/busan/line-02/TAG_0~ | double
+(1 rows)
+```
+
+**column presence, type='boolean' tag [50,000 rows]** — `325 ms`
+
+```sql
+SELECT count(latency) AS latency, count(value) AS value, count(value_numeric) AS value_numeric, count(value_boolean) AS value_boolean, count(quality) AS quality, count(attribute) AS attribute FROM scale.tm_tag_point WHERE tag_id='tag-000000';
+```
+
+```
+latency | value | value_numeric | value_boolean | quality | attribute
+--------+-------+---------------+---------------+---------+----------
+50000 | 50000 | 0 | 50000 | 50000 | 50000
+(1 rows)
+```
+
+**column presence, type='double' tag [50,000 rows]** — `263 ms`
+
+```sql
+SELECT count(latency) AS latency, count(value) AS value, count(value_numeric) AS value_numeric, count(value_boolean) AS value_boolean, count(quality) AS quality, count(attribute) AS attribute FROM scale.tm_tag_point WHERE tag_id='tag-000001';
+```
+
+```
+latency | value | value_numeric | value_boolean | quality | attribute
+--------+-------+---------------+---------------+---------+----------
+50000 | 50000 | 50000 | 0 | 50000 | 50000
+(1 rows)
+```
+
+### gap-fill (locf/interpolate over avg(value_numeric), numeric tag tag-000001)
+
+**gapfill 1h + locf over the full 13h span [50,000 rows]** — `143 ms`
+
+```sql
+SELECT time_bucket_gapfill(1h, timestamp, '2024-01-01 00:00:00+0000', '2024-01-01 13:53:20+0000'), locf(avg(value_numeric)) FROM scale.tm_tag_point WHERE tag_id='tag-000001' GROUP BY tag_id, time_bucket_gapfill(1h, timestamp, '2024-01-01 00:00:00+0000', '2024-01-01 13:53:20+0000') ORDER BY timestamp ASC;
+```
+
+```
+system_time_bucket_gapfill_1h__timestamp___2024_01_01_00_00_00_0000____2024_01_01_13_53_20_0000 | system_locf_system_avg_value_numeric
+------------------------------------------------------------------------------------------------+-------------------------------------
+2024-01-01 00:00:00 | 13.63
+2024-01-01 01:00:00 | 13.422
+2024-01-01 02:00:00 | 13.3907
+2024-01-01 03:00:00 | 13.0522
+2024-01-01 04:00:00 | 13.1257
+2024-01-01 05:00:00 | 13.265
+... (14 rows total)
+```
+
+**gapfill 5m + interpolate over 6h [21,600 rows]** — `46 ms`
+
+```sql
+SELECT time_bucket_gapfill(5m, timestamp, '2024-01-01 00:00:00+0000', '2024-01-01 06:00:00+0000'), interpolate(avg(value_numeric)) FROM scale.tm_tag_point WHERE tag_id='tag-000001' AND timestamp >= '2024-01-01 00:00:00+0000' AND timestamp < '2024-01-01 06:00:00+0000' GROUP BY tag_id, time_bucket_gapfill(5m, timestamp, '2024-01-01 00:00:00+0000', '2024-01-01 06:00:00+0000') ORDER BY timestamp ASC;
+```
+
+```
+system_time_bucket_gapfill_5m__timestamp___2024_01_01_00_00_00_0000____2024_01_01_06_00_00_0000 | system_interpolate_system_avg_value_numeric
+------------------------------------------------------------------------------------------------+--------------------------------------------
+2024-01-01 00:00:00 | 13.7812
+2024-01-01 00:05:00 | 13.7593
+2024-01-01 00:10:00 | 13.7099
+2024-01-01 00:15:00 | 13.7551
+2024-01-01 00:20:00 | 13.6845
+2024-01-01 00:25:00 | 13.5115
 ... (72 rows total)
 ```
 
-### multi-partition
+### multi-partition (numeric-typed tags only -- 109 of 600 tags are numeric)
 
-**10 series, hourly avg (333330 rows)** — `565 ms`
-
-```sql
-SELECT series, time_bucket(1h, ts), avg(value) FROM scale.metrics WHERE series IN ('sensor-000000', 'sensor-000001', 'sensor-000002', 'sensor-000003', 'sensor-000004', 'sensor-000005', 'sensor-000006', 'sensor-000007', 'sensor-000008', 'sensor-000009') GROUP BY series, time_bucket(1h, ts);
-```
-
-```
-series | system_time_bucket_1h__ts | system_avg_value
--------+---------------------------+-----------------
-sensor-000000 | 2024-01-01 00:00:00 | 55.17
-sensor-000000 | 2024-01-01 01:00:00 | 57.8219
-sensor-000000 | 2024-01-01 02:00:00 | 56.6966
-sensor-000000 | 2024-01-01 03:00:00 | 52.6745
-sensor-000000 | 2024-01-01 04:00:00 | 48.9073
-sensor-000000 | 2024-01-01 05:00:00 | 48.3472
-sensor-000000 | 2024-01-01 06:00:00 | 51.4319
-sensor-000000 | 2024-01-01 07:00:00 | 55.742
-... (280 rows total)
-```
-
-**100 series, hourly avg (3333300 rows)** — `5,600 ms`
+**10 numeric tags, hourly avg(value_numeric) [500,000 rows]** — `1,904 ms`
 
 ```sql
-SELECT series, time_bucket(1h, ts), avg(value) FROM scale.metrics WHERE series IN ('sensor-000000', 'sensor-000001', 'sensor-000002', 'sensor-000003', 'sensor-000004', 'sensor-000005', 'sensor-000006', 'sensor-000007', 'sensor-000008', 'sensor-000009', 'sensor-000010', 'sensor-000011', 'sensor-000012', 'sensor-000013', 'sensor-000014', 'sensor-000015', 'sensor-000016', 'sensor-000017', 'sensor-000018', 'sensor-000019', 'sensor-000020', 'sensor-000021', 'sensor-000022', 'sensor-000023', 'sensor-000024', 'sensor-000025', 'sensor-000026', 'sensor-000027', 'sensor-000028', 'sensor-000029', 'sensor-000030', 'sensor-000031', 'sensor-000032', 'sensor-000033', 'sensor-000034', 'sensor-000035', 'sensor-000036', 'sensor-000037', 'sensor-000038', 'sensor-000039', 'sensor-000040', 'sensor-000041', 'sensor-000042', 'sensor-000043', 'sensor-000044', 'sensor-000045', 'sensor-000046', 'sensor-000047', 'sensor-000048', 'sensor-000049', 'sensor-000050', 'sensor-000051', 'sensor-000052', 'sensor-000053', 'sensor-000054', 'sensor-000055', 'sensor-000056', 'sensor-000057', 'sensor-000058', 'sensor-000059', 'sensor-000060', 'sensor-000061', 'sensor-000062', 'sensor-000063', 'sensor-000064', 'sensor-000065', 'sensor-000066', 'sensor-000067', 'sensor-000068', 'sensor-000069', 'sensor-000070', 'sensor-000071', 'sensor-000072', 'sensor-000073', 'sensor-000074', 'sensor-000075', 'sensor-000076', 'sensor-000077', 'sensor-000078', 'sensor-000079', 'sensor-000080', 'sensor-000081', 'sensor-000082', 'sensor-000083', 'sensor-000084', 'sensor-000085', 'sensor-000086', 'sensor-000087', 'sensor-000088', 'sensor-000089', 'sensor-000090', 'sensor-000091', 'sensor-000092', 'sensor-000093', 'sensor-000094', 'sensor-000095', 'sensor-000096', 'sensor-000097', 'sensor-000098', 'sensor-000099') GROUP BY series, time_bucket(1h, ts);
+SELECT tag_id, time_bucket(1h, timestamp), avg(value_numeric) FROM scale.tm_tag_point WHERE tag_id IN ('tag-000001', 'tag-000002', 'tag-000013', 'tag-000014', 'tag-000026', 'tag-000027', 'tag-000038', 'tag-000039', 'tag-000050', 'tag-000051') GROUP BY tag_id, time_bucket(1h, timestamp);
 ```
 
 ```
-series | system_time_bucket_1h__ts | system_avg_value
--------+---------------------------+-----------------
-sensor-000000 | 2024-01-01 00:00:00 | 55.17
-sensor-000000 | 2024-01-01 01:00:00 | 57.8219
-sensor-000000 | 2024-01-01 02:00:00 | 56.6966
-sensor-000000 | 2024-01-01 03:00:00 | 52.6745
-sensor-000000 | 2024-01-01 04:00:00 | 48.9073
-sensor-000000 | 2024-01-01 05:00:00 | 48.3472
-sensor-000000 | 2024-01-01 06:00:00 | 51.4319
-sensor-000000 | 2024-01-01 07:00:00 | 55.742
-... (2800 rows total)
+tag_id | system_time_bucket_1h__timestamp | system_avg_value_numeric
+-------+----------------------------------+-------------------------
+tag-000001 | 2024-01-01 13:00:00 | 13.7759
+tag-000001 | 2024-01-01 12:00:00 | 13.8408
+tag-000001 | 2024-01-01 11:00:00 | 14.151
+tag-000001 | 2024-01-01 10:00:00 | 14.0014
+tag-000001 | 2024-01-01 09:00:00 | 13.9908
+tag-000001 | 2024-01-01 08:00:00 | 13.7399
+... (140 rows total)
 ```
 
-**100 series, p95 per series** — `4,971 ms`
+**100 numeric tags, hourly avg(value_numeric) [5,000,000 rows]** — `17,282 ms`
 
 ```sql
-SELECT series, percentile(value, 0.95) FROM scale.metrics WHERE series IN ('sensor-000000', 'sensor-000001', 'sensor-000002', 'sensor-000003', 'sensor-000004', 'sensor-000005', 'sensor-000006', 'sensor-000007', 'sensor-000008', 'sensor-000009', 'sensor-000010', 'sensor-000011', 'sensor-000012', 'sensor-000013', 'sensor-000014', 'sensor-000015', 'sensor-000016', 'sensor-000017', 'sensor-000018', 'sensor-000019', 'sensor-000020', 'sensor-000021', 'sensor-000022', 'sensor-000023', 'sensor-000024', 'sensor-000025', 'sensor-000026', 'sensor-000027', 'sensor-000028', 'sensor-000029', 'sensor-000030', 'sensor-000031', 'sensor-000032', 'sensor-000033', 'sensor-000034', 'sensor-000035', 'sensor-000036', 'sensor-000037', 'sensor-000038', 'sensor-000039', 'sensor-000040', 'sensor-000041', 'sensor-000042', 'sensor-000043', 'sensor-000044', 'sensor-000045', 'sensor-000046', 'sensor-000047', 'sensor-000048', 'sensor-000049', 'sensor-000050', 'sensor-000051', 'sensor-000052', 'sensor-000053', 'sensor-000054', 'sensor-000055', 'sensor-000056', 'sensor-000057', 'sensor-000058', 'sensor-000059', 'sensor-000060', 'sensor-000061', 'sensor-000062', 'sensor-000063', 'sensor-000064', 'sensor-000065', 'sensor-000066', 'sensor-000067', 'sensor-000068', 'sensor-000069', 'sensor-000070', 'sensor-000071', 'sensor-000072', 'sensor-000073', 'sensor-000074', 'sensor-000075', 'sensor-000076', 'sensor-000077', 'sensor-000078', 'sensor-000079', 'sensor-000080', 'sensor-000081', 'sensor-000082', 'sensor-000083', 'sensor-000084', 'sensor-000085', 'sensor-000086', 'sensor-000087', 'sensor-000088', 'sensor-000089', 'sensor-000090', 'sensor-000091', 'sensor-000092', 'sensor-000093', 'sensor-000094', 'sensor-000095', 'sensor-000096', 'sensor-000097', 'sensor-000098', 'sensor-000099') GROUP BY series;
+SELECT tag_id, time_bucket(1h, timestamp), avg(value_numeric) FROM scale.tm_tag_point WHERE tag_id IN ('tag-000001', 'tag-000002', 'tag-000013', 'tag-000014', 'tag-000026', 'tag-000027', 'tag-000038', 'tag-000039', 'tag-000050', 'tag-000051', 'tag-000063', 'tag-000064', 'tag-000075', 'tag-000076', 'tag-000087', 'tag-000088', 'tag-000100', 'tag-000101', 'tag-000112', 'tag-000113', 'tag-000124', 'tag-000125', 'tag-000126', 'tag-000137', 'tag-000138', 'tag-000149', 'tag-000150', 'tag-000161', 'tag-000162', 'tag-000163', 'tag-000174', 'tag-000175', 'tag-000186', 'tag-000187', 'tag-000198', 'tag-000199', 'tag-000200', 'tag-000211', 'tag-000212', 'tag-000223', 'tag-000224', 'tag-000235', 'tag-000236', 'tag-000237', 'tag-000248', 'tag-000249', 'tag-000260', 'tag-000261', 'tag-000273', 'tag-000274', 'tag-000284', 'tag-000285', 'tag-000286', 'tag-000297', 'tag-000298', 'tag-000310', 'tag-000311', 'tag-000321', 'tag-000322', 'tag-000323', 'tag-000334', 'tag-000335', 'tag-000347', 'tag-000348', 'tag-000359', 'tag-000360', 'tag-000371', 'tag-000372', 'tag-000384', 'tag-000385', 'tag-000396', 'tag-000397', 'tag-000408', 'tag-000409', 'tag-000421', 'tag-000422', 'tag-000433', 'tag-000434', 'tag-000445', 'tag-000446', 'tag-000447', 'tag-000458', 'tag-000459', 'tag-000470', 'tag-000471', 'tag-000482', 'tag-000483', 'tag-000484', 'tag-000495', 'tag-000496', 'tag-000507', 'tag-000508', 'tag-000519', 'tag-000520', 'tag-000521', 'tag-000532', 'tag-000533', 'tag-000544', 'tag-000545', 'tag-000556') GROUP BY tag_id, time_bucket(1h, timestamp);
 ```
 
 ```
-series | system_percentile_value__0_95
--------+------------------------------
-sensor-000000 | 92.7757
-sensor-000001 | 92.7757
-sensor-000002 | 92.7757
-sensor-000003 | 92.7757
-sensor-000004 | 92.7757
-sensor-000005 | 92.7757
-sensor-000006 | 92.7757
-sensor-000007 | 92.7757
+tag_id | system_time_bucket_1h__timestamp | system_avg_value_numeric
+-------+----------------------------------+-------------------------
+tag-000001 | 2024-01-01 13:00:00 | 13.7759
+tag-000001 | 2024-01-01 12:00:00 | 13.8408
+tag-000001 | 2024-01-01 11:00:00 | 14.151
+tag-000001 | 2024-01-01 10:00:00 | 14.0014
+tag-000001 | 2024-01-01 09:00:00 | 13.9908
+tag-000001 | 2024-01-01 08:00:00 | 13.7399
+... (1400 rows total)
+```
+
+**100 numeric tags, p95(value_numeric) per tag [5,000,000 rows]** — `15,349 ms`
+
+```sql
+SELECT tag_id, percentile(value_numeric, 0.95) FROM scale.tm_tag_point WHERE tag_id IN ('tag-000001', 'tag-000002', 'tag-000013', 'tag-000014', 'tag-000026', 'tag-000027', 'tag-000038', 'tag-000039', 'tag-000050', 'tag-000051', 'tag-000063', 'tag-000064', 'tag-000075', 'tag-000076', 'tag-000087', 'tag-000088', 'tag-000100', 'tag-000101', 'tag-000112', 'tag-000113', 'tag-000124', 'tag-000125', 'tag-000126', 'tag-000137', 'tag-000138', 'tag-000149', 'tag-000150', 'tag-000161', 'tag-000162', 'tag-000163', 'tag-000174', 'tag-000175', 'tag-000186', 'tag-000187', 'tag-000198', 'tag-000199', 'tag-000200', 'tag-000211', 'tag-000212', 'tag-000223', 'tag-000224', 'tag-000235', 'tag-000236', 'tag-000237', 'tag-000248', 'tag-000249', 'tag-000260', 'tag-000261', 'tag-000273', 'tag-000274', 'tag-000284', 'tag-000285', 'tag-000286', 'tag-000297', 'tag-000298', 'tag-000310', 'tag-000311', 'tag-000321', 'tag-000322', 'tag-000323', 'tag-000334', 'tag-000335', 'tag-000347', 'tag-000348', 'tag-000359', 'tag-000360', 'tag-000371', 'tag-000372', 'tag-000384', 'tag-000385', 'tag-000396', 'tag-000397', 'tag-000408', 'tag-000409', 'tag-000421', 'tag-000422', 'tag-000433', 'tag-000434', 'tag-000445', 'tag-000446', 'tag-000447', 'tag-000458', 'tag-000459', 'tag-000470', 'tag-000471', 'tag-000482', 'tag-000483', 'tag-000484', 'tag-000495', 'tag-000496', 'tag-000507', 'tag-000508', 'tag-000519', 'tag-000520', 'tag-000521', 'tag-000532', 'tag-000533', 'tag-000544', 'tag-000545', 'tag-000556') GROUP BY tag_id;
+```
+
+```
+tag_id | system_percentile_value_numeric__0_95
+-------+--------------------------------------
+tag-000001 | 14.19
+tag-000002 | 165
+tag-000013 | 118
+tag-000014 | 287
+tag-000026 | 88.28
+tag-000027 | 71
 ... (100 rows total)
 ```
 
-### dashboard query
+### dashboard query (numeric tag tag-000001)
 
-**OHLC + change + p95 per hour** — `150 ms`
+**OHLC + change + p95 of value_numeric per hour [50,000 rows]** — `352 ms`
 
 ```sql
-SELECT time_bucket(1h, ts) AS bucket, count(value) AS samples, first(value, ts) AS open, last(value, ts) AS close, min(value) AS low, max(value) AS high, avg(value) AS mean, delta(value, ts) AS change, rate(value, ts) AS per_second, percentile(value, 0.95) AS p95 FROM scale.metrics WHERE series='sensor-000000' GROUP BY series, time_bucket(1h, ts);
+SELECT time_bucket(1h, timestamp) AS bucket, count(value_numeric) AS samples, first(value_numeric, timestamp) AS open, last(value_numeric, timestamp) AS close, min(value_numeric) AS low, max(value_numeric) AS high, avg(value_numeric) AS mean, delta(value_numeric, timestamp) AS change, rate(value_numeric, timestamp) AS per_second, percentile(value_numeric, 0.95) AS p95 FROM scale.tm_tag_point WHERE tag_id='tag-000001' GROUP BY tag_id, time_bucket(1h, timestamp);
 ```
 
 ```
 bucket | samples | open | close | low | high | mean | change | per_second | p95
 -------+---------+------+-------+-----+------+------+--------+------------+----
-2024-01-01 00:00:00 | 3600 | 50 | 82.698 | 10.0006 | 95.9995 | 55.17 | 32.698 | 0.0090853 | 92.3628
-2024-01-01 01:00:00 | 3600 | 83.7467 | 91.647 | 10.0006 | 96 | 57.8219 | 7.9003 | 0.00219514 | 93.8698
-2024-01-01 02:00:00 | 3600 | 92.6263 | 70.3239 | 10.0002 | 95.9997 | 56.6966 | -22.3024 | -0.00619682 | 92.6719
-2024-01-01 03:00:00 | 3600 | 71.25 | 29.9977 | 10 | 95.9992 | 52.6745 | -41.2524 | -0.0114622 | 92.3455
-2024-01-01 04:00:00 | 3600 | 30.9284 | 12.3392 | 10.0002 | 95.9996 | 48.9073 | -18.5893 | -0.00516512 | 92.3633
-2024-01-01 05:00:00 | 3600 | 13.3288 | 25.7469 | 10.0006 | 95.9999 | 48.3472 | 12.418 | 0.00345041 | 92.3527
-2024-01-01 06:00:00 | 3600 | 26.8036 | 61.2852 | 10.0001 | 96 | 51.4319 | 34.4816 | 0.00958089 | 92.3642
-2024-01-01 07:00:00 | 3600 | 55.3645 | 85.6836 | 10 | 95.9997 | 55.742 | 30.3191 | 0.00842432 | 92.3547
-... (28 rows total)
+2024-01-01 13:00:00 | 3200 | 13.73 | 13.36 | 13.3 | 14.12 | 13.7759 | -0.37 | -0.000115661 | 14.05
+2024-01-01 12:00:00 | 3600 | 14.05 | 13.73 | 13.5 | 14.11 | 13.8408 | -0.32 | -8.89136e-05 | 14.03
+2024-01-01 11:00:00 | 3600 | 14.19 | 14.05 | 13.66 | 14.44 | 14.151 | -0.14 | -3.88997e-05 | 14.38
+2024-01-01 10:00:00 | 3600 | 13.9 | 14.19 | 13.68 | 14.35 | 14.0014 | 0.29 | 8.05779e-05 | 14.25
+2024-01-01 09:00:00 | 3600 | 14.04 | 13.91 | 13.79 | 14.21 | 13.9908 | -0.13 | -3.61211e-05 | 14.15
+2024-01-01 08:00:00 | 3600 | 13.4 | 14.05 | 13.4 | 14.08 | 13.7399 | 0.65 | 0.000180606 | 14
+... (14 rows total)
 ```
 
-### full table scan (100000000 rows)
+### full table scan (30,000,000 rows) -- WRONG ANSWER on a tiered table (known limitation)
 
-**count(*) over the whole table** — `5 ms`
+**count(*) over the whole table** — `53 ms`
 
 ```sql
-SELECT count(*) FROM scale.metrics;
+SELECT count(*) FROM scale.tm_tag_point;
 ```
 
 ```
 count
 -----
-0
+600
 (1 rows)
 ```
