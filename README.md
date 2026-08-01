@@ -67,6 +67,7 @@ ORDER BY timestamp ASC;
 | [Gap-Fill 설계 (gapfill-design.md)](doc/timeseries/gapfill-design.md) | `time_bucket_gapfill`의 CQL 문법, 보간 규칙, 가드레일 |
 | [Continuous Aggregates 설계 (continuous-aggregates-design.md)](doc/timeseries/continuous-aggregates-design.md) | 시간 버킷 롤업(연속 집계) 설계안 — 진행 중 |
 | **[풀텍스트 검색 (fulltext-search.md)](doc/timeseries/fulltext-search.md)** | SAI `LIKE` + `index_analyzer` — 로그/메시지 본문 부분문자열 검색 (한글 포함) |
+| **[프로덕션 투입 체크리스트 (production-rollout.md)](doc/timeseries/production-rollout.md)**  | 계층화를 실 운영 테이블에 처음 켜기 전 확인 목록 — 되돌릴 수 없는 지점, 스키마 요건, TTL→`cold_window` 이관, 애플리케이션 영향, 검증 절차 |
 | **[계층화 벤치마크 (tiering-benchmark.md)](doc/timeseries/tiering-benchmark.md)** | 1억 건 전/후 실측 — 저장 35%↓(`double` 1개짜리 최악 조건), 재인코딩 265k rows/s, 질의는 동률~30% 느림(§ 핵심 3 참고) |
 | **[운영 튜닝 가이드 (operations-tuning.md)](doc/timeseries/operations-tuning.md)** | 장기 보존(10년) 전환 실전 가이드 — 용량 산수, 적용 순서, 원본·**청크 테이블** 튜닝값과 근거, TTL과 계층화의 관계, 점검 목록 |
 | **[계층형 저장 (tiered-storage.md)](doc/timeseries/tiered-storage.md)** | `timeseries_tiering` 정책·청크 재인코더 — 설정, 청크 조회 패턴, 운영(nodetool/가상 테이블), 불변식과 제한사항 |
