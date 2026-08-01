@@ -517,7 +517,12 @@ public final class TimeSeriesFcts
 
                     private boolean winsOver(ByteBuffer timestamp)
                     {
-                        int cmp = timestampType.compare(timestamp, bestTimestamp);
+                        // unwrap(), not the declared type: on WITH CLUSTERING ORDER BY (ts DESC) the
+                        // clustering column's type is ReversedType, whose compare() inverts. Comparing
+                        // with it makes first() return the LATEST row and last() the EARLIEST -- silently,
+                        // on exactly the descending layout industrial tables use. "Earliest" must mean
+                        // earliest in time regardless of how the table happens to be sorted on disk.
+                        int cmp = timestampType.unwrap().compare(timestamp, bestTimestamp);
                         return keepEarliest ? cmp < 0 : cmp > 0;
                     }
                 };

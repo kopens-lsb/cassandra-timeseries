@@ -517,6 +517,82 @@ public class TimeSeriesFctsTest extends CQLTester
                    row(date("2024-01-01T11:00:00Z"), 20.0));
     }
 
+    /**
+     * Gap-fill on a {@code CLUSTERING ORDER BY (ts DESC)} table -- the industrial idiom, and the shape the
+     * tiered-storage work is built around. {@link org.apache.cassandra.db.aggregation.TimeBucketGapFiller}
+     * requires rows grouped by partition and <em>ascending</em> bucket within a partition, and nothing
+     * enforces it, so this combination has to be pinned rather than assumed.
+     */
+    @Test
+    public void testTimeBucketGapfillOnDescClusteredTable() throws Throwable
+    {
+        createTable("CREATE TABLE %s (k int, ts timestamp, v int, PRIMARY KEY (k, ts)) " +
+                    "WITH CLUSTERING ORDER BY (ts DESC)");
+        execute("INSERT INTO %s (k, ts, v) VALUES (1, '2024-01-01 09:30:00+0000', 5)");
+        execute("INSERT INTO %s (k, ts, v) VALUES (1, '2024-01-01 11:15:00+0000', 7)");
+
+        String gf = "time_bucket_gapfill(1h, ts, '2024-01-01 09:00:00+0000', '2024-01-01 12:00:00+0000')";
+
+        // ORDER BY ts ASC cancels the table's DESC declaration, so the filler sees the ascending
+        // buckets it documents as its precondition: the empty 10:00 bucket carries 5 forward.
+        assertRows(execute("SELECT " + gf + ", locf(sum(v)) FROM %s WHERE k = 1 GROUP BY k, " + gf +
+                           " ORDER BY ts ASC"),
+                   row(date("2024-01-01T09:00:00Z"), 5),
+                   row(date("2024-01-01T10:00:00Z"), 5),
+                   row(date("2024-01-01T11:00:00Z"), 7));
+    }
+
+    /**
+     * The time-series functions against the production table shape, aggregating the column a real
+     * dashboard aggregates. In {@code tm_tag_point} the reading lives in {@code value_numeric} when the
+     * tag's static {@code type} is numeric (and in {@code value_boolean} when it is boolean); {@code value}
+     * is a text mirror of the same reading and cannot be aggregated numerically, and {@code latency} is
+     * collection metadata, not the measurement. Every function test above uses a toy
+     * {@code (k int, ts timestamp, v int)} table, so nothing proved the functions work over this shape --
+     * static columns, a frozen map, mixed types and DESC clustering all present at once.
+     */
+    @Test
+    public void testFunctionsOverProductionShapeAggregateValueNumeric() throws Throwable
+    {
+        createTable("CREATE TABLE %s (" +
+                    "tag_id text, timestamp timestamp, " +
+                    "site_id text static, tag_name text static, type text static, " +
+                    "attribute frozen<map<text, text>>, error_code int, latency int, quality int, " +
+                    "value text, value_boolean boolean, value_numeric double, " +
+                    "PRIMARY KEY (tag_id, timestamp)) WITH CLUSTERING ORDER BY (timestamp DESC)");
+
+        execute("INSERT INTO %s (tag_id, site_id, tag_name, type) VALUES ('TAG-1', 'GN', 'temp', 'double')");
+        // A numeric-typed tag: value_numeric carries the reading, value mirrors it as text,
+        // value_boolean stays null, and quality/error_code/attribute are constant -- as in production.
+        Object[][] samples = { { "2024-01-01T09:00:00Z", 10.0 },
+                               { "2024-01-01T09:30:00Z", 20.0 },
+                               { "2024-01-01T10:00:00Z", 30.0 },
+                               { "2024-01-01T10:30:00Z", 40.0 } };
+        for (Object[] s : samples)
+            execute("INSERT INTO %s (tag_id, timestamp, attribute, error_code, latency, quality, " +
+                    "value, value_boolean, value_numeric) VALUES ('TAG-1', ?, {}, 0, 42, 192, ?, null, ?)",
+                    date((String) s[0]), String.valueOf(s[1]), s[1]);
+
+        // Hourly bucketing plus the order-dependent family, on the real column. DESC clustering means an
+        // unordered read arrives newest-first, so the ASC request is what first/last/delta/rate need.
+        assertRows(execute("SELECT time_bucket(1h, timestamp), avg(value_numeric), min(value_numeric), " +
+                           "max(value_numeric), first(value_numeric, timestamp), last(value_numeric, timestamp), " +
+                           "delta(value_numeric, timestamp) FROM %s WHERE tag_id = 'TAG-1' " +
+                           "GROUP BY tag_id, time_bucket(1h, timestamp) ORDER BY timestamp ASC"),
+                   row(date("2024-01-01T09:00:00Z"), 15.0, 10.0, 20.0, 10.0, 20.0, 10.0),
+                   row(date("2024-01-01T10:00:00Z"), 35.0, 30.0, 40.0, 30.0, 40.0, 10.0));
+
+        // Whole-partition statistics on the same column.
+        // percentile interpolates between neighbours, so p50 of {10,20,30,40} is (20+30)/2, not a rank pick.
+        assertRows(execute("SELECT count(*), avg(value_numeric), percentile(value_numeric, 0.5) " +
+                           "FROM %s WHERE tag_id = 'TAG-1'"),
+                   row(4L, 25.0, 25.0));
+
+        // Statics and the constant columns survive alongside the aggregates.
+        assertRows(execute("SELECT site_id, type FROM %s WHERE tag_id = 'TAG-1' LIMIT 1"),
+                   row("GN", "double"));
+    }
+
     @Test
     public void testTimeBucketGapfillMultiPartition() throws Throwable
     {
