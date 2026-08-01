@@ -23,7 +23,9 @@ import java.util.Collection;
 import java.util.List;
 import java.util.Map;
 import java.util.NavigableMap;
+import java.util.NavigableSet;
 import java.util.TreeMap;
+import java.util.TreeSet;
 import java.util.concurrent.TimeUnit;
 import java.util.function.LongUnaryOperator;
 
@@ -67,19 +69,36 @@ public class TimeWindowSplittingMultiWriter implements SSTableMultiWriter
 
     /**
      * Cap on concurrently-open per-window writers. Each writer holds data, index, filter and CRC file
-     * descriptors plus write buffers, so an unbounded fan-out (a backfill flush or a legacy spanning
-     * stream covering a year at {@code window_size=1h} wants ~8,760) exhausts file descriptors or heap.
+     * descriptors plus write buffers, so an unbounded fan-out exhausts file descriptors or heap. The
+     * fan-out is <em>not</em> bounded by the routing buffer: one 10 MB partition holding a row an hour
+     * for ten years wants ~87,600 windows at {@code window_size=1h} and never comes near the
+     * {@link WindowRoutingIterator#maxBufferedBytesPerPartition} budget, so the cap has to hold
+     * <em>within</em> a partition, not just between partitions.
      *
-     * <p>Beyond the cap, further windows are <em>snapped</em> onto an already-open writer instead of
-     * failing: routing is asked for the snapped window key, so each partition still yields at most one
-     * slice per writer and nothing has to be merged. The resulting sstable spans windows and classifies
-     * FREEZING, and {@code SplitRefreezeCompactionTask} re-splits it later from a smaller input — each
-     * pass peels off up to {@code maxWindowWriters} windows, so the process converges rather than
-     * looping. Failing the write instead was rejected: this writer is on the memtable-flush and
-     * bootstrap-stream paths, where an exception blocks writes or aborts a bootstrap.
+     * <p>It does, because admission is decided per routed element rather than once per {@code append}:
+     * {@link WindowAdmission} is consulted for every timestamp routing looks at, and once the cap is
+     * reached further windows are <em>snapped</em> onto an already-admitted one. Routing is asked for
+     * the snapped key, so a partition still yields at most one slice per writer and nothing has to be
+     * merged; {@code writers.keySet()} is a subset of the admitted set, which never exceeds the cap.
+     * Failing the write instead was rejected: this writer is on the memtable-flush and bootstrap-stream
+     * paths, where an exception blocks writes or aborts a bootstrap.
+     *
+     * <p>A snapped output spans windows and classifies FREEZING, and
+     * {@code SplitRefreezeCompactionTask} — which applies the same cap — re-splits it later. That
+     * converges: one input yields at most {@code maxWindowWriters} outputs, every one of them
+     * non-empty (a key is only admitted because some element routed to it), so each output covers a
+     * <em>proper</em> subset of the input's windows and the widest span strictly shrinks every pass.
+     * The argument needs at least two writers, so the cap is clamped to 2 below. The strategy's
+     * no-progress guard is the backstop if anything else stalls the sequence.
      */
     @VisibleForTesting
-    static volatile int maxWindowWriters = 1000;
+    public static volatile int maxWindowWriters = 1000;
+
+    /** The cap, clamped to the minimum the convergence argument above needs. */
+    public static int maxWindowWriters()
+    {
+        return Math.max(2, maxWindowWriters);
+    }
 
     private final ColumnFamilyStore cfs;
     private final Descriptor descriptor;
@@ -131,47 +150,78 @@ public class TimeWindowSplittingMultiWriter implements SSTableMultiWriter
         if (partition.isReverseOrder())
             throw new IllegalStateException("Window-splitting writer only supports forward iteration");
 
+        // One admission decision maker per partition, seeded from the writers already open, so the cap
+        // holds across the whole flush AND inside this one partition (see maxWindowWriters).
+        WindowAdmission admission = new WindowAdmission();
+
         // Header placement (deletion and static cells routed by their own timestamps) is
         // WindowRoutingIterator's contract - see slices() for the rationale.
-        for (Map.Entry<Long, UnfilteredRowIterator> entry : WindowRoutingIterator.slices(partition, routingFunction(), tableResolution).entrySet())
-            writerFor(entry.getKey()).append(entry.getValue());
+        for (Map.Entry<Long, UnfilteredRowIterator> entry : WindowRoutingIterator.slices(partition, admission, tableResolution).entrySet())
+            writerFor(entry.getKey(), admission).append(entry.getValue());
     }
 
     /**
-     * The window function routing is asked to use. Below the writer cap this is the strategy's own
-     * window arithmetic; at the cap it additionally snaps unknown windows onto an open writer, so a
-     * partition can never produce two slices targeting one writer (which would append the same
-     * partition key twice).
+     * Decides, for the duration of one partition, which window keys may have a writer of their own.
+     * Consulted by routing for every timestamped element, so the number of distinct keys routing can
+     * produce - and therefore the number of writers {@link #writerFor} can open - is capped no matter
+     * how many windows a single partition spans.
+     *
+     * <p>The mapping is stable within a partition: the admitted set only grows until the cap is
+     * reached and never after, so a key that mapped to itself keeps mapping to itself and a snapped
+     * key keeps snapping to the same target. That is what guarantees routing yields at most one slice
+     * per writer; two slices for one writer would append the same partition key twice.
      */
-    private LongUnaryOperator routingFunction()
+    private final class WindowAdmission implements LongUnaryOperator
     {
-        if (writers.size() < maxWindowWriters)
-            return windowStartOfMillis;
+        private final NavigableSet<Long> admitted = new TreeSet<>(writers.keySet());
 
-        NoSpamLogger.log(logger, NoSpamLogger.Level.WARN, "window-writer-cap", 1, TimeUnit.MINUTES,
-                         "{}.{} reached the cap of {} concurrent window writers while writing {}; further " +
-                         "windows are folded onto open writers, producing window-spanning sstables that a " +
-                         "later split-refreeze has to break up. window_size is very likely far too small for " +
-                         "the write-timestamp spread of this data.",
-                         cfs.getKeyspaceName(), cfs.getTableName(), maxWindowWriters, descriptor);
+        @Override
+        public long applyAsLong(long millis)
+        {
+            return admit(windowStartOfMillis.applyAsLong(millis));
+        }
 
-        return millis -> {
-            long window = windowStartOfMillis.applyAsLong(millis);
-            if (writers.containsKey(window))
+        /** @return {@code window} itself if it may have its own writer, else the open writer it folds onto. */
+        long admit(long window)
+        {
+            if (admitted.contains(window))
                 return window;
-            Map.Entry<Long, SSTableWriter> floor = writers.floorEntry(window);
-            return floor != null ? floor.getKey() : writers.firstKey();
-        };
+            if (admitted.size() < maxWindowWriters())
+            {
+                admitted.add(window);
+                return window;
+            }
+
+            NoSpamLogger.log(logger, NoSpamLogger.Level.WARN, "window-writer-cap", 1, TimeUnit.MINUTES,
+                             "{}.{} reached the cap of {} concurrent window writers while writing {}; further " +
+                             "windows are folded onto open writers, producing window-spanning sstables that a " +
+                             "later split-refreeze has to break up. window_size is very likely far too small for " +
+                             "the write-timestamp spread of this data.",
+                             cfs.getKeyspaceName(), cfs.getTableName(), maxWindowWriters(), descriptor);
+
+            Long floor = admitted.floor(window);
+            return floor != null ? floor : admitted.first();
+        }
     }
 
-    private SSTableWriter writerFor(long windowStart)
+    /**
+     * The window key is re-admitted here rather than trusted: routing hands back keys it obtained from
+     * the same {@link WindowAdmission} (so this is the identity in every ordinary case), but the
+     * degraded whole-partition slice {@code WindowRoutingIterator.slices} emits on a routing-buffer
+     * overflow is keyed off its buckets and can name a key routing never asked about. Passing it
+     * through admission keeps {@code writers.keySet()} a subset of the admitted set, which is what
+     * bounds the fan-out; that overflow case produces a single slice, so folding it cannot collide
+     * with a sibling slice of the same partition.
+     */
+    private SSTableWriter writerFor(long windowStart, WindowAdmission admission)
     {
-        SSTableWriter writer = writers.get(windowStart);
+        long target = admission.admit(windowStart);
+        SSTableWriter writer = writers.get(target);
         if (writer == null)
         {
             Descriptor desc = writers.isEmpty() ? descriptor : cfs.newSSTableDescriptor(descriptor.directory);
             writer = createWriter(desc, writers.size() + 1);
-            writers.put(windowStart, writer);
+            writers.put(target, writer);
         }
         return writer;
     }

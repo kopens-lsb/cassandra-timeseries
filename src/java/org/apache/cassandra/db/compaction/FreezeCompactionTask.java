@@ -20,6 +20,8 @@ package org.apache.cassandra.db.compaction;
 
 import java.util.Collection;
 
+import com.google.common.annotations.VisibleForTesting;
+
 import org.apache.cassandra.db.ColumnFamilyStore;
 import org.apache.cassandra.db.compaction.timeseries.WindowFrozenListeners;
 import org.apache.cassandra.db.lifecycle.LifecycleTransaction;
@@ -36,11 +38,32 @@ import org.apache.cassandra.io.sstable.format.SSTableReader;
 public class FreezeCompactionTask extends CompactionTask
 {
     private final long windowStartMillis;
+    private final Runnable onCompleted;
 
     public FreezeCompactionTask(ColumnFamilyStore cfs, LifecycleTransaction txn, long gcBefore, long windowStartMillis)
     {
+        this(cfs, txn, gcBefore, windowStartMillis, () -> {});
+    }
+
+    /**
+     * @param onCompleted run once the freeze has durably committed, and never if it aborted or threw.
+     *        {@link TimeSeriesCompactionStrategy} scores its no-progress guard from this, so a freeze
+     *        refused by the disk-space pre-flight or stopped by {@code nodetool stop COMPACTION} must
+     *        not reach it - a strike for work that never ran would park a healthy window, and freeing
+     *        the disk would not un-park it.
+     */
+    public FreezeCompactionTask(ColumnFamilyStore cfs, LifecycleTransaction txn, long gcBefore,
+                                long windowStartMillis, Runnable onCompleted)
+    {
         super(cfs, txn, gcBefore);
         this.windowStartMillis = windowStartMillis;
+        this.onCompleted = onCompleted;
+    }
+
+    @VisibleForTesting
+    Runnable onCompleted()
+    {
+        return onCompleted;
     }
 
     /**
@@ -76,13 +99,18 @@ public class FreezeCompactionTask extends CompactionTask
      * its <em>first</em> key, so a boundary or topology change can leave one instance holding sstables that
      * cross the new boundary. The window then still has two sstables and classifies FREEZING again; the
      * strategy's no-progress guard is what stops that becoming a permanent refreeze loop
-     * ({@code TimeSeriesCompactionStrategy#allowRewrite}). No event fires for a split output, because no
-     * single sstable represents the window.
+     * ({@code TimeSeriesCompactionStrategy#recordCompletedRewrite}). No event fires for a split output,
+     * because no single sstable represents the window.
+     * <p>
+     * The guard callback fires here for the same reason the listeners do, and unconditionally: a freeze
+     * that emitted two sstables, or none, is still a freeze that ran, and "ran and changed nothing" is
+     * exactly what the guard has to count.
      */
     @Override
     protected Collection<SSTableReader> finish(AbstractCompactionPipeline pipeline)
     {
         Collection<SSTableReader> newSStables = super.finish(pipeline);
+        onCompleted.run();
         if (newSStables.size() == 1)
             WindowFrozenListeners.fire(cfs.metadata(), windowStartMillis, newSStables.iterator().next());
         else if (newSStables.isEmpty())

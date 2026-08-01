@@ -119,14 +119,35 @@ public final class WindowRoutingIterator
      * compaction partitions.
      *
      * <p>Rather than materialise a million-row time-series partition on heap, routing gives up on
-     * splitting a partition once it exceeds this budget: the buffered prefix and the unread remainder
-     * are handed back as a single lazy slice (see {@link #slices}), which keeps memory bounded and the
-     * data correct at the cost of one window-spanning sstable. That sstable is visible — it classifies
-     * FREEZING, and the strategy's no-progress guard parks it with a WARN naming the sstable rather
-     * than rewriting it forever.
+     * splitting a partition once it exceeds this budget: the untouched source prefix and the unread
+     * remainder are handed back as a single lazy slice (see {@link #slices}), which keeps memory
+     * bounded and the data correct at the cost of one window-spanning sstable.
+     *
+     * <p><b>Why that does not livelock.</b> The spanning sstable classifies FREEZING, so
+     * {@code nextSplitRefreezeCandidate} selects it and {@code SplitRefreezeCompactionTask} re-routes
+     * it — with the same budget, so the same partition overflows again and the same window keeps a
+     * spanning sstable. The strategy's no-progress guard is what bounds that, and it does so because
+     * the rewrite is provably shape-preserving here: the window holds one sstable before and one
+     * after, and the overflowing partition's timestamps are unchanged by a rewrite that neither drops
+     * nor splits them, so the sstable's min/max — and hence the window's
+     * {@code (sstable count, windows spanned)} signature — come out identical. The guard compares
+     * exactly that signature across a completed rewrite, so each futile split scores a strike and the
+     * window is parked after {@code NO_PROGRESS_STRIKES} of them, with a WARN naming the sstable.
+     * (Purging can shrink the span, in which case the rewrite made real progress, the guard resets,
+     * and the next round starts the count again from a strictly smaller span — still finite.)
      *
      * <p>Failing instead was rejected: this routing is on the memtable flush path, where an exception
      * fails the whole flush and blocks writes.
+     *
+     * <p><b>What this actually measures.</b> The counter is a sum of {@link Row#dataSize()}, i.e. the
+     * <em>serialized</em> size of the buffered rows, and a flat 64 bytes for a range-tombstone marker.
+     * Retained heap is a multiple of that: every buffered row also costs a {@code BTreeRow} plus its
+     * BTree and {@code Cell} objects (object headers, references and padding), the routing keeps two
+     * reference lists over the prefix (the stream-order buffer used by the overflow path and the
+     * per-window buckets), and a row whose timestamps straddle a boundary is retained both whole and
+     * as its per-window pieces. So this is a coarse throttle that stops unbounded growth, not a hard
+     * heap ceiling: expect real retention of a few times the configured number while a partition is
+     * being routed. Size it accordingly rather than against a heap headroom figure.
      */
     @VisibleForTesting
     static volatile long maxBufferedBytesPerPartition = 64L * 1024 * 1024;
@@ -156,6 +177,12 @@ public final class WindowRoutingIterator
     private static final class Routed
     {
         final NavigableMap<Long, List<Unfiltered>> buckets = new TreeMap<>();
+        /**
+         * The buffered prefix in <em>source</em> order — the original {@link Unfiltered}s, untouched: no
+         * row split into pieces, no range-tombstone boundary decomposed. Only the overflow path reads
+         * it; see {@link #slices} for why that is the only ordering that can be written back out.
+         */
+        final List<Unfiltered> prefix = new ArrayList<>();
         /** Non-null once the budget was exhausted: the unread remainder of the source partition. */
         Iterator<Unfiltered> remainder;
         /** The newest window observed before giving up — where the unsplit remainder is parked. */
@@ -186,6 +213,7 @@ public final class WindowRoutingIterator
                 return routed;
             }
             buffered += sizeOf(unfiltered);
+            routed.prefix.add(unfiltered);
 
             if (unfiltered instanceof RangeTombstoneBoundaryMarker)
             {
@@ -227,10 +255,22 @@ public final class WindowRoutingIterator
      * data in comparator order, and complex cells in cell-path order after that column's complex
      * deletion, so every per-window subset is handed to its builder already sorted — the same
      * discipline {@code UnfilteredSerializer} uses when reading rows back off disk.
+     *
+     * <p>A row that carries <em>no</em> timestamp at all is dropped, on purpose. Every element a row can
+     * hold — primary-key liveness, row deletion, complex deletion, simple or complex cell — carries a
+     * write timestamp, so "no timestamp" is exactly "no content": {@link Row#isEmpty()}. There is no
+     * window such a row could be routed to and nothing to write if there were; the sstable writers'
+     * {@code Rows.collectStats} rightly refuses an empty row. An earlier revision threw here instead,
+     * which was defensible while routing was per-row (an empty row meant the caller had gone wrong) but
+     * is not now: on the memtable-flush path an exception fails the whole flush and blocks writes, and
+     * the condition is checked and skipped rather than merely falling through untested.
      */
     @VisibleForTesting
     static NavigableMap<Long, Row> splitRow(Row row, LongUnaryOperator windowStartOfMillis, TimeUnit tableResolution)
     {
+        if (row.isEmpty())
+            return Collections.emptyNavigableMap();
+
         // Overwhelmingly the common case: every timestamp in the row names the same window, so the row
         // is already contained and is passed through untouched - no rebuild, no allocation, and callers
         // keep the original instance.
@@ -291,8 +331,8 @@ public final class WindowRoutingIterator
 
     /**
      * @return the one window every timestamp in {@code row} belongs to, or {@link #NOT_SINGLE_WINDOW}
-     *         if they differ (or the row carries no timestamp at all, in which case there is nothing to
-     *         route and the split path correctly produces no pieces).
+     *         if they differ. Callers screen out empty rows first ({@link #splitRow}), so a non-empty
+     *         row always names at least one window.
      */
     private static long singleWindowOf(Row row, LongUnaryOperator windowStartOfMillis, TimeUnit tableResolution)
     {
@@ -399,16 +439,29 @@ public final class WindowRoutingIterator
                              partition.partitionKey(), partition.metadata().keyspace, partition.metadata().name,
                              maxBufferedBytesPerPartition, routed.overflowWindow);
 
-            List<Unfiltered> prefix = new ArrayList<>();
-            for (List<Unfiltered> bucket : routed.buckets.values())
-                prefix.addAll(bucket);
-            // Buckets are per-window; concatenating them loses clustering order, so re-sort the
-            // buffered prefix before splicing the (still ordered) remainder behind it.
-            prefix.sort(partition.metadata().comparator);
+            // The routing work done so far is DISCARDED and the untouched source prefix is written
+            // instead. Two reasons, both fatal to any attempt to reuse the buckets here:
+            //
+            //  1. routed.buckets holds split PIECES. A row whose cells straddle a boundary contributes
+            //     one piece per window, all sharing the row's Clustering, and ClusteringComparator ranks
+            //     those equal - so concatenating the buckets and sorting cannot separate them, and
+            //     SortedTablePartitionWriter.addUnfiltered does not validate monotonicity. The partition
+            //     would be written with the same clustering twice, and every later split-refreeze would
+            //     re-read and re-propagate it. That is the very defect element-granularity routing exists
+            //     to fix, reintroduced on the degraded path.
+            //  2. A RangeTombstoneBoundaryMarker whose deletions fall in different windows is decomposed
+            //     into a close and an open marker. INCL_END_BOUND and EXCL_START_BOUND compare equal
+            //     (ClusteringPrefix.Kind.comparison == 3), so once the buckets are concatenated in
+            //     window-key order a stable sort cannot restore their relative order: when the open
+            //     deletion is older than the close deletion the open marker precedes the close marker and
+            //     one of the two range tombstones silently loses its coverage, resurrecting deleted rows.
+            //
+            // The source prefix has neither problem by construction: clusterings are strictly increasing,
+            // boundary markers are still whole, and the unread remainder appends behind it in order.
             Row overflowStatic = staticRow.isEmpty() ? Rows.EMPTY_STATIC_ROW : staticRow;
             slices.put(routed.overflowWindow,
                        new WindowSlice(partition, partitionDeletion, overflowStatic,
-                                       Iterators.concat(prefix.iterator(), routed.remainder)));
+                                       Iterators.concat(routed.prefix.iterator(), routed.remainder)));
             return slices;
         }
 

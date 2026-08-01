@@ -293,6 +293,40 @@ public class TimeWindowSplittingMultiWriterTest extends SchemaLoader
                                          List.<Unfiltered>of(older, newer).iterator());
     }
 
+    /**
+     * C2: the writer cap has to hold <em>inside</em> one partition.
+     * <p>
+     * It used to be evaluated once per {@code append()} - that is, once per partition - after which
+     * {@code writerFor} created writers with no further check. So the first partition of a flush opened
+     * one writer per window, unbounded: a 10 MB partition holding one row an hour for ten years wants
+     * ~87,600 concurrent {@code SSTableWriter}s (each with data, index, filter and CRC descriptors plus
+     * buffers), on the memtable-flush path, and the routing-buffer budget never trips because the
+     * partition is nowhere near 64 MiB. Here one partition spans ten windows with a cap of three; before
+     * the fix this flushed ten sstables.
+     */
+    @Test
+    public void oneOversizedPartitionCannotExceedTheWriterCap()
+    {
+        ColumnFamilyStore cfs = prepare();
+        int saved = TimeWindowSplittingMultiWriter.maxWindowWriters;
+        try
+        {
+            TimeWindowSplittingMultiWriter.maxWindowWriters = 3;
+            long now = System.currentTimeMillis();
+            for (int i = 0; i < 10; i++)                 // ONE partition, ten distinct write-timestamp windows
+                write(cfs, "tag-cap", "c" + i, now - i * MINUTE_MS);
+            Util.flush(cfs);
+
+            assertEquals("one partition must not open more writers than the cap", 3, cfs.getLiveSSTables().size());
+            // Folding windows together costs containment, not data: every row is still readable.
+            assertEquals(10, Util.getOnlyPartition(Util.cmd(cfs, Util.dk("tag-cap")).build()).rowCount());
+        }
+        finally
+        {
+            TimeWindowSplittingMultiWriter.maxWindowWriters = saved;
+        }
+    }
+
     @Test
     public void allRowsReadableAfterSplit()
     {

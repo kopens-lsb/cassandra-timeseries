@@ -20,10 +20,12 @@ package org.apache.cassandra.db.compaction;
 
 import java.util.ArrayList;
 import java.util.Collection;
+import java.util.Collections;
 import java.util.HashMap;
 import java.util.HashSet;
 import java.util.List;
 import java.util.Map;
+import java.util.NavigableMap;
 import java.util.Set;
 import java.util.TreeMap;
 import java.util.concurrent.TimeUnit;
@@ -96,20 +98,24 @@ public class TimeSeriesCompactionStrategy extends AbstractCompactionStrategy
     private volatile Set<SSTableReader> farFutureSSTables = Set.of();
     // Per-window no-progress bookkeeping for the guard below; guarded by this.
     private final Map<Long, WindowProgress> windowProgress = new HashMap<>();
+    // windows the guard has parked, with the sstables they are parked at; refreshed each round so
+    // operators can see them - a parked window is deliberately absent from the backlogs, so it would
+    // otherwise be invisible except for one WARN at the transition. See getParkedWindows().
+    private volatile NavigableMap<Long, Set<SSTableReader>> parkedWindows = Collections.emptyNavigableMap();
 
     /**
-     * How many times a rewrite may be <em>re-dispatched</em> for one window at an unchanged shape before
-     * the window is parked; the window is therefore rewritten at most {@code NO_PROGRESS_STRIKES + 1}
-     * times in total. Two allows a couple of retries - enough to absorb a rewrite that lost a race with
-     * concurrent work - while keeping a genuinely stuck window's cost bounded instead of unbounded.
+     * How many <em>completed</em> rewrites of one window may leave that window's shape unchanged before
+     * it is parked; a genuinely stuck window is therefore rewritten exactly this many times and then
+     * never again. Two allows one futile rewrite - enough to absorb a rewrite that lost a race with
+     * concurrent work - while keeping a stuck window's cost bounded instead of unbounded.
      */
     @VisibleForTesting
     static final int NO_PROGRESS_STRIKES = 2;
 
-    /** What the guard remembers about a window it has handed out a freeze or split task for. */
+    /** What the guard remembers about a window whose rewrite completed without changing it. */
     private static final class WindowProgress
     {
-        /** The window's shape when the last task was handed out; see {@link #windowSignature}. */
+        /** The window's shape after that rewrite; see {@link #windowSignature}. */
         private final long signature;
         private int strikes;
         private boolean parked;
@@ -212,9 +218,11 @@ public class TimeSeriesCompactionStrategy extends AbstractCompactionStrategy
                 if (txn != null)
                 {
                     previousFreezeCandidate = Set.of();
-                    recordRewriteDispatch(freeze.getKey(), freeze.getValue(), "freeze");
                     logger.debug("Freezing window {} of {}: {} sstables -> 1", freeze.getKey(), cfs.getTableName(), toFreeze.size());
-                    return List.of(new FreezeCompactionTask(cfs, txn, gcBefore, freeze.getKey()));
+                    long window = freeze.getKey();
+                    long before = windowSignature(freeze.getValue());
+                    return List.of(new FreezeCompactionTask(cfs, txn, gcBefore, window,
+                                                            () -> recordCompletedRewrite(window, before, "freeze")));
                 }
                 // Refused (e.g. a delegate compaction started while the window was CLOSING is still running):
                 // skip this round, fall through to the delegate, retry next round (spec section 8).
@@ -243,10 +251,12 @@ public class TimeSeriesCompactionStrategy extends AbstractCompactionStrategy
                     if (txn != null)
                     {
                         previousFreezeCandidate = Set.of();
-                        recordRewriteDispatch(split.getKey(), split.getValue(), "split-refreeze");
                         logger.debug("Split-refreezing spanning sstable in window {} of {}", split.getKey(), cfs.getTableName());
+                        long window = split.getKey();
+                        long before = windowSignature(split.getValue());
                         return List.of(new SplitRefreezeCompactionTask(cfs, txn, gcBefore,
-                                                                       tsOptions::windowStartFor, tsOptions.timestampResolution));
+                                                                       tsOptions::windowStartFor, tsOptions.timestampResolution,
+                                                                       () -> recordCompletedRewrite(window, before, "split-refreeze")));
                     }
                     if (toSplit.equals(previousFreezeCandidate))
                         logger.warn("Could not acquire references for split-refreezing sstables {} which is not a problem" +
@@ -407,7 +417,7 @@ public class TimeSeriesCompactionStrategy extends AbstractCompactionStrategy
             if (classify(window.getKey(), window.getValue(), nowMillis) != WindowState.FREEZING)
                 continue;
             if (isParked(window.getKey(), window.getValue()))
-                continue;                                 // freezing it again provably changes nothing; see allowRewrite
+                continue;                                 // freezing it again provably changes nothing; see recordCompletedRewrite
             backlog++;
             if (oldest == null)
                 oldest = window;
@@ -438,7 +448,7 @@ public class TimeSeriesCompactionStrategy extends AbstractCompactionStrategy
             if (classify(window.getKey(), window.getValue(), nowMillis) != WindowState.FREEZING)
                 continue;                                 // FROZEN (contained) or still active/expired
             if (isParked(window.getKey(), window.getValue()))
-                continue;                                 // splitting it again provably changes nothing; see allowRewrite
+                continue;                                 // splitting it again provably changes nothing; see recordCompletedRewrite
             backlog++;
             if (oldest == null)
                 oldest = window;
@@ -462,41 +472,63 @@ public class TimeSeriesCompactionStrategy extends AbstractCompactionStrategy
      * </ul>
      * Candidate equality cannot detect either: every rewrite produces a fresh generation, so the
      * candidate set differs each round while the window's <em>shape</em> is unchanged. The guard
-     * therefore compares the shape - {@link #windowSignature} - across rewrites of the same window,
-     * and parks a window whose shape has survived {@link #NO_PROGRESS_STRIKES} completed rewrites.
+     * therefore compares the shape - {@link #windowSignature} - immediately before and immediately
+     * after each rewrite, and parks a window that survives {@link #NO_PROGRESS_STRIKES} rewrites which
+     * each left it exactly as they found it.
+     * <p>
+     * <b>Before-and-after, not round-to-round.</b> Comparing the shape a window has when a task is
+     * handed out with the shape it had at the previous hand-out cannot tell a stuck window from a
+     * healthy one under steady late data: a closed window that receives one late flush per round
+     * oscillates 2 sstables -> 1 -> 2, and every round samples it at 2 with an identical signature, so
+     * three <em>successful</em> freezes would park a window that is working perfectly. Attributing the
+     * shape change to the rewrite that caused it fixes that - the freeze took the window from 2 to 1
+     * and the guard sees it - while still catching the real loops, where the rewrite provably changed
+     * nothing.
+     * <p>
+     * <b>Completed rewrites only.</b> This is called strictly post-commit by the task itself, so a
+     * freeze aborted by the disk-space pre-flight, stopped by {@code nodetool stop COMPACTION} or
+     * killed by an IO error never scores. Counting hand-outs instead meant three consecutive full-disk
+     * rounds parked a window, and freeing the disk did not un-park it: nothing about the window had
+     * changed, so nothing reset the guard, and only a restart or a shape change recovered it.
      * <p>
      * Parking is deliberately self-healing: the record is keyed on the signature, so any change to the
      * window (a late flush, an operator's {@code nodetool relocatesstables} or major compaction)
      * silently un-parks it. Parking is a safety net, not a fix - a parked window never freezes, so
      * {@link org.apache.cassandra.db.compaction.timeseries.WindowFrozenListener} never fires for it and
-     * downstream consumers never see it. That is why it warns.
+     * downstream consumers never see it. That is why it warns, and why {@link #getParkedWindows()}
+     * exposes the current set.
      *
-     * Called immediately after a rewrite task has been successfully dispatched for this window - never
-     * on a round where {@code tryModify} refused. That distinction matters: a window whose sstables are
-     * briefly locked by another compaction must not accumulate strikes for rounds in which nothing ran,
-     * or contention alone would park a perfectly healthy window.
+     * @param signatureBefore the window's shape when this rewrite was handed out
      */
-    private synchronized void recordRewriteDispatch(long windowStartMillis, Set<SSTableReader> windowSSTables, String what)
+    @VisibleForTesting
+    synchronized void recordCompletedRewrite(long windowStartMillis, long signatureBefore, String what)
     {
-        long signature = windowSignature(windowSSTables);
-        WindowProgress progress = windowProgress.get(windowStartMillis);
-        if (progress == null || progress.signature != signature)
+        Set<SSTableReader> after = windows().getOrDefault(windowStartMillis, Set.of());
+        long signatureAfter = windowSignature(after);
+        if (signatureAfter != signatureBefore)
         {
-            // First dispatch at this shape - and, if the shape changed, proof the last one made progress.
-            windowProgress.put(windowStartMillis, new WindowProgress(signature));
+            // The rewrite changed the window: real progress, and any earlier strikes are stale.
+            windowProgress.remove(windowStartMillis);
             return;
+        }
+
+        WindowProgress progress = windowProgress.get(windowStartMillis);
+        if (progress == null || progress.signature != signatureAfter)
+        {
+            progress = new WindowProgress(signatureAfter);
+            windowProgress.put(windowStartMillis, progress);
         }
         if (++progress.strikes < NO_PROGRESS_STRIKES)
             return;
 
         progress.parked = true;
-        logger.warn("Parking window {} of {}.{}: {} ran {} more time(s) without changing the window " +
+        logger.warn("Parking window {} of {}.{}: {} completed {} time(s) without changing the window " +
                     "({} sstable(s), spanning windows {}). Not re-selecting it until the window changes - " +
                     "it will not freeze, so downstream consumers of the frozen-window event will not see it. " +
                     "Investigate: for a still-spanning single sstable check for partitions too large to " +
                     "window-route; for a window stuck at several sstables on JBOD, run nodetool relocatesstables.",
                     windowStartMillis, cfs.getKeyspaceName(), cfs.getTableName(), what, progress.strikes,
-                    windowSSTables.size(), describeSpans(windowSSTables));
+                    after.size(), describeSpans(after));
     }
 
     /** True if the guard has parked this window at its current shape. */
@@ -544,11 +576,39 @@ public class TimeSeriesCompactionStrategy extends AbstractCompactionStrategy
         return sb.toString();
     }
 
-    /** Drops guard bookkeeping for windows this instance no longer holds, so the map cannot grow unbounded. */
+    /**
+     * Drops guard bookkeeping for windows this instance no longer holds, so the map cannot grow
+     * unbounded, and republishes {@link #parkedWindows} for {@link #getParkedWindows()}.
+     */
     private synchronized void pruneWindowProgress()
     {
+        Map<Long, Set<SSTableReader>> current = windows();
         if (!windowProgress.isEmpty())
-            windowProgress.keySet().retainAll(windows().keySet());
+            windowProgress.keySet().retainAll(current.keySet());
+
+        NavigableMap<Long, Set<SSTableReader>> parked = new TreeMap<>();
+        for (Map.Entry<Long, Set<SSTableReader>> window : current.entrySet())
+            if (isParked(window.getKey(), window.getValue()))
+                parked.put(window.getKey(), Set.copyOf(window.getValue()));
+        parkedWindows = Collections.unmodifiableNavigableMap(parked);
+    }
+
+    /**
+     * Windows the no-progress guard has parked, mapped to the sstables they are parked at. Exposed for
+     * the same reason as {@link #getFarFutureSSTables()}: a parked window is deliberately skipped by
+     * {@link #nextFreezeCandidate} and {@link #nextSplitRefreezeCandidate}, so it drops out of
+     * {@code freezeBacklog}/{@code splitBacklog} and out of {@link #getEstimatedRemainingTasks()} - it
+     * looks exactly like a table with nothing to do. It is not: a parked window never reaches FROZEN,
+     * so {@link org.apache.cassandra.db.compaction.timeseries.WindowFrozenListener} never fires for it
+     * and everything downstream of the freeze (tiered-storage compression included) stops for that
+     * window. Without this, the only signal is a single WARN at the moment of parking.
+     * <p>
+     * Refreshed on every background round; empty is the healthy state. Un-parking is automatic on any
+     * change to the window - see {@link #recordCompletedRewrite}.
+     */
+    public NavigableMap<Long, Set<SSTableReader>> getParkedWindows()
+    {
+        return parkedWindows;
     }
 
     /**

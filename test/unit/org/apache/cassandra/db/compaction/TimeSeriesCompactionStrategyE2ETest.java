@@ -40,6 +40,7 @@ import org.apache.cassandra.db.ColumnFamilyStore;
 import org.apache.cassandra.db.DecoratedKey;
 import org.apache.cassandra.db.Keyspace;
 import org.apache.cassandra.db.RowUpdateBuilder;
+import org.apache.cassandra.db.compaction.timeseries.TimeWindowSplittingMultiWriter;
 import org.apache.cassandra.db.compaction.timeseries.WindowFrozenListener;
 import org.apache.cassandra.db.compaction.timeseries.WindowFrozenListeners;
 import org.apache.cassandra.db.lifecycle.LifecycleTransaction;
@@ -604,6 +605,60 @@ public class TimeSeriesCompactionStrategyE2ETest extends SchemaLoader
             assertEquals(s.toString(), windowOfMinute(s.getMinTimestamp()), windowOfMinute(s.getMaxTimestamp()));
         assertEquals(3, Util.getOnlyPartition(Util.cmd(cfs, key).build()).rowCount());
         assertTrue(tscs.getNextBackgroundTasksAt(System.currentTimeMillis(), nowInSeconds()).isEmpty());
+    }
+
+    /**
+     * C2, second half: {@code SplitRefreezeCompactionTask} had no cap at all - its {@code rewriters} map
+     * was an unbounded {@code TreeMap}, so splitting one legacy sstable spanning a year at
+     * {@code window_size=1h} would have opened ~8,760 concurrent rewriters, each with its own writer and
+     * file descriptors. It now applies the same per-element admission the flush writer does. Ten windows,
+     * cap three: at most three outputs, all rows still readable.
+     */
+    @Test
+    public void testSplitRefreezeRespectsTheWindowWriterCap()
+    {
+        Keyspace keyspace = Keyspace.open(KEYSPACE1);
+        ColumnFamilyStore cfs = keyspace.getColumnFamilyStore(CF_STANDARD1);
+        cfs.truncateBlocking();
+        cfs.disableAutoCompaction();
+        cfs.setCompactionParameters(ImmutableMap.of("class", "SizeTieredCompactionStrategy"));
+
+        int saved = TimeWindowSplittingMultiWriter.maxWindowWriters;
+        try
+        {
+            ByteBuffer value = ByteBuffer.wrap(new byte[16]);
+            DecoratedKey key = Util.dk("cap-span");
+            long now = System.currentTimeMillis();
+            // One legacy partition spanning ten one-minute windows, flushed while the strategy is still
+            // SizeTiered so nothing splits it on the way in. All ten are well past window_size +
+            // freeze_after, so the newest window is closed and the sstable is a split candidate.
+            for (int i = 0; i < 10; i++)
+                new RowUpdateBuilder(cfs.metadata(), now - TimeUnit.MINUTES.toMillis(10L + i), key.getKey())
+                    .clustering("c" + i).add("val", value).build().applyUnsafe();
+            Util.flush(cfs);
+            assertEquals(1, cfs.getLiveSSTables().size());
+            SSTableReader spanning = cfs.getLiveSSTables().iterator().next();
+
+            TimeWindowSplittingMultiWriter.maxWindowWriters = 3;
+            cfs.setCompactionParameters(ImmutableMap.of("class", "TimeSeriesCompactionStrategy",
+                                                        "timestamp_resolution", "MILLISECONDS",
+                                                        "window_size", "1m",
+                                                        "freeze_after", "1m"));
+            TimeSeriesCompactionStrategy tscs =
+                (TimeSeriesCompactionStrategy) cfs.getCompactionStrategyManager().getCompactionStrategyFor(spanning);
+
+            AbstractCompactionTask task = Iterables.getOnlyElement(tscs.getNextBackgroundTasks(nowInSeconds()), null);
+            assertNotNull(task);
+            assertTrue(task instanceof SplitRefreezeCompactionTask);
+            task.execute(ActiveCompactionsTracker.NOOP);
+
+            assertEquals("a split must not open more rewriters than the cap", 3, cfs.getLiveSSTables().size());
+            assertEquals(10, Util.getOnlyPartition(Util.cmd(cfs, key).build()).rowCount());
+        }
+        finally
+        {
+            TimeWindowSplittingMultiWriter.maxWindowWriters = saved;
+        }
     }
 
     private static long windowOfMinute(long ms)

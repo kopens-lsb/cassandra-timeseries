@@ -52,6 +52,7 @@ import org.apache.cassandra.utils.ByteBufferUtil;
 import org.apache.cassandra.utils.btree.BTree;
 
 import static org.junit.Assert.assertEquals;
+import static org.junit.Assert.assertFalse;
 import static org.junit.Assert.assertSame;
 import static org.junit.Assert.assertTrue;
 
@@ -318,14 +319,42 @@ public class WindowRoutingIteratorTest
         assertEquals(micros(BASE + HOUR_MS + 10), cellPiece.getCell(value).timestamp());
     }
 
-    /** A row with nothing at all in a window must not be emitted into that window. */
+    /**
+     * A row with nothing at all in a window must not be emitted into that window, and no piece that IS
+     * emitted may be an empty row.
+     * <p>
+     * Deliberately a row that takes {@code splitRow}'s SPLIT path - its two cells were written two hours
+     * apart. Asserting against a single-window row, as this test used to, exercises only the fast path,
+     * which returns the caller's row untouched and structurally cannot emit an empty piece or an extra
+     * window: the guarantee named here was never tested.
+     */
     @Test
     public void windowsWithNothingGetNoRow()
     {
-        Row r = row(BASE + 1, BASE + 1);
+        Row r = twoCellRow(BASE + 1, BASE + 1, BASE + 2 * HOUR_MS + 1);
         NavigableMap<Long, List<Unfiltered>> routed = route(List.of(r));
-        assertEquals(1, routed.size());
-        assertTrue(routed.containsKey(BASE));
+
+        // The hour in between is named by no timestamp of this row, so it gets no bucket at all.
+        assertEquals(List.of(BASE, BASE + 2 * HOUR_MS), List.copyOf(routed.keySet()));
+        for (List<Unfiltered> bucket : routed.values())
+            for (Unfiltered u : bucket)
+                assertFalse("an empty piece was emitted into a window", ((Row) u).isEmpty());
+    }
+
+    /**
+     * A row carrying no timestamp at all is dropped, deliberately and explicitly. Every element a row
+     * can hold is timestamped, so "no timestamp" is exactly "no content", there is no window to route it
+     * to, and the sstable writers refuse an empty row anyway. The previous revision reached the same
+     * outcome by falling through a split path that happened to build no pieces; this pins it.
+     */
+    @Test
+    public void emptyRowIsDroppedRatherThanRouted()
+    {
+        Row empty = BTreeRow.create(ck(BASE + 1), org.apache.cassandra.db.LivenessInfo.EMPTY,
+                                    Row.Deletion.LIVE, BTree.empty());
+        assertTrue(empty.isEmpty());
+        assertTrue(WindowRoutingIterator.splitRow(empty, WINDOW, TimeUnit.MICROSECONDS).isEmpty());
+        assertTrue(route(List.of(empty)).isEmpty());
     }
 
     // ---------------------------------------------------------------------------------------------
@@ -404,23 +433,33 @@ public class WindowRoutingIteratorTest
                    sliced.get(BASE + HOUR_MS).partitionLevelDeletion().isLive());
     }
 
-    /** Exactly one slice carries the header; the rest get LIVE/EMPTY, which MetadataCollector ignores. */
+    /**
+     * Exactly one slice carries the partition deletion and exactly one carries the static row; the rest
+     * get LIVE/EMPTY, which MetadataCollector ignores.
+     * <p>
+     * Three windows, one piece of the partition in each: the deletion in window 1, both static cells in
+     * window 2, one regular row in window 3. Passing a {@code null} static row - as this test used to -
+     * made the static half vacuous: {@code Source} substitutes {@code EMPTY_STATIC_ROW}, which is
+     * exactly what the assertion looks for, so it held no matter what routing did with a real one.
+     */
     @Test
     public void nonHeaderSlicesCarryNoHeader()
     {
         DeletionTime deletion = DeletionTime.build(micros(BASE + 5), 1000);
         NavigableMap<Long, UnfilteredRowIterator> sliced =
-            slices(deletion, null, List.of(row(BASE + 1, BASE + 1), row(BASE + 2, BASE + HOUR_MS + 2)));
+            slices(deletion, staticRow(BASE + HOUR_MS + 3, BASE + HOUR_MS + 4),
+                   List.of(row(BASE + 1, BASE + 2 * HOUR_MS + 1)));
+        assertEquals(3, sliced.size());
 
-        int carryingDeletion = 0;
-        for (UnfilteredRowIterator slice : sliced.values())
-        {
-            if (!slice.partitionLevelDeletion().isLive())
-                carryingDeletion++;
-            else
-                assertTrue(slice.staticRow().isEmpty());
-        }
-        assertEquals(1, carryingDeletion);
+        assertEquals(deletion, sliced.get(BASE).partitionLevelDeletion());
+        assertTrue("the deletion's window must not also inherit the static row",
+                   sliced.get(BASE).staticRow().isEmpty());
+
+        assertTrue(sliced.get(BASE + HOUR_MS).partitionLevelDeletion().isLive());
+        assertEquals(2, sliced.get(BASE + HOUR_MS).staticRow().columnCount());
+
+        assertTrue(sliced.get(BASE + 2 * HOUR_MS).partitionLevelDeletion().isLive());
+        assertTrue(sliced.get(BASE + 2 * HOUR_MS).staticRow().isEmpty());
     }
 
     /** A partition with nothing in it at all yields no slices. */
@@ -428,6 +467,136 @@ public class WindowRoutingIteratorTest
     public void emptyPartitionYieldsNoSlices()
     {
         assertTrue(slices(DeletionTime.LIVE, null, List.of()).isEmpty());
+    }
+
+    // ---------------------------------------------------------------------------------------------
+    // The degraded overflow path: a partition too large to window-route is written UNSPLIT. The prefix
+    // that has already been buffered must go out exactly as it came in - not as re-sorted split pieces.
+    // ---------------------------------------------------------------------------------------------
+
+    private static List<Unfiltered> drain(UnfilteredRowIterator slice)
+    {
+        List<Unfiltered> out = new ArrayList<>();
+        while (slice.hasNext())
+            out.add(slice.next());
+        return out;
+    }
+
+    /**
+     * C1: a partition over the routing budget must not be written with the same clustering twice.
+     * <p>
+     * The old overflow path concatenated the per-window buckets and re-sorted them. Those buckets hold
+     * split <em>pieces</em>, and a row whose cells straddle a window boundary contributes one piece per
+     * window, all carrying the row's own {@code Clustering} - which {@code ClusteringComparator} ranks
+     * equal, so the sort kept both and {@code SortedTablePartitionWriter.addUnfiltered} (which does not
+     * validate monotonicity) wrote them both. That is the exact INSERT-then-UPDATE shape this release
+     * exists to fix, reintroduced on the degraded path, and every later split-refreeze re-propagated it.
+     */
+    @Test
+    public void overflowingPartitionIsWrittenUnsplitAndNeverDuplicatesAClustering()
+    {
+        long saved = WindowRoutingIterator.maxBufferedBytesPerPartition;
+        try
+        {
+            // INSERT ... USING TIMESTAMP old, then UPDATE ... SET val0 USING TIMESTAMP new, merged into
+            // one row - placed FIRST so it lands in the buffered prefix, the only place the old
+            // concatenate-and-sort could duplicate it.
+            Row straddling = twoCellRow(BASE + 1, BASE + 1, BASE + HOUR_MS + 1);
+            Row second = row(BASE + 2, BASE + 2);
+            Row third = row(BASE + 3, BASE + HOUR_MS + 3);
+
+            WindowRoutingIterator.maxBufferedBytesPerPartition = 1;   // overflow right after the first row
+            NavigableMap<Long, UnfilteredRowIterator> sliced =
+                slices(DeletionTime.LIVE, null, List.of(straddling, second, third));
+
+            assertEquals("an overflowing partition yields exactly one, unsplit slice", 1, sliced.size());
+            List<Unfiltered> emitted = drain(sliced.firstEntry().getValue());
+
+            // The source Unfiltereds, untouched and in source order - so no clustering can repeat.
+            assertEquals(3, emitted.size());
+            assertSame(straddling, emitted.get(0));
+            assertSame(second, emitted.get(1));
+            assertSame(third, emitted.get(2));
+            assertStrictlyIncreasing(emitted);
+        }
+        finally
+        {
+            WindowRoutingIterator.maxBufferedBytesPerPartition = saved;
+        }
+    }
+
+    /**
+     * I4: the overflow path must not reorder a range-tombstone boundary's two halves.
+     * <p>
+     * {@code INCL_END_BOUND} and {@code EXCL_START_BOUND} share {@code comparison == 3}, so they compare
+     * equal; the old path decomposed a boundary whose deletions fell in different windows and then
+     * concatenated the buckets in window-key order, and when the OPEN deletion was the older of the two
+     * its half came out first. A stable sort cannot repair that, and the result -
+     * {@code open(a,D1), open(x,D2), close(x,D1), close(b,D2)} - silently drops D2's coverage of
+     * {@code [x,b]}, resurrecting deleted rows. Written unsplit, the boundary is never decomposed at all.
+     */
+    @Test
+    public void overflowingPartitionKeepsRangeTombstoneBoundariesIntact()
+    {
+        long saved = WindowRoutingIterator.maxBufferedBytesPerPartition;
+        try
+        {
+            DeletionTime newer = DeletionTime.build(micros(BASE + HOUR_MS + 5), 1000);   // window 2
+            DeletionTime older = DeletionTime.build(micros(BASE + 5), 1000);             // window 1
+            Unfiltered open = RangeTombstoneBoundMarker.inclusiveOpen(false, ck(BASE + 10), newer);
+            // closes the newer deletion and opens the older one: closeWindow > openWindow, the inversion.
+            RangeTombstoneBoundaryMarker boundary =
+                RangeTombstoneBoundaryMarker.exclusiveCloseInclusiveOpen(false, ck(BASE + 20), newer, older);
+            Unfiltered close = RangeTombstoneBoundMarker.inclusiveClose(false, ck(BASE + 30), older);
+
+            // sizeOf() charges a marker a flat 64 bytes, so 100 buffers two and overflows on the third.
+            WindowRoutingIterator.maxBufferedBytesPerPartition = 100;
+            NavigableMap<Long, UnfilteredRowIterator> sliced =
+                slices(DeletionTime.LIVE, null, List.of(open, boundary, close));
+
+            assertEquals(1, sliced.size());
+            List<Unfiltered> emitted = drain(sliced.firstEntry().getValue());
+            assertEquals(3, emitted.size());
+            assertSame(open, emitted.get(0));
+            assertSame("the boundary must still be whole, not decomposed and reordered", boundary, emitted.get(1));
+            assertSame(close, emitted.get(2));
+        }
+        finally
+        {
+            WindowRoutingIterator.maxBufferedBytesPerPartition = saved;
+        }
+    }
+
+    /** The overflow slice keeps the partition header, since it is the only slice there is. */
+    @Test
+    public void overflowingPartitionKeepsItsHeader()
+    {
+        long saved = WindowRoutingIterator.maxBufferedBytesPerPartition;
+        try
+        {
+            DeletionTime deletion = DeletionTime.build(micros(BASE + 5), 1000);
+            Row statics = staticRow(BASE + 3, BASE + HOUR_MS + 3);
+            WindowRoutingIterator.maxBufferedBytesPerPartition = 1;
+            NavigableMap<Long, UnfilteredRowIterator> sliced =
+                slices(deletion, statics, List.of(row(BASE + 1, BASE + 1), row(BASE + 2, BASE + HOUR_MS + 2)));
+
+            assertEquals(1, sliced.size());
+            UnfilteredRowIterator only = sliced.firstEntry().getValue();
+            assertEquals(deletion, only.partitionLevelDeletion());
+            assertEquals("the static row goes out whole, not split per cell", 2, only.staticRow().columnCount());
+        }
+        finally
+        {
+            WindowRoutingIterator.maxBufferedBytesPerPartition = saved;
+        }
+    }
+
+    private static void assertStrictlyIncreasing(List<Unfiltered> unfiltereds)
+    {
+        for (int i = 1; i < unfiltereds.size(); i++)
+            assertTrue("clustering must strictly increase at " + i + ": " + unfiltereds,
+                       metadata.comparator.compare(unfiltereds.get(i - 1).clustering(),
+                                                   unfiltereds.get(i).clustering()) < 0);
     }
 
     @Test

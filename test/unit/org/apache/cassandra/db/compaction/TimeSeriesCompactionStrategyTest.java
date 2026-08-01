@@ -504,14 +504,50 @@ public class TimeSeriesCompactionStrategyTest
 
     // ---------------------------------------------------------------------------------------------
     // The no-progress guard: one guard in the strategy for both livelock shapes.
+    //
+    // Strikes are scored by the task itself, post-commit, through the callback the strategy hands it -
+    // not at hand-out. These tests therefore have to run that callback to simulate a rewrite that
+    // actually committed; dispatching alone must score nothing (see guardScoresOnlyRewritesThatCompleted).
     // ---------------------------------------------------------------------------------------------
+
+    /** Runs a dispatched rewrite task's post-commit guard callback: "this rewrite durably committed". */
+    private static void complete(AbstractCompactionTask task)
+    {
+        if (task instanceof FreezeCompactionTask)
+            ((FreezeCompactionTask) task).onCompleted().run();
+        else if (task instanceof SplitRefreezeCompactionTask)
+            ((SplitRefreezeCompactionTask) task).onCompleted().run();
+        else
+            throw new AssertionError("not a rewrite task: " + task);
+    }
+
+    private static AbstractCompactionTask onlyTask(Collection<AbstractCompactionTask> tasks)
+    {
+        assertEquals("expected exactly one task, got " + tasks, 1, tasks.size());
+        return List.copyOf(tasks).get(0);
+    }
+
+    /** Replaces this instance's whole sstable set, as a committed rewrite or a late flush would. */
+    private static void setWindow(TimeSeriesCompactionStrategy tscs, ColumnFamilyStore cfs, Set<SSTableReader> window)
+    {
+        for (SSTableReader s : tscs.getSSTables())
+            tscs.removeSSTable(s);
+        for (SSTableReader s : window)
+            tscs.addSSTable(s);
+        when(cfs.getLiveSSTables()).thenReturn(window);
+    }
+
+    private static long oldWindow()
+    {
+        return new TimeSeriesCompactionStrategyOptions(options()).windowStartFor(NOW - 10 * HOUR);
+    }
 
     /**
      * T2-I3's shape: a freeze that keeps emitting two sstables (a JBOD disk-boundary writer switch)
      * leaves the window at two sstables, so it classifies FREEZING and is re-selected forever. Here the
-     * sstable set never changes between rounds, which is exactly what the classifier sees in that case.
-     * Candidate equality cannot catch it in production because each rewrite has a fresh generation, so
-     * the guard compares the window's shape instead.
+     * sstable set never changes across the rewrite, which is exactly what the classifier sees in that
+     * case. Candidate equality cannot catch it in production because each rewrite has a fresh
+     * generation, so the guard compares the window's shape before and after the rewrite instead.
      */
     @Test
     public void freezeThatNeverChangesTheWindowIsParked()
@@ -523,26 +559,23 @@ public class TimeSeriesCompactionStrategyTest
         ColumnFamilyStore cfs = mock(ColumnFamilyStore.class, Mockito.RETURNS_DEEP_STUBS);
         stubTracker(cfs);
         TimeSeriesCompactionStrategy tscs = new TimeSeriesCompactionStrategy(cfs, options(), delegate);
-        TimeSeriesCompactionStrategyOptions o = new TimeSeriesCompactionStrategyOptions(options());
 
         SSTableReader a = sstableAt(NOW - 10 * HOUR);
         SSTableReader b = sstableAt(NOW - 10 * HOUR + 60_000);
-        tscs.addSSTable(a);
-        tscs.addSSTable(b);
-        when(cfs.getLiveSSTables()).thenReturn(Set.of(a, b));
+        setWindow(tscs, cfs, Set.of(a, b));
 
-        // Bounded: the window is rewritten NO_PROGRESS_STRIKES + 1 times, then never again.
-        for (int round = 0; round <= TimeSeriesCompactionStrategy.NO_PROGRESS_STRIKES; round++)
+        // Bounded: exactly NO_PROGRESS_STRIKES freezes actually run, each leaving the window untouched.
+        for (int round = 0; round < TimeSeriesCompactionStrategy.NO_PROGRESS_STRIKES; round++)
         {
-            Collection<AbstractCompactionTask> tasks = tscs.getNextBackgroundTasksAt(NOW, 0);
-            assertEquals("round " + round, 1, tasks.size());
-            assertTrue("round " + round, List.copyOf(tasks).get(0) instanceof FreezeCompactionTask);
+            AbstractCompactionTask task = onlyTask(tscs.getNextBackgroundTasksAt(NOW, 0));
+            assertTrue("round " + round, task instanceof FreezeCompactionTask);
+            complete(task);
         }
 
-        // The next round parks the window and every round after it falls straight through to the delegate.
+        // From here on every round falls straight through to the delegate.
         assertEquals(List.of(delegateTask), List.copyOf(tscs.getNextBackgroundTasksAt(NOW, 0)));
         assertEquals(List.of(delegateTask), List.copyOf(tscs.getNextBackgroundTasksAt(NOW, 0)));
-        assertTrue(tscs.isParked(o.windowStartFor(NOW - 10 * HOUR), Set.of(a, b)));
+        assertTrue(tscs.isParked(oldWindow(), Set.of(a, b)));
         // A parked window is no longer pending work, so it must not inflate the backlog either.
         assertEquals(0, tscs.getEstimatedRemainingTasks());
     }
@@ -557,21 +590,52 @@ public class TimeSeriesCompactionStrategyTest
         ColumnFamilyStore cfs = mock(ColumnFamilyStore.class, Mockito.RETURNS_DEEP_STUBS);
         stubTracker(cfs);
         TimeSeriesCompactionStrategy tscs = new TimeSeriesCompactionStrategy(cfs, options(), delegate);
-        TimeSeriesCompactionStrategyOptions o = new TimeSeriesCompactionStrategyOptions(options());
 
         SSTableReader spanning = sstableSpanning(NOW - 11 * HOUR, NOW - 10 * HOUR);
-        tscs.addSSTable(spanning);
-        when(cfs.getLiveSSTables()).thenReturn(Set.of(spanning));
+        setWindow(tscs, cfs, Set.of(spanning));
 
-        for (int round = 0; round <= TimeSeriesCompactionStrategy.NO_PROGRESS_STRIKES; round++)
+        for (int round = 0; round < TimeSeriesCompactionStrategy.NO_PROGRESS_STRIKES; round++)
         {
-            Collection<AbstractCompactionTask> tasks = tscs.getNextBackgroundTasksAt(NOW, 0);
-            assertEquals("round " + round, 1, tasks.size());
-            assertTrue("round " + round, List.copyOf(tasks).get(0) instanceof SplitRefreezeCompactionTask);
+            AbstractCompactionTask task = onlyTask(tscs.getNextBackgroundTasksAt(NOW, 0));
+            assertTrue("round " + round, task instanceof SplitRefreezeCompactionTask);
+            complete(task);
         }
 
         assertEquals(List.of(delegateTask), List.copyOf(tscs.getNextBackgroundTasksAt(NOW, 0)));
-        assertTrue(tscs.isParked(o.windowStartFor(NOW - 10 * HOUR), Set.of(spanning)));
+        assertTrue(tscs.isParked(oldWindow(), Set.of(spanning)));
+    }
+
+    /**
+     * I1: a rewrite that never ran must never score a strike.
+     * <p>
+     * The guard used to count hand-outs, so a freeze aborted by the disk-space pre-flight, stopped by
+     * {@code nodetool stop COMPACTION} or thrown from still scored. Three consecutive full-disk rounds
+     * parked the window - and freeing the disk did not un-park it, because parking is keyed on the
+     * window's shape and nothing about the window had changed. Only a restart or a shape change
+     * recovered; until then the window never froze and the frozen-window event never fired for it.
+     * Here nothing is ever completed, so no number of rounds may park the window.
+     */
+    @Test
+    public void guardScoresOnlyRewritesThatCompleted()
+    {
+        UnifiedCompactionStrategy delegate = mock(UnifiedCompactionStrategy.class);
+        when(delegate.getNextBackgroundTasks(anyLong())).thenReturn(List.of());
+        ColumnFamilyStore cfs = mock(ColumnFamilyStore.class, Mockito.RETURNS_DEEP_STUBS);
+        stubTracker(cfs);
+        TimeSeriesCompactionStrategy tscs = new TimeSeriesCompactionStrategy(cfs, options(), delegate);
+
+        SSTableReader a = sstableAt(NOW - 10 * HOUR);
+        SSTableReader b = sstableAt(NOW - 10 * HOUR + 60_000);
+        setWindow(tscs, cfs, Set.of(a, b));
+
+        for (int round = 0; round < 3 * TimeSeriesCompactionStrategy.NO_PROGRESS_STRIKES + 2; round++)
+        {
+            AbstractCompactionTask task = onlyTask(tscs.getNextBackgroundTasksAt(NOW, 0));
+            assertTrue("round " + round + " must still be dispatched", task instanceof FreezeCompactionTask);
+            // deliberately NOT completed: this is the aborted / stopped / failed rewrite
+        }
+        assertFalse(tscs.isParked(oldWindow(), Set.of(a, b)));
+        assertTrue(tscs.getParkedWindows().isEmpty());
     }
 
     /**
@@ -588,29 +652,37 @@ public class TimeSeriesCompactionStrategyTest
         ColumnFamilyStore cfs = mock(ColumnFamilyStore.class, Mockito.RETURNS_DEEP_STUBS);
         stubTracker(cfs);
         TimeSeriesCompactionStrategy tscs = new TimeSeriesCompactionStrategy(cfs, options(), delegate);
-        TimeSeriesCompactionStrategyOptions o = new TimeSeriesCompactionStrategyOptions(options());
 
         SSTableReader a = sstableAt(NOW - 10 * HOUR);
         SSTableReader b = sstableAt(NOW - 10 * HOUR + 60_000);
-        tscs.addSSTable(a);
-        tscs.addSSTable(b);
-        when(cfs.getLiveSSTables()).thenReturn(Set.of(a, b));
+        setWindow(tscs, cfs, Set.of(a, b));
 
-        for (int round = 0; round <= TimeSeriesCompactionStrategy.NO_PROGRESS_STRIKES; round++)
-            tscs.getNextBackgroundTasksAt(NOW, 0);
-        assertTrue(tscs.isParked(o.windowStartFor(NOW - 10 * HOUR), Set.of(a, b)));
+        for (int round = 0; round < TimeSeriesCompactionStrategy.NO_PROGRESS_STRIKES; round++)
+            complete(onlyTask(tscs.getNextBackgroundTasksAt(NOW, 0)));
+        assertTrue(tscs.isParked(oldWindow(), Set.of(a, b)));
 
         SSTableReader late = sstableAt(NOW - 10 * HOUR + 120_000);
-        tscs.addSSTable(late);
-        when(cfs.getLiveSSTables()).thenReturn(Set.of(a, b, late));
+        setWindow(tscs, cfs, Set.of(a, b, late));
 
-        assertFalse(tscs.isParked(o.windowStartFor(NOW - 10 * HOUR), Set.of(a, b, late)));
-        Collection<AbstractCompactionTask> tasks = tscs.getNextBackgroundTasksAt(NOW, 0);
-        assertEquals(1, tasks.size());
-        assertTrue(List.copyOf(tasks).get(0) instanceof FreezeCompactionTask);
+        assertFalse(tscs.isParked(oldWindow(), Set.of(a, b, late)));
+        assertTrue(onlyTask(tscs.getNextBackgroundTasksAt(NOW, 0)) instanceof FreezeCompactionTask);
     }
 
-    /** A freeze that actually shrinks the window must never be parked, however many rounds it takes. */
+    /**
+     * I2/I5: a window that keeps changing must never be parked, however many rounds it takes - and that
+     * includes the steady-late-data shape that used to false-positive.
+     * <p>
+     * A closed window receiving one late flush per round oscillates 2 sstables -> 1 -> 2, and every
+     * round samples it at 2 with an identical {@code (count, spanTotal)} signature. A guard that
+     * compares one hand-out with the previous hand-out sees "nothing changed" three times running and
+     * parks a window whose freezes are all working perfectly - after which it never freezes again and
+     * the frozen-window event stops firing for it. Attributing a change to the rewrite that caused it
+     * is what fixes this: the freeze took the window from 2 sstables to 1, and the guard sees that.
+     * <p>
+     * Deliberately many more rounds than {@code NO_PROGRESS_STRIKES}: the previous version of this test
+     * ran two rounds against {@code NO_PROGRESS_STRIKES == 2}, so deleting the signature comparison
+     * outright still left it green.
+     */
     @Test
     public void progressResetsTheGuard()
     {
@@ -620,23 +692,54 @@ public class TimeSeriesCompactionStrategyTest
         stubTracker(cfs);
         TimeSeriesCompactionStrategy tscs = new TimeSeriesCompactionStrategy(cfs, options(), delegate);
 
+        for (int round = 0; round < 3 * TimeSeriesCompactionStrategy.NO_PROGRESS_STRIKES + 2; round++)
+        {
+            // The window holds two sstables of an identical shape at the start of every round.
+            setWindow(tscs, cfs, Set.of(sstableAt(NOW - 10 * HOUR), sstableAt(NOW - 10 * HOUR + 60_000)));
+
+            AbstractCompactionTask task = onlyTask(tscs.getNextBackgroundTasksAt(NOW, 0));
+            assertTrue("round " + round, task instanceof FreezeCompactionTask);
+
+            // The freeze commits and leaves one sstable behind - real progress, whatever arrives next.
+            setWindow(tscs, cfs, Set.of(sstableAt(NOW - 10 * HOUR)));
+            complete(task);
+            assertFalse("round " + round, tscs.isParked(oldWindow(), tscs.getSSTables()));
+        }
+    }
+
+    /**
+     * I3: a parked window has to be visible. {@link TimeSeriesCompactionStrategy#isParked} is consulted
+     * before the backlog counter, so a parked window drops out of freezeBacklog/splitBacklog and hence
+     * out of getEstimatedRemainingTasks() - the table then looks exactly like one with nothing to do,
+     * while in fact a window has stopped freezing and every downstream consumer of the frozen-window
+     * event has silently stopped receiving it for that window. One WARN at the transition is not enough.
+     */
+    @Test
+    public void parkedWindowsAreExposedForOperators()
+    {
+        UnifiedCompactionStrategy delegate = mock(UnifiedCompactionStrategy.class);
+        when(delegate.getNextBackgroundTasks(anyLong())).thenReturn(List.of());
+        when(delegate.getEstimatedRemainingTasks()).thenReturn(0);
+        ColumnFamilyStore cfs = mock(ColumnFamilyStore.class, Mockito.RETURNS_DEEP_STUBS);
+        stubTracker(cfs);
+        TimeSeriesCompactionStrategy tscs = new TimeSeriesCompactionStrategy(cfs, options(), delegate);
+
         SSTableReader a = sstableAt(NOW - 10 * HOUR);
         SSTableReader b = sstableAt(NOW - 10 * HOUR + 60_000);
-        SSTableReader c = sstableAt(NOW - 10 * HOUR + 120_000);
+        setWindow(tscs, cfs, Set.of(a, b));
+        assertTrue("nothing is parked in the healthy state", tscs.getParkedWindows().isEmpty());
 
-        // Each round the window is a little smaller, as a working freeze would leave it.
-        for (Set<SSTableReader> window : List.of(Set.of(a, b, c), Set.of(a, b)))
-        {
-            for (SSTableReader s : List.of(a, b, c))
-                tscs.removeSSTable(s);
-            for (SSTableReader s : window)
-                tscs.addSSTable(s);
-            when(cfs.getLiveSSTables()).thenReturn(window);
+        for (int round = 0; round < TimeSeriesCompactionStrategy.NO_PROGRESS_STRIKES; round++)
+            complete(onlyTask(tscs.getNextBackgroundTasksAt(NOW, 0)));
 
-            Collection<AbstractCompactionTask> tasks = tscs.getNextBackgroundTasksAt(NOW, 0);
-            assertEquals(1, tasks.size());
-            assertTrue(List.copyOf(tasks).get(0) instanceof FreezeCompactionTask);
-        }
+        // The snapshot is republished on the next background round, like every other operator-visible
+        // figure this strategy keeps.
+        tscs.getNextBackgroundTasksAt(NOW, 0);
+
+        assertEquals(Set.of(oldWindow()), tscs.getParkedWindows().keySet());
+        assertEquals(Set.of(a, b), tscs.getParkedWindows().get(oldWindow()));
+        // ...which is exactly the information getEstimatedRemainingTasks() cannot carry.
+        assertEquals(0, tscs.getEstimatedRemainingTasks());
     }
 
     @Test
