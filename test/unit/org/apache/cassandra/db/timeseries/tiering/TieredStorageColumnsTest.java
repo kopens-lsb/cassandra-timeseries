@@ -33,7 +33,9 @@ import org.slf4j.LoggerFactory;
 
 import org.apache.cassandra.cql3.CQLTester;
 import org.apache.cassandra.cql3.UntypedResultSet;
+import org.apache.cassandra.db.ColumnFamilyStore;
 import org.apache.cassandra.db.ConsistencyLevel;
+import org.apache.cassandra.db.Keyspace;
 import org.apache.cassandra.db.marshal.BooleanType;
 import org.apache.cassandra.db.marshal.DoubleType;
 import org.apache.cassandra.db.marshal.Int32Type;
@@ -809,7 +811,7 @@ public class TieredStorageColumnsTest extends CQLTester
      * {@code null} (node-local internal) path is the same mistake by another route.
      */
     @Test
-    public void theLedgerIsNeverConsultedBelowQuorumStrength()
+    public void theLedgerIsNeverConsultedBelowQuorumStrength() throws Throwable
     {
         assertEquals(ConsistencyLevel.LOCAL_QUORUM, ChunkCoverage.ledgerConsistency(null));
         assertEquals(ConsistencyLevel.LOCAL_QUORUM, ChunkCoverage.ledgerConsistency(ConsistencyLevel.ONE));
@@ -822,6 +824,30 @@ public class TieredStorageColumnsTest extends CQLTester
         assertEquals(ConsistencyLevel.LOCAL_QUORUM, ChunkCoverage.ledgerConsistency(ConsistencyLevel.LOCAL_QUORUM));
         assertEquals(ConsistencyLevel.EACH_QUORUM, ChunkCoverage.ledgerConsistency(ConsistencyLevel.EACH_QUORUM));
         assertEquals(ConsistencyLevel.ALL, ChunkCoverage.ledgerConsistency(ConsistencyLevel.ALL));
+
+        // ...and the load path actually uses it. Asserting the helper alone does not discriminate:
+        // reverting the ledger read to executeInternal leaves every assertion above green while the
+        // read goes node-local, which is the exact bug this test is named for. Two observations pin
+        // the real call:
+        //
+        //  1. the read is a COORDINATOR read. coordinatorReadLatency is updated by StorageProxy and
+        //     by nothing else, so executeInternal (which never enters StorageProxy) cannot move it.
+        //  2. it is issued at the UPGRADED level, not the caller's. CL=ANY is illegal for a read
+        //     (ConsistencyLevel.validateForRead), so passing the caller's level through would throw,
+        //     be caught by load()'s own handler, and cache Coverage.UNKNOWN. Coming back KNOWN is
+        //     only possible if ANY was replaced by a quorum-strength level first.
+        chunkOneRow();
+        ColumnFamilyStore ledger = Keyspace.open(KEYSPACE)
+                                            .getColumnFamilyStore(ChunkTables.coverageTableName(currentTable()));
+        ChunkCoverage.invalidateAll();
+        long coordinatorReadsBefore = ledger.metric.coordinatorReadLatency.getCount();
+
+        ChunkCoverage.Coverage coverage = ChunkCoverage.forTable(baseMetadata(), ConsistencyLevel.ANY);
+
+        assertTrue("a CL=ANY caller must not drag the ledger read below quorum strength: " + coverage,
+                   coverage.known() && coverage.anyChunks());
+        assertTrue("the ledger read must go through the coordinator, never executeInternal",
+                   ledger.metric.coordinatorReadLatency.getCount() > coordinatorReadsBefore);
     }
 
     // ---- end-to-end: a tombstone written while the row was hot must survive re-encoding ----

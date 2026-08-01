@@ -385,8 +385,21 @@ public final class ChunkCoverage
      * {@code null} (node-local internal) path is the same mistake by another route: a coordinator
      * holding no replica of the ledger partition reads it as empty.
      * <p>
-     * Quorum strength is exactly the set a {@link TieringPolicy} may name for its own writes, so a
-     * ledger row written by the re-encoder is always visible to a read at any level this returns.
+     * Quorum strength is exactly the set a {@link TieringPolicy} may name for its own writes. That
+     * makes a ledger row visible to any later read <em>in the same quorum scope</em> -- it does
+     * <b>not</b> make it unconditionally visible: a row written at {@code LOCAL_QUORUM} in DC1 and
+     * read at {@code LOCAL_QUORUM} in DC2 shares no replica, so the reader can legitimately see
+     * {@link Coverage#EMPTY} until the write has propagated. Same-DC and single-DC deployments, and
+     * any policy naming {@code QUORUM}/{@code EACH_QUORUM}/{@code ALL}, do not have the gap.
+     * <p>
+     * What that costs is bounded, and deliberately so. A reader that misses the ledger row treats the
+     * table as having no cold data; with a policy installed that is still safe, because
+     * {@link ColdBoundary} floors the cold boundary at the policy's own hot-window edge rather than
+     * trusting the ledger to move it -- so the merge still covers everything the re-encoder can have
+     * encoded. The exposed case is the one with no policy to floor against: a table whose
+     * {@code timeseries_tiering} extension has been dropped while its chunks remain, where a
+     * cross-DC-stale ledger reads as "nothing is cold" and the chunks stay unmerged until the write
+     * propagates and the {@link #REFRESH_MILLIS} cache entry expires.
      *
      * @param requested the caller's consistency level, or {@code null}
      */

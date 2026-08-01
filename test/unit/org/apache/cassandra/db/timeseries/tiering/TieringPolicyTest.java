@@ -39,6 +39,7 @@ import org.apache.cassandra.schema.IndexMetadata;
 import org.apache.cassandra.schema.Indexes;
 import org.apache.cassandra.schema.TableMetadata;
 import org.apache.cassandra.schema.TableParams;
+import org.apache.cassandra.service.consensus.TransactionalMode;
 import org.apache.cassandra.utils.ByteBufferUtil;
 
 import static org.junit.Assert.assertEquals;
@@ -437,6 +438,33 @@ public class TieringPolicyTest
         String error = TieringPolicy.unsupportedSchemaError(table);
         assertNotNull(error);
         assertTrue(error, error.contains("exactly 1 clustering column"));
+    }
+
+    /**
+     * An Accord transactional read is the one read path that never merges chunks back in:
+     * {@code TxnNamedRead#performLocalKeyRead} runs the {@code ReadCommand} locally with none of
+     * {@code TransparentReads}' wrapping, so it answers from the hot window alone. Every mode but
+     * {@code off} enables Accord, and {@code mixed_reads} routes even a plain SERIAL read through it,
+     * so the whole non-{@code off} set has to be refused while the Accord read path is unhooked.
+     */
+    @Test
+    public void testTransactionalModeRejected()
+    {
+        for (TransactionalMode mode : TransactionalMode.values())
+        {
+            TableMetadata table = canonicalTable(null).unbuild()
+                                                       .params(TableParams.builder().transactionalMode(mode).build())
+                                                       .build();
+            String error = TieringPolicy.unsupportedSchemaError(table);
+            if (mode == TransactionalMode.off)
+            {
+                assertNull("transactional_mode 'off' is the supported setting", error);
+                continue;
+            }
+            assertNotNull("transactional_mode '" + mode.name() + "' must be rejected", error);
+            assertTrue(error, error.contains("transactional_mode"));
+            assertTrue(error, error.contains(mode.name()));
+        }
     }
 
     @Test

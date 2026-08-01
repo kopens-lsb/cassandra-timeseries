@@ -40,6 +40,7 @@ import org.apache.cassandra.schema.KeyspaceMetadata;
 import org.apache.cassandra.schema.Schema;
 import org.apache.cassandra.schema.TableMetadata;
 import org.apache.cassandra.schema.ViewMetadata;
+import org.apache.cassandra.service.consensus.TransactionalMode;
 import org.apache.cassandra.utils.ByteBufferUtil;
 import org.apache.cassandra.utils.JsonUtils;
 import org.apache.cassandra.utils.Pair;
@@ -297,7 +298,18 @@ public final class TieringPolicy
      *     <li>a partition key column named like one of the chunk table's own columns
      *     ({@link ChunkTables#RESERVED_COLUMN_NAMES}) -- the mirrored chunk table would declare that
      *     name twice.</li>
+     *     <li>a <b>{@code transactional_mode} other than {@code off}</b> -- an Accord transactional read
+     *     ({@code TxnNamedRead#performLocalKeyRead}) executes its {@code ReadCommand} locally without
+     *     going through {@link TransparentReads}, so it returns hot rows only and silently omits every
+     *     row already encoded into a chunk. Accord <em>writes</em> are safe (they route through
+     *     {@code CQL3CasRequest#createWriteFragments} into the cold-immutability guard), so this is a
+     *     read-side hole only -- but it is exactly the guarantee tiering exists to give.</li>
      * </ul>
+     *
+     * <p>This is a pure function of {@code metadata}, re-evaluated by
+     * {@link TieredStorageService#runOnce} on every re-encode cycle, so it does not matter in which
+     * order an operator installs a policy and changes the schema: whichever comes second, the next
+     * cycle refuses to encode and logs why.
      *
      * @return {@code null} if tiering supports {@code metadata}, else a human-readable reason naming
      * the offending column/index/view.
@@ -311,6 +323,20 @@ public final class TieringPolicy
             return format("'%s' is a materialized view: put the timeseries_tiering policy on the base " +
                            "table instead. A view's rows are derived from its base table, so there is nothing " +
                            "for the re-encoder to own", metadata.name);
+
+        // Accord's read path is the one read path that does not merge chunks back in: TxnNamedRead
+        // executes the ReadCommand locally, with none of TransparentReads' wrapping, so a transactional
+        // read of a tiered table would answer from the hot window alone and silently drop all cold
+        // history. Every mode but 'off' enables Accord (TransactionalMode.accordIsEnabled), and
+        // 'mixed_reads' routes even a plain SERIAL read through it, so 'off' is the only safe setting
+        // until the Accord read path is hooked up.
+        TransactionalMode mode = metadata.params.transactionalMode;
+        if (mode.accordIsEnabled)
+            return format("transactional_mode is '%s': an Accord transactional read executes locally without the " +
+                           "chunk merge every other read path applies, so it would return only rows younger than " +
+                           "hot_window and silently omit all tiered history. Set transactional_mode = 'off' to make " +
+                           "this table tierable",
+                           mode.name());
 
         if (metadata.clusteringColumns().size() != 1)
             return format("expected exactly 1 clustering column, found %d: a chunk encodes one time axis, " +

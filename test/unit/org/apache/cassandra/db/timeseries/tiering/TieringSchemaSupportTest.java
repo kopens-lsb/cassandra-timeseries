@@ -25,6 +25,7 @@ import com.google.common.collect.ImmutableList;
 import org.junit.Test;
 import org.slf4j.LoggerFactory;
 
+import org.apache.cassandra.config.DatabaseDescriptor;
 import org.apache.cassandra.cql3.CQLStatement;
 import org.apache.cassandra.cql3.CQLTester;
 import org.apache.cassandra.cql3.QueryProcessor;
@@ -129,6 +130,48 @@ public class TieringSchemaSupportTest extends CQLTester
         createIndex("CREATE CUSTOM INDEX ON %s(opc_id) USING 'sai'");
 
         assertNull(TieringPolicy.unsupportedSchemaError(metadata()));
+    }
+
+    /**
+     * The Accord read hole, from both ends. {@code TxnNamedRead#performLocalKeyRead} executes its
+     * {@code ReadCommand} locally with none of {@code TransparentReads}' wrapping, so a transactional
+     * read of a tiered table answers from the hot window alone and silently omits every chunked row.
+     * <p>
+     * Both orders matter and both are covered here, because the check is a pure function of the
+     * table's metadata evaluated by {@link TieredStorageService#runOnce} on every cycle: it does not
+     * matter whether the policy or the mode came first, only what the table looks like now.
+     */
+    @Test
+    public void transactionalModeIsRejectedWhicheverWayTheTableGotThere() throws Throwable
+    {
+        boolean accordWasEnabled = DatabaseDescriptor.getAccordTransactionsEnabled();
+        DatabaseDescriptor.setAccordTransactionsEnabled(true);
+        try
+        {
+            // 1. A tierable table that someone then makes transactional.
+            createTable("CREATE TABLE %s (tag text, ts timestamp, value double, PRIMARY KEY (tag, ts))");
+            assertNull(TieringPolicy.unsupportedSchemaError(metadata()));
+            alterTable("ALTER TABLE %s WITH transactional_mode = 'full'");
+
+            String error = TieringPolicy.unsupportedSchemaError(metadata());
+            assertNotNull("making a tierable table transactional must make it un-tierable", error);
+            assertTrue(error, error.contains("transactional_mode"));
+            assertTrue(error, error.contains("full"));
+
+            // 2. A table that was already transactional when the policy arrived. mixed_reads, not full:
+            // it is the mode that reads look most normal under (plain SELECTs keep working) and it still
+            // routes SERIAL reads through Accord, so it is the easiest one to install a policy on by
+            // mistake.
+            createTable("CREATE TABLE %s (tag text, ts timestamp, value double, PRIMARY KEY (tag, ts)) " +
+                        "WITH transactional_mode = 'mixed_reads'");
+            error = TieringPolicy.unsupportedSchemaError(metadata());
+            assertNotNull("installing a policy on an already-transactional table must be refused", error);
+            assertTrue(error, error.contains("mixed_reads"));
+        }
+        finally
+        {
+            DatabaseDescriptor.setAccordTransactionsEnabled(accordWasEnabled);
+        }
     }
 
     @Test
