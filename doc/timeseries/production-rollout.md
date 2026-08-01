@@ -131,6 +131,31 @@ SELECT count(*) FROM pp.tm_tag_point;        -- → 태그 수 (실제 행 수 �
 
 과거 데이터를 정정·삭제하는 배치가 있다면 계층화와 양립하지 않습니다.
 
+### 3.2.1 ⚠️ 백필: `null` 바인딩이 거부됩니다
+
+콜드 구간 쓰기 가드가 무엇을 막는지 정확히 보면:
+
+```java
+if (!row.deletion().isLive())   → 거부   // 행 삭제
+else if (hasCellTombstone(row)) → 거부   // 셀 툼스톤
+```
+
+카산드라에서 **컬럼을 생략하면** 아무것도 쓰지 않지만, **`null`을 명시적으로 바인딩하면 툼스톤**이
+됩니다. 따라서:
+
+| 백필 형태 | 결과 |
+| --- | --- |
+| `INSERT INTO t (tag_id, timestamp, value, value_boolean) VALUES (...)` — 안 쓰는 컬럼 **생략** | ✅ 허용. 다음 재인코딩 주기에 청크로 병합 |
+| `INSERT INTO t (...모든 컬럼...) VALUES (?, ?, ?, null, ?)` — **명시적 null** | ❌ 거부 |
+
+**이게 왜 함정인가**: 드라이버의 prepared statement는 보통 **모든 컬럼을 바인딩**합니다. 그리고
+`tm_tag_point`는 태그 타입에 따라 `value_numeric`/`value_boolean` 중 하나가 **항상 비어 있습니다.**
+8개 컬럼을 전부 바인딩하는 수집기라면 **모든 행이 null을 하나씩 들고 있고**, `hot_window` 이전
+구간으로 들어오는 백필은 **전부 거부됩니다.**
+
+**투입 전 확인**: 수집기가 안 쓰는 컬럼을 (a) 컬럼 목록에서 빼는지, (b) `unset`으로 두는지,
+(c) `null`을 바인딩하는지. (c)라면 (a)나 (b)로 바꿔야 백필이 동작합니다.
+
 ### 3.3 `transactional_mode`을 켜지 마십시오
 
 Accord 트랜잭션 **읽기**는 청크 병합을 거치지 않아 `hot_window` 이전 이력이 통째로 빠진 결과를

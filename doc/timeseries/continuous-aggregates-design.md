@@ -98,6 +98,32 @@ Consequences for the design:
 - `percentile` and `approx_count_distinct` therefore either roll up from raw at every resolution, or require
   storing a mergeable sketch — a larger piece of work, and a reasonable v1 exclusion.
 
+### 3.2 Backfill is a primary workload here, not an edge case
+
+The watermark design silently loses late data. A refresh processes
+`(watermark, newest_closed_bucket]`, so a write landing in a bucket *below* the watermark leaves that
+bucket's rollup stale forever, with no error. `max_lag` only rescues writes that arrive within it.
+
+That is not an acceptable v1 limitation for this fork specifically. Its stated workload is edge devices
+that lose connectivity and then push **days** of history at once — no sane `max_lag` covers that, and the
+rollup would be quietly wrong for exactly the periods an operator is most likely to go back and look at.
+
+Options, roughly in increasing cost:
+
+| mechanism | cost | notes |
+| --- | --- | --- |
+| **Manual range refresh** (`--from/--to`) | trivial | Necessary regardless. Requires someone to know a backfill happened. |
+| **Trailing re-refresh** — always re-do the last N buckets each cycle | cheap, bounded | Good default. Catches backfill up to N; idempotent, so re-running costs only IO. |
+| **Invalidation log** — record buckets touched by late writes | expensive | TimescaleDB's approach; needs a hook on the write path. |
+| **Reuse the TSCS late-isolation signal** | moderate | This fork already isolates late arrivals into their own window (T3's window-splitting writer). A closed window receiving new sstables *is* an invalidation signal, and it is per-window — which maps onto bucket ranges directly. TimescaleDB has no equivalent; this fork does. |
+
+Recommended: trailing re-refresh as the default, manual range refresh always available, and the TSCS signal
+as the precise mechanism once the executor is proven.
+
+**Invalidation must cascade through chained rollups.** If an hourly bucket is recomputed, every daily bucket
+built from it is stale too. A design that chains resolutions (§3.1) must propagate invalidation down the chain,
+or the daily rollup silently disagrees with the hourly one it came from.
+
 ## 4. Components
 
 1. **Definition / catalog.** A new system table, e.g.
