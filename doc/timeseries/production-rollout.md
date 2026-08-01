@@ -55,6 +55,40 @@
 
 ---
 
+## 0.5 기존 6.0.0에 올리기 — jar 하나만 교체하면 됩니다
+
+업스트림(`cassandra-6.0`)과 실제로 비교한 결과입니다:
+
+| 항목 | 포크가 바꿨나 | 교체 필요 |
+| --- | --- | --- |
+| `lib/apache-cassandra-6.0.0.jar` | **예** — 포크 코드 전부가 여기 들어 있습니다 | **예** |
+| `bin/` (`nodetool`, `cassandra`, `cqlsh` …) | 아니오 | 아니오 |
+| `lib/` 의 다른 jar | 아니오 — Lucene도 업스트림 SAI가 이미 씁니다 | 아니오 |
+| `conf/cassandra.yaml` | 주석 처리된 가이드레일 설명 7줄뿐 | 아니오 |
+
+`nodetool`은 셸 스크립트이고 `retier`/`tieringstatus` 클래스는 메인 jar 안에 있습니다
+(`org/apache/cassandra/tools/nodetool/Retier.class` 확인). 그래서 스크립트는 건드릴 필요가 없습니다.
+
+```bash
+nodetool drain                                   # memtable flush + 커밋로그 정리
+systemctl stop cassandra
+# 기존 jar 교체 (이름이 같으므로 그대로 덮어쓰기)
+cp apache-cassandra-6.0.0.jar "$CASSANDRA_HOME/lib/"
+systemctl start cassandra
+nodetool version && nodetool status              # 올라왔는지, 링에 붙었는지
+```
+
+**주의 두 가지:**
+
+1. **`lib/`에 6.0.0 jar이 하나뿐인지 확인하십시오.** 이름이 다른 6.0.0 jar이 남아 있으면 둘 다
+   클래스패스에 올라갑니다 — `ls $CASSANDRA_HOME/lib/apache-cassandra*.jar`.
+2. **롤링으로 하십시오.** 온디스크 포맷과 CQL 문법은 업스트림 그대로이고 새 기능은 전부
+   옵트인(테이블 확장 / 컴팩션 전략)이므로, **jar만 바꾼 시점에는 동작이 전혀 달라지지 않습니다.**
+   계층화나 TSCS는 그 뒤에 테이블별로 켜면 됩니다. 이 성질 덕분에 바이너리 교체와 기능 활성화를
+   분리해서 각각 검증할 수 있습니다.
+
+---
+
 ## 1. 스키마 적합성 확인
 
 계층화가 거부하는 형태가 하나라도 있으면 그 테이블은 계층화가 **통째로 멈추고**, 콜드 청크 만료도
