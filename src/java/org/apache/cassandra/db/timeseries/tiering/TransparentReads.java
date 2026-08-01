@@ -80,26 +80,33 @@ public final class TransparentReads
      * into THEM would make already-encoded windows look like live base rows again (re-encode loops,
      * broken idempotency). The tiering machinery brackets its work with this per-thread bypass.
      */
-    private static final ThreadLocal<Boolean> INTERNAL_BYPASS = ThreadLocal.withInitial(() -> Boolean.FALSE);
+    private static final ThreadLocal<Integer> INTERNAL_BYPASS = ThreadLocal.withInitial(() -> 0);
 
     private TransparentReads()
     {
     }
 
+    /**
+     * Nesting-safe on purpose: several unrelated things bracket reads with this now (the re-encoder's
+     * own cycle, and each CAS precondition read), and a plain boolean would let an inner
+     * {@code exit} re-enable merging while an outer bracket was still meant to hold -- silently, and
+     * on a path where the consequence is a linearizability violation or a JVM crash.
+     */
     public static void enterInternalBypass()
     {
-        INTERNAL_BYPASS.set(Boolean.TRUE);
+        INTERNAL_BYPASS.set(INTERNAL_BYPASS.get() + 1);
     }
 
     public static void exitInternalBypass()
     {
-        INTERNAL_BYPASS.set(Boolean.FALSE);
+        int depth = INTERNAL_BYPASS.get() - 1;
+        INTERNAL_BYPASS.set(Math.max(0, depth));
     }
 
     /** True while this thread is inside tiering's own machinery (see {@link #enterInternalBypass}). */
     public static boolean inInternalBypass()
     {
-        return INTERNAL_BYPASS.get();
+        return INTERNAL_BYPASS.get() > 0;
     }
 
     /**
@@ -109,7 +116,7 @@ public final class TransparentReads
     public static UnfilteredPartitionIterator maybeWrap(TableMetadata metadata, ReadQuery query,
                                                         UnfilteredPartitionIterator hot, ConsistencyLevel cl)
     {
-        if (INTERNAL_BYPASS.get())
+        if (inInternalBypass())
             return hot;
 
         TieringPolicy policy;

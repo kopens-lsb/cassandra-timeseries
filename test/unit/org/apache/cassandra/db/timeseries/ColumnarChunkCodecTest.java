@@ -32,6 +32,10 @@ import java.util.TreeMap;
 
 import org.junit.Test;
 
+import org.apache.cassandra.db.marshal.ByteBufferAccessor;
+import org.apache.cassandra.db.marshal.ValueAccessor;
+import org.apache.cassandra.utils.FastByteOperations;
+
 import static org.assertj.core.api.Assertions.assertThatThrownBy;
 import static org.junit.Assert.assertArrayEquals;
 import static org.junit.Assert.assertEquals;
@@ -350,6 +354,85 @@ public class ColumnarChunkCodecTest
 
         ByteBuffer third = ColumnarChunkCodec.encode(ts, n, reversed);
         assertEquals(first, third);
+    }
+
+    /**
+     * Every value a cursor hands out must be usable by Cassandra's own comparison machinery. This is
+     * not a style preference: {@link FastByteOperations}'s unsafe path branches on
+     * {@code hasArray()}, and if that is false it reads the buffer's {@code address} field and
+     * dereferences it. A read-only HEAP buffer -- which is what {@code asReadOnlyBuffer()} produces --
+     * answers {@code false} to both {@code hasArray()} and {@code isDirect()}, so its address is 0
+     * and the comparison segfaults the JVM. The decoder returned exactly such buffers from the
+     * CONSTANT and TEXT/OPAQUE paths until it was fixed, and no existing assertion noticed, because
+     * reading the bytes back out works fine; only comparing them crashes.
+     * <p>
+     * So this asserts the comparison RESULT (not merely that nothing throws -- a SIGSEGV would not
+     * throw anyway) over one value from each decode path, plus the structural property that makes
+     * the fast path safe.
+     */
+    @Test
+    public void decodedValuesSurviveCassandrasComparisonPaths()
+    {
+        int n = 8;
+        long[] ts = sequentialTimestamps(n);
+        ByteBuffer[] constantDouble = new ByteBuffer[n];      // CONSTANT path (directory, 0-byte section)
+        ByteBuffer[] varyingDouble = new ByteBuffer[n];       // normal fixed-width data section
+        ByteBuffer[] text = new ByteBuffer[n];                // TEXT dictionary path
+        ByteBuffer[] opaque = new ByteBuffer[n];              // OPAQUE dictionary path
+        for (int i = 0; i < n; i++)
+        {
+            constantDouble[i] = bytesOf(1.5);
+            varyingDouble[i] = bytesOf(i * 1.25);
+            text[i] = bytesOf("label-" + (i % 3));
+            opaque[i] = ByteBuffer.wrap(new byte[]{ (byte) i, (byte) (i + 1) });
+        }
+        SortedMap<String, ColumnarChunkCodec.ColumnInput> columns = new TreeMap<>();
+        columns.put("constant", new ColumnarChunkCodec.ColumnInput(ColumnarChunkCodec.TYPE_DOUBLE_CHIMP, constantDouble));
+        columns.put("varying", new ColumnarChunkCodec.ColumnInput(ColumnarChunkCodec.TYPE_DOUBLE_CHIMP, varyingDouble));
+        columns.put("label", new ColumnarChunkCodec.ColumnInput(ColumnarChunkCodec.TYPE_TEXT, text));
+        columns.put("blobish", new ColumnarChunkCodec.ColumnInput(ColumnarChunkCodec.TYPE_OPAQUE, opaque));
+
+        ColumnarCursor cursor = ColumnarChunkCodec.cursor(ColumnarChunkCodec.encode(ts, n, columns), null);
+        assertTrue(cursor.advance());
+
+        assertComparable("constant", cursor.getBytes("constant"), bytesOf(1.5), bytesOf(9.0));
+        assertComparable("varying", cursor.getBytes("varying"), bytesOf(0.0), bytesOf(9.0));
+        assertComparable("label", cursor.getBytes("label"), bytesOf("label-0"), bytesOf("label-9"));
+        assertComparable("blobish", cursor.getBytes("blobish"),
+                         ByteBuffer.wrap(new byte[]{ 0, 1 }), ByteBuffer.wrap(new byte[]{ 9, 9 }));
+
+        // A second row, so the per-row (non-constant) sections are exercised at an offset too.
+        assertTrue(cursor.advance());
+        assertComparable("constant", cursor.getBytes("constant"), bytesOf(1.5), bytesOf(9.0));
+        assertComparable("varying", cursor.getBytes("varying"), bytesOf(1.25), bytesOf(9.0));
+    }
+
+    /**
+     * @param decoded a value straight out of the cursor
+     * @param same    a separately-built buffer holding the identical bytes
+     * @param greater a buffer that must sort strictly after {@code decoded}
+     */
+    private static void assertComparable(String column, ByteBuffer decoded, ByteBuffer same, ByteBuffer greater)
+    {
+        // The structural invariant the fast path depends on. Checked first so a regression names the
+        // cause rather than crashing the JVM on the next line.
+        assertTrue(column + ": a decoded value must be array-backed for FastByteOperations' fast path",
+                   decoded.hasArray());
+
+        // The exact route cell reconciliation takes (Cells.compareValues -> ValueAccessor.compare ->
+        // FastByteOperations), asserting the ORDERING, not just the absence of an exception.
+        assertEquals(column + ": must compare equal to its own bytes", 0,
+                     FastByteOperations.compareUnsigned(decoded, same));
+        assertEquals(column + ": must compare equal in the other direction", 0,
+                     FastByteOperations.compareUnsigned(same, decoded));
+        assertTrue(column + ": must sort before a larger value",
+                   FastByteOperations.compareUnsigned(decoded, greater) < 0);
+        assertTrue(column + ": a larger value must sort after it",
+                   FastByteOperations.compareUnsigned(greater, decoded) > 0);
+        // And through the accessor Cells actually uses, so the test tracks reconciliation rather than
+        // one utility method.
+        assertEquals(column + ": ValueAccessor must agree", 0,
+                     ValueAccessor.compare(decoded, ByteBufferAccessor.instance, same, ByteBufferAccessor.instance));
     }
 
     private static SortedMap<String, ColumnarChunkCodec.ColumnInput> representativeColumns(int n)
