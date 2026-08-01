@@ -110,6 +110,13 @@ timeseries-tests:
     # exposed the schema-agreement window between CREATE TABLE returning and every replica being
     # able to serve a read of the new table.
     - ant test-jvm-dtest-some -Dtest.name=org.apache.cassandra.distributed.test.timeseries.TieredStorageDistributedTest
+    # TimeSeriesCompactionStrategy on a real cluster. The one that matters is the streaming split
+    # path: TimeWindowSplittingMultiWriter runs on the RECEIVING node when sstables arrive by
+    # rebuild/bootstrap/repair, and until this suite it had never run on more than one node. Also
+    # per-node freeze convergence plus its livelock guard (compaction is node-local, so RF=3 means
+    # three independent convergences and a node that livelocks is invisible to every read), the
+    # retention drop on every replica, and late-backfill isolation on the flush path. ~3.5 min.
+    - ant test-jvm-dtest-some -Dtest.name=org.apache.cassandra.distributed.test.timeseries.TimeSeriesCompactionDistributedTest
 
 # Build the Testcontainers-compatible Docker image (see docker/) and publish it as a loadable tarball to
 # the GitLab GENERIC PACKAGE registry — this instance has no container registry configured (no
@@ -190,6 +197,43 @@ docker-integration-test:
     when: always
     paths:
       - build/timeseries-it-report.html
+    expire_in: 1 month
+
+# Three real containers on a docker network, RF=3 (docker/cluster-test.sh). Everything it asserts is
+# also asserted in-JVM by the timeseries dtest classes, which run on every pipeline; what this adds
+# is three separate JVMs, three separate data directories and a repair stream between operating
+# system processes.
+#
+# MANUAL on every ref, including tags — deliberately NOT a release gate. Three JVMs at 2G plus this
+# job is more than a shared runner is guaranteed to have, and a release gate that fails on runner
+# capacity rather than on the product is worse than no gate. Play it by hand when the cluster path
+# has changed (compaction, streaming, tiering) or before a release worth the extra confidence.
+docker-cluster-test:
+  stage: integration
+  timeout: 60m
+  needs:
+    - job: docker-image
+      artifacts: true
+  image: docker:27-cli
+  variables:
+    DOCKER_HOST: unix:///var/run/docker.sock
+  # Alpine ships no bash and cluster-test.sh is #!/bin/bash — see docker-integration-test.
+  before_script:
+    - apk add --no-cache bash coreutils
+  rules:
+    - when: manual
+      allow_failure: true
+  script:
+    - docker load -i cassandra-timeseries-6.0.0-docker.tar
+    - ./docker/cluster-test.sh cassandra-timeseries:6.0.0
+  after_script:
+    - docker rm -f cassandra-ts-cluster-1 cassandra-ts-cluster-2 cassandra-ts-cluster-3 || true
+  artifacts:
+    name: "timeseries-cluster-test-report"
+    when: always
+    paths:
+      - build/timeseries-cluster-report.html
+      - build/timeseries-cluster-report.md
     expire_in: 1 month
 
 # Upload the image tarball to the generic package registry so it has a stable, tokened download URL

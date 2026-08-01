@@ -18,7 +18,10 @@ if grep -q '^broadcast_rpc_address:' "$CFG"; then
 else
     printf '\nbroadcast_rpc_address: %s\n' "$NODE_IP" >> "$CFG"
 fi
-sed -ri 's/- seeds:.*/- seeds: "'"$NODE_IP"'"/' "$CFG"
+# A single-node container seeds itself. CASSANDRA_SEEDS (same name and meaning as the official
+# image) points a node at an existing cluster instead -- docker/cluster-test.sh uses it to form a
+# real 3-container cluster, which is the only way to exercise streaming between separate JVMs.
+sed -ri 's/- seeds:.*/- seeds: "'"${CASSANDRA_SEEDS:-$NODE_IP}"'"/' "$CFG"
 
 if [ -n "$CASSANDRA_ENDPOINT_SNITCH" ]; then
     sed -ri 's/^endpoint_snitch:.*/endpoint_snitch: '"$CASSANDRA_ENDPOINT_SNITCH"'/' "$CFG"
