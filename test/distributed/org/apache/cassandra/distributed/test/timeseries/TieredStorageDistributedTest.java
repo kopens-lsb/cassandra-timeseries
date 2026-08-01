@@ -45,10 +45,8 @@ import static org.junit.Assert.assertTrue;
  * cold; re-encode cycles are driven explicitly with {@code nodetool retier} rather than the 60s
  * sweeper, keeping the test deterministic.
  * <p>
- * <b>Every test here currently FAILS on the first {@code nodetool retier}</b>, and not for a reason
- * this class can fix: the re-encoder's chunk-table creation cannot propagate on a real cluster. See
- * {@link ChunkTableSchemaPropagationTest} for the two-node reduction and the mechanism. Two
- * prerequisites that <em>were</em> in this class's way are fixed and verified:
+ * Three defects had to be fixed before this class could run meaningfully, and it is what holds all
+ * three in place:
  * <ul>
  *   <li>the null-MBean-proxy failure of {@code nodetool retier} under jvm-dtest -- in-JVM instances
  *   never run {@code CassandraDaemon.setup()}, so {@code NodeProbe.tieredStorageProxy} was never
@@ -56,14 +54,20 @@ import static org.junit.Assert.assertTrue;
  *   {@code InternalNodeProbe.connect()}, rather than by making the test call
  *   {@code TieredStorageService.setup()} (which would also start the 60s sweeper and cost this
  *   class its determinism);</li>
- *   <li>the policy extension, which takes a plain JSON string now -- the {@code hex()} helper this
- *   class used to carry is gone, and the plain-string {@code ALTER TABLE} is confirmed to reach
- *   schema agreement across all three nodes.</li>
+ *   <li>the re-encoder's chunk-table creation, which could not propagate on a real cluster at all.
+ *   See {@link ChunkTableSchemaPropagationTest} for the two-node reduction and the mechanism;</li>
+ *   <li>the <em>timing</em> of that propagation, which {@link #everyTagIsEncodedExactlyOnceAcrossNodes}
+ *   is the only thing that catches: committing the chunk table's DDL makes it visible on the
+ *   creating node, not on its replicas, so the reads the very next line of the cycle issues at the
+ *   policy's consistency level could hit a replica that was still behind. That replica answers
+ *   {@code INCOMPATIBLE_SCHEMA}, the coordinator raises {@code ReadFailureException}, and the
+ *   re-encoder's per-tag error handler skips the tag for the whole cycle -- silently losing an
+ *   arbitrary, run-to-run varying subset of tags (24 expected, 16-23 observed). Fixed by giving
+ *   {@code ChunkTables.ensureChunkTable} a cluster-wide postcondition.</li>
  * </ul>
  * The coverage SP4 Task 5 asks for on top of these five tests -- the tm_tag_point shape, a
  * three-column partition key, cold immutability on every coordinator, DESC clustering end to end --
- * is deliberately <b>not</b> written yet: it could not be run, and an unrun distributed test is what
- * put this class in its current state in the first place.
+ * is deliberately <b>not</b> written yet.
  */
 public class TieredStorageDistributedTest extends TestBaseImpl
 {

@@ -18,10 +18,17 @@
 package org.apache.cassandra.db.timeseries.tiering;
 
 import java.util.List;
+import java.util.Map;
 import java.util.Set;
+import java.util.concurrent.ConcurrentHashMap;
+import java.util.concurrent.TimeUnit;
 
 import com.google.common.collect.ImmutableMap;
 import com.google.common.collect.ImmutableSet;
+import com.google.common.util.concurrent.Uninterruptibles;
+
+import org.slf4j.Logger;
+import org.slf4j.LoggerFactory;
 
 import org.apache.cassandra.cql3.CqlBuilder;
 import org.apache.cassandra.cql3.QueryProcessor;
@@ -32,10 +39,14 @@ import org.apache.cassandra.db.marshal.BytesType;
 import org.apache.cassandra.db.marshal.Int32Type;
 import org.apache.cassandra.db.marshal.LongType;
 import org.apache.cassandra.db.marshal.TimestampType;
+import org.apache.cassandra.gms.Gossiper;
 import org.apache.cassandra.schema.ColumnMetadata;
 import org.apache.cassandra.schema.CompactionParams;
+import org.apache.cassandra.schema.Schema;
 import org.apache.cassandra.schema.TableMetadata;
 import org.apache.cassandra.schema.TableParams;
+import org.apache.cassandra.service.StorageProxy;
+import org.apache.cassandra.utils.Clock;
 
 /**
  * Creates and names the per-table shadow "chunk table" that the background re-encoder
@@ -55,6 +66,23 @@ import org.apache.cassandra.schema.TableParams;
  */
 public final class ChunkTables
 {
+    private static final Logger logger = LoggerFactory.getLogger(ChunkTables.class);
+
+    /**
+     * How long {@link #ensureChunkTable} will wait for a freshly created chunk table to become
+     * visible cluster-wide before giving up and letting the cycle proceed anyway. Matches the budget
+     * {@code ViewBuilderTask} allows itself for the same hazard.
+     */
+    private static final long SCHEMA_AGREEMENT_TIMEOUT_MILLIS = TimeUnit.SECONDS.toMillis(10);
+
+    /**
+     * {@code "keyspace.table"} of every chunk table this node has already watched the whole cluster
+     * converge on. Schema only moves forwards and a chunk table is never dropped by this code, so a
+     * table that was once visible everywhere stays visible: the check is worth paying exactly once
+     * per chunk table per process, not on every sweep tick.
+     */
+    private static final Set<String> agreedChunkTables = ConcurrentHashMap.newKeySet();
+
     static final String CLUSTERING_COLUMN = "window_start";
     static final String CODEC_COLUMN = "codec";
     static final String SAMPLES_COLUMN = "samples";
@@ -198,9 +226,85 @@ public final class ChunkTables
      * the CMS, not just to local state. The consistency level is irrelevant to a DDL statement (schema
      * agreement is the metadata log's job, not the read/write path's) and is never consulted. The
      * internal {@code QueryState} carries no user, so no authorization, guardrail or auto-grant applies.
+     * <p>
+     * <b>The postcondition is cluster-wide, not local</b> (see {@link #awaitClusterWideVisibility}):
+     * committing the DDL only guarantees that the CMS accepted it and that <em>this</em> node has
+     * applied it, and the re-encoder's very next act is to read the chunk table at the policy's
+     * consistency level. A replica that has not yet caught up to that metadata epoch answers such a
+     * read with {@code INCOMPATIBLE_SCHEMA}, which the coordinator surfaces as a
+     * {@code ReadFailureException} -- and the re-encoder's per-tag error handler then skips that tag
+     * for the whole cycle. On a 3-node cluster that silently loses an arbitrary, run-to-run varying
+     * subset of tags from the first cycle after the chunk table is created.
      */
     public static void ensureChunkTable(TableMetadata base)
     {
         QueryProcessor.process(createChunkTableStatement(base), ConsistencyLevel.ONE);
+        awaitClusterWideVisibility(base.keyspace, chunkTableName(base.name));
+    }
+
+    /**
+     * Blocks (up to {@link #SCHEMA_AGREEMENT_TIMEOUT_MILLIS}) until every reachable node reports this
+     * node's schema version, i.e. until the chunk table just ensured is visible to every replica the
+     * re-encoder is about to query. This is the same precaution {@code ViewBuilderTask} takes before
+     * sending view mutations for a just-created materialized view, and for the same reason: a peer
+     * that has not seen the schema change cannot serve a request naming the new table.
+     * <p>
+     * Schema versions are collected with {@link StorageProxy#describeSchemaVersions}, which asks each
+     * live node for its <em>current</em> version over the wire, rather than with
+     * {@code Gossiper.waitForSchemaAgreement}, which compares gossip-cached versions: those lag the
+     * schema change itself, so every node can still be advertising the <em>old</em> version and
+     * "agree" on it, returning immediately and leaving the race exactly as it was.
+     * <p>
+     * Unreachable nodes are ignored: a node that cannot answer a schema-version request cannot serve
+     * the re-encoder's reads either, and waiting for it would only delay the tags whose replicas are
+     * up. A single-node cluster short-circuits before sending anything, so this costs nothing off a
+     * real cluster. On timeout the cycle proceeds anyway (and is not memoized, so the next cycle
+     * re-checks): the per-tag error handling still holds the line, and refusing to run at all would
+     * turn a slow peer into a permanently stalled re-encoder.
+     */
+    private static void awaitClusterWideVisibility(String keyspace, String table)
+    {
+        String key = keyspace + '.' + table;
+        if (agreedChunkTables.contains(key))
+            return;
+
+        // Nobody to propagate to. Also the shape every single-node unit test runs in, where the
+        // messaging layer this would otherwise drive may not even be listening.
+        if (Gossiper.instance.getLiveMembers().size() <= 1)
+            return;
+
+        long deadline = Clock.Global.currentTimeMillis() + SCHEMA_AGREEMENT_TIMEOUT_MILLIS;
+        long backoffMillis = 50;
+        while (true)
+        {
+            if (everyReachableNodeHasOurSchema())
+            {
+                agreedChunkTables.add(key);
+                return;
+            }
+
+            if (Clock.Global.currentTimeMillis() >= deadline)
+                break;
+
+            Uninterruptibles.sleepUninterruptibly(backoffMillis, TimeUnit.MILLISECONDS);
+            backoffMillis = Math.min(1000, backoffMillis * 2);
+        }
+
+        logger.warn("Tiered storage: {} did not become visible cluster-wide within {}ms of being ensured. " +
+                    "Tags whose replicas are still behind will fail this re-encode cycle with " +
+                    "INCOMPATIBLE_SCHEMA and be retried on the next one.", key, SCHEMA_AGREEMENT_TIMEOUT_MILLIS);
+    }
+
+    /** @return {@code true} if no reachable node reports a schema version other than this node's. */
+    private static boolean everyReachableNodeHasOurSchema()
+    {
+        String ourVersion = Schema.instance.getVersion().toString();
+        Map<String, List<String>> versions = StorageProxy.describeSchemaVersions(false);
+        for (String version : versions.keySet())
+        {
+            if (!version.equals(StorageProxy.UNREACHABLE) && !version.equals(ourVersion))
+                return false;
+        }
+        return true;
     }
 }
