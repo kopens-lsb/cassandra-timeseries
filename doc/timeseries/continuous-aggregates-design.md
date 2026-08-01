@@ -65,6 +65,39 @@ Rather than maintain the rollup synchronously on every write (expensive, and the
 
 This is the same shape as TimescaleDB's refresh policy and avoids touching the write hot path.
 
+### 3.1 Which aggregates can be chained, and which cannot
+
+Rollups are most useful chained — the daily rollup should be built from the hourly one, not by re-scanning raw.
+That only works for aggregates that are **decomposable**, and getting this wrong produces answers that look
+plausible and are quietly incorrect.
+
+`avg(avg)` is the trap. Averaging hourly averages weights every hour equally, so an hour with 5 samples counts
+as much as an hour with 3,600. The daily average is then wrong whenever sample counts differ — which, on an
+event-driven historian with gaps and backfills, is most of the time.
+
+| aggregate | chainable? | how |
+| --- | --- | --- |
+| `min` / `max` | yes, exactly | `min(min)`, `max(max)` |
+| `count` | yes | `sum(count)` |
+| `sum` | yes | `sum(sum)` |
+| `avg` | **only with a companion `count`** | `sum(avg × count) / sum(count)` |
+| `variance` / `stddev` | only with `count`, `sum`, `sum_sq` | recompute from the three; variance alone is not enough |
+| `first` / `last` | only with the companion timestamp | pick the value whose kept timestamp is min/max |
+| `delta` / `rate` / `derivative` | no | defined over endpoints of a range; recompute from `first`/`last` instead |
+| `percentile` | **no** | p95 of a day is not derivable from 24 hourly p95s |
+| `histogram` | yes, if bucket bounds are identical | element-wise `sum` of the bucket arrays |
+| `approx_count_distinct` | only if the **HLL sketch** is stored, not the estimate | merge sketches |
+| `time_weighted_average` / `integral` | only with the covered duration | weight by each bucket's time span |
+
+Consequences for the design:
+
+- **A rollup target schema must carry the companion columns**, not just the headline aggregate. Storing `avg`
+  alone makes that rollup permanently unchainable — the information needed to combine it is gone.
+- **A CA definition should reject a chained source whose aggregate is not decomposable** rather than silently
+  computing `avg(avg)`. If someone wants a daily p95 they must roll it up from raw, not from the hourly rollup.
+- `percentile` and `approx_count_distinct` therefore either roll up from raw at every resolution, or require
+  storing a mergeable sketch — a larger piece of work, and a reasonable v1 exclusion.
+
 ## 4. Components
 
 1. **Definition / catalog.** A new system table, e.g.
