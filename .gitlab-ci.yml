@@ -57,66 +57,20 @@ build-jar:
 timeseries-tests:
   stage: test
   timeout: 90m
+  # One line per class. Full per-class output goes to build/ci-logs/ and is kept as an
+  # artifact -- jvm-dtests log at DEBUG and a single one can fill GitLab's 4 MiB trace
+  # limit, which in the 6.0.0 release run happened during the SECOND class. The script
+  # also reads failures/errors out of the JUnit XML instead of trusting ant's exit code,
+  # because `ant testsome` reports BUILD SUCCESSFUL when a class name does not resolve.
   script:
-    - ant testsome -Dtest.name=org.apache.cassandra.db.aggregation.TimeBucketGapFillerTest
-    - ant testsome -Dtest.name=org.apache.cassandra.cql3.functions.TimeSeriesFctsTest
-    # full-text search (SAI LIKE + index_analyzer)
-    - ant testsome -Dtest.name=org.apache.cassandra.index.sai.analyzer.LuceneTokenizingAnalyzerTest
-    - ant testsome -Dtest.name=org.apache.cassandra.index.sai.cql.AnalyzedLikeQueryTest
-    # regression guard: LIKE on non-analyzed indexes must keep demanding ALLOW FILTERING
-    - ant testsome -Dtest.name=org.apache.cassandra.index.sai.cql.AllowFilteringTest
-    # 3-node cluster semantics (consistency levels, paging, unrepaired rows)
-    - ant test-jvm-dtest-some -Dtest.name=org.apache.cassandra.distributed.test.sai.AnalyzedLikeDistributedTest
-    # tiered storage: chunk codecs (chimp128 v2, columnar v3) + version dispatcher
-    - ant testsome -Dtest.name=org.apache.cassandra.db.timeseries.BitStreamTest
-    - ant testsome -Dtest.name=org.apache.cassandra.db.timeseries.TimestampCodecTest
-    - ant testsome -Dtest.name=org.apache.cassandra.db.timeseries.Chimp128CodecTest
-    - ant testsome -Dtest.name=org.apache.cassandra.db.timeseries.ChunkCodecsTest
-    - ant testsome -Dtest.name=org.apache.cassandra.db.timeseries.ColumnarChunkCodecTest
-    # tiered storage: chunk store re-encoder (SP2) — policy, re-encode cycle, nodetool commands,
-    # ALTER TABLE extensions validation
-    - ant testsome -Dtest.name=org.apache.cassandra.db.timeseries.tiering.TieringPolicyTest
-    - ant testsome -Dtest.name=org.apache.cassandra.db.timeseries.tiering.TieredStorageServiceTest
-    # supported schemas (SP4): accept/reject matrix on real CQL schemas (indexes, views, counters,
-    # collections), composite partition key mirroring, static-column survival, TTL vs hot_window
-    - ant testsome -Dtest.name=org.apache.cassandra.db.timeseries.tiering.TieringSchemaSupportTest
-    # multi-column re-encoding (SP4): every regular column into one columnar chunk — production
-    # (tm_tag_point) shape round trip incl. nulls, per-column late merge, max writetime across all
-    # columns, DESC-clustered merged reads, composite key, byte-identical idempotency
-    - ant testsome -Dtest.name=org.apache.cassandra.db.timeseries.tiering.TieredStorageColumnsTest
-    # transparent reads (SP3): chunk decode, coordinator merge, end-to-end SELECT matrix
-    - ant testsome -Dtest.name=org.apache.cassandra.db.timeseries.tiering.ChunkReadSupportTest
-    - ant testsome -Dtest.name=org.apache.cassandra.db.timeseries.tiering.ChunkMergeIteratorTest
-    - ant testsome -Dtest.name=org.apache.cassandra.db.timeseries.tiering.TransparentReadTest
-    - ant testsome -Dtest.name=org.apache.cassandra.tools.nodetool.mock.TieredStorageMockTest
-    - ant testsome -Dtest.name=org.apache.cassandra.cql3.validation.operations.AlterTableExtensionsTest
-    # time-series compaction strategy (TSCS T1 window classification + T2 freeze state machine)
-    - ant testsome -Dtest.name=org.apache.cassandra.db.compaction.TimeSeriesCompactionStrategyOptionsTest
-    - ant testsome -Dtest.name=org.apache.cassandra.db.compaction.TimeSeriesCompactionStrategyTest
-    - ant testsome -Dtest.name=org.apache.cassandra.db.compaction.TimeSeriesCompactionStrategyE2ETest
-    - ant testsome -Dtest.name=org.apache.cassandra.db.compaction.timeseries.WindowFrozenListenersTest
-    - ant testsome -Dtest.name=org.apache.cassandra.db.compaction.timeseries.WindowRoutingIteratorTest
-    - ant testsome -Dtest.name=org.apache.cassandra.db.compaction.timeseries.TimeWindowSplittingMultiWriterTest
-    # tiered storage on a real cluster: the chunk table's schema change must be expressible as CQL,
-    # because TCM stores schema transformations as CQL TEXT and re-parses them on read. A
-    # programmatic SchemaTransformation serialises its cql() default -- the literal string "null" --
-    # which peers cannot parse, freezing schema propagation cluster-wide, and which the writing node
-    # itself cannot replay at startup. This is the only automated proof of both; ~70s, worth it.
-    - ant test-jvm-dtest-some -Dtest.name=org.apache.cassandra.distributed.test.timeseries.ChunkTableSchemaPropagationTest
-    # tiered storage across 3 nodes at RF=3: primary-range partitioning of the re-encoder (every tag
-    # encoded exactly once, no gaps and no double-encoding), coordinator-independent transparent
-    # reads, survival of the late row against the distributed range delete, node restart, and
-    # whole-dataset fidelity. Catches races a single node cannot have -- it was this suite that
-    # exposed the schema-agreement window between CREATE TABLE returning and every replica being
-    # able to serve a read of the new table.
-    - ant test-jvm-dtest-some -Dtest.name=org.apache.cassandra.distributed.test.timeseries.TieredStorageDistributedTest
-    # TimeSeriesCompactionStrategy on a real cluster. The one that matters is the streaming split
-    # path: TimeWindowSplittingMultiWriter runs on the RECEIVING node when sstables arrive by
-    # rebuild/bootstrap/repair, and until this suite it had never run on more than one node. Also
-    # per-node freeze convergence plus its livelock guard (compaction is node-local, so RF=3 means
-    # three independent convergences and a node that livelocks is invisible to every read), the
-    # retention drop on every replica, and late-backfill isolation on the flush path. ~3.5 min.
-    - ant test-jvm-dtest-some -Dtest.name=org.apache.cassandra.distributed.test.timeseries.TimeSeriesCompactionDistributedTest
+    - .build/sh/ci-timeseries-tests.sh
+  artifacts:
+    name: "timeseries-test-logs"
+    when: always
+    paths:
+      - build/ci-logs/
+      - build/test/output/
+    expire_in: 1 month
 
 # Build the Testcontainers-compatible Docker image (see docker/) and publish it as a loadable tarball to
 # the GitLab GENERIC PACKAGE registry — this instance has no container registry configured (no
