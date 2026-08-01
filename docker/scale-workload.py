@@ -1,12 +1,19 @@
 #!/usr/bin/env python3
-"""Loader + timed query workload for the cassandra-timeseries scale test.
+"""Loader + timed query workload for the cassandra-timeseries scale / tiering benchmark.
 
-Runs *inside* the container (see docker/scale-test.sh) using the python driver that ships
-with cqlsh, so the measured query times are the real client-observed CQL execution times
-without any cqlsh/docker-exec startup in the way.
+Models the *production* table shape (`tm_tag_point`): one wide row per sample with static
+per-tag metadata, several columns that are constant in practice, one column that is entirely
+null, one high-entropy int, one slowly-varying numeric-looking text reading and a state bit.
+That mix -- not a single high-entropy double -- is what the columnar (v3) chunk format is
+designed for, so it is the shape the tiering trade-off has to be measured on.
 
-  python3 scale-workload.py load  --rows 100000000 --series 3000 --loaders 12
-  python3 scale-workload.py query --rows 100000000 --series 3000 > report.html
+Runs *inside* the container (see docker/scale-test.sh) using the python driver that ships with
+cqlsh, so the measured query times are the real client-observed CQL execution times without any
+cqlsh/docker-exec startup in the way.
+
+  python3 scale-workload.py ddl
+  python3 scale-workload.py load  --rows 20000000 --series 500 --loaders 12
+  python3 scale-workload.py query --rows 20000000 --series 500 > report.html
 """
 import argparse
 import datetime
@@ -16,6 +23,7 @@ import html
 import math
 import multiprocessing
 import os
+import random
 import sys
 import time
 
@@ -28,47 +36,199 @@ for _extra in ('geomet-0.1.0.zip', 'futures-2.1.6-py2.py3-none-any.zip'):
     if os.path.exists(_p):
         sys.path.insert(0, _p)
 
-from cassandra.cluster import Cluster                      # noqa: E402
-from cassandra.query import BatchStatement, BatchType      # noqa: E402
-
 KEYSPACE = 'scale'
-TABLE = 'metrics'          # overridden by --table
+TABLE = 'tm_tag_point'     # overridden by --table
 EPOCH = datetime.datetime(2024, 1, 1, tzinfo=datetime.timezone.utc)
-BATCH_ROWS = 100          # rows per unlogged batch (stays under batch_size_warn_threshold)
-IN_FLIGHT = 96            # async batches in flight per loader process
+SAMPLE_SECONDS = 1         # one sample per tag per second
+BATCH_ROWS = 100           # rows per unlogged batch (stays under batch_size_warn_threshold)
+IN_FLIGHT = 96             # async batches in flight per loader process
+
+# Constant-in-production values. These are what make the CONSTANT / ALL_NULL encodings pay:
+# each costs a full cell (value + per-cell metadata) per row in the base table and O(1) bytes
+# per chunk once tiered.
+QUALITY_GOOD = 192
+ERROR_CODE_NONE = 0
+ATTRIBUTE_EMPTY = {}       # frozen<map<text,text>>, empty in every production row
+
+# ---------------------------------------------------------------------------------------------
+# PRODUCTION VALUE DISTRIBUTION (measured read-only on the production cluster, 3,000 distinct
+# tags sampled with PER PARTITION LIMIT 1).
+#
+# The static `type` column decides WHICH value column carries the reading. Because `type` is
+# static it is fixed per tag, so within one chunk (one tag x one window) each value column is
+# uniformly populated or uniformly absent -- never mixed. A chunk's value_numeric is therefore
+# either fully populated (Chimp128) or entirely absent (ALL_NULL, 0 bytes), and the *mix of
+# tags* is what sets the real compression ratio.
+#
+#     boolean 79.2%   int 8.3%   double 6.4%   long 2.8%   string 2.7%   float 0.5%
+#
+# Per-type population, verified by sampling real rows:
+#     type=boolean : value_boolean = true/false | value_numeric = null | value = "true"/"false"
+#     type=long    : value_numeric = 157        | value_boolean = null | value = "157"
+#     type=double  : value_numeric = 20.76      | value_boolean = null | value = "20.76"
+# i.e. `value` (text) is a REDUNDANT STRING MIRROR of whichever typed column holds the reading.
+# The same information is stored twice, once typed and once as text; that is a real property of
+# this schema and it matters for the compression number.
+#
+# type=string (2.7%) was NOT verified against production -- it is modelled here as `value` = the
+# text reading with both typed columns null, and the report says so.
+TYPE_WEIGHTS_PER_MILLE = (('boolean', 793), ('int', 83), ('double', 64),
+                          ('long', 28), ('string', 27), ('float', 5))
+NUMERIC_TYPES = frozenset(('int', 'long', 'float', 'double'))
+# ---------------------------------------------------------------------------------------------
+
+_TYPE_BY_SLOT = []
+for _t, _w in TYPE_WEIGHTS_PER_MILLE:
+    _TYPE_BY_SLOT.extend([_t] * _w)
+assert len(_TYPE_BY_SLOT) == 1000, len(_TYPE_BY_SLOT)
+
+
+def tag_type(i):
+    """The static `type` of tag i. Multiplying by a large coprime spreads the types across
+    consecutive tag indices, so any contiguous slice of tags (e.g. the 100 the multi-partition
+    queries hit) carries a representative mix rather than one solid block of booleans."""
+    return _TYPE_BY_SLOT[(i * 7919) % 1000]
+
+DDL = """
+CREATE KEYSPACE IF NOT EXISTS {ks} WITH replication =
+    {{'class':'SimpleStrategy','replication_factor':1}};
+CREATE TABLE IF NOT EXISTS {ks}.{tbl} (
+    tag_id text,
+    timestamp timestamp,
+    area_id text static,
+    asset_id text static,
+    line_id text static,
+    opc_id text static,
+    site_id text static,
+    tag_name text static,
+    type text static,
+    attribute frozen<map<text,text>>,
+    error_code int,
+    latency int,
+    quality int,
+    value text,
+    value_boolean boolean,
+    value_numeric double,
+    PRIMARY KEY (tag_id, timestamp)
+) WITH CLUSTERING ORDER BY (timestamp DESC)
+   AND compaction = {{'class':'UnifiedCompactionStrategy',
+                     'scaling_parameters':'T4',
+                     'target_sstable_size':'1GiB',
+                     'expired_sstable_check_frequency_seconds':600}};
+"""
+
+INSERT_STATICS = ("INSERT INTO %s.%s (tag_id, area_id, asset_id, line_id, opc_id, site_id, "
+                  "tag_name, type) VALUES (?, ?, ?, ?, ?, ?, ?, ?)")
+_COMMON = "tag_id, timestamp, attribute, error_code, latency, quality, value"
+# One prepared statement per type family, so a column that production leaves absent is genuinely
+# absent. Binding None would write a NULL *tombstone* instead -- that is not what production does
+# and it would put a per-row deletion into every chunk's ALL_NULL column.
+INSERT_BY_KIND = {
+    'boolean': "INSERT INTO %s.%s (" + _COMMON + ", value_boolean) VALUES (?, ?, ?, ?, ?, ?, ?, ?)",
+    'numeric': "INSERT INTO %s.%s (" + _COMMON + ", value_numeric) VALUES (?, ?, ?, ?, ?, ?, ?, ?)",
+    'string': "INSERT INTO %s.%s (" + _COMMON + ") VALUES (?, ?, ?, ?, ?, ?, ?)",
+}
+
+SITES = ['seoul', 'busan', 'ulsan', 'gwangju']
+AREAS = ['area-a', 'area-b', 'area-c']
+LINES = ['line-01', 'line-02', 'line-03', 'line-04', 'line-05']
 
 
 def connect(timeout=900):
+    from cassandra.cluster import Cluster
     cluster = Cluster(['127.0.0.1'], connect_timeout=60)
     session = cluster.connect()
     session.default_timeout = timeout
     return cluster, session
 
 
-def series_name(i):
-    return 'sensor-%06d' % i
+def tag_id(i):
+    return 'tag-%06d' % i
 
 
-def sample_value(i):
-    """Deterministic, non-trivial series: a slow sine plus a small sawtooth."""
-    return 50.0 + 40.0 * math.sin(i / 500.0) + (i % 7)
+def statics_for(i):
+    return (tag_id(i),
+            AREAS[i % len(AREAS)],
+            'asset-%04d' % (i % 250),
+            LINES[i % len(LINES)],
+            'opc-%02d' % (i % 8),
+            SITES[i % len(SITES)],
+            'PLANT/%s/%s/TAG_%06d' % (SITES[i % len(SITES)], LINES[i % len(LINES)], i),
+            tag_type(i))
+
+
+def kind_of(tag_type_name):
+    """Which prepared statement (and therefore which value column) a tag's static type selects."""
+    if tag_type_name == 'boolean':
+        return 'boolean'
+    return 'numeric' if tag_type_name in NUMERIC_TYPES else 'string'
+
+
+def partition_rows(i, rows_per_series):
+    """Yield the per-row values of tag i, reproducing the measured production distribution.
+
+    Constant in every row and every type: quality=192, error_code=0, attribute={}.
+    latency is a high-entropy small int, present for every type.
+
+    The reading itself is a *slowly varying* signal (a bounded random walk -- a real sensor, not
+    white noise), and which column carries it is decided by the tag's static `type`:
+      boolean  -> value_boolean, a state bit that flips every few hundred samples
+      numeric  -> value_numeric (double); int/long are integer-valued, double/float have decimals
+      string   -> neither typed column (assumed, not verified against production)
+    `value` (text) always mirrors the reading as a string, exactly as production does.
+
+    Yields (timestamp, attribute, error_code, latency, quality, value, extra) where `extra` is
+    the value_boolean / value_numeric argument, or absent for string-typed tags.
+    """
+    kind_name = tag_type(i)
+    kind = kind_of(kind_name)
+    rnd = random.Random(0x5EED ^ (i * 2654435761))
+    flag = bool(i & 1)
+    # int/long read as whole numbers; double/float and the text-only case carry decimals.
+    integral = kind_name in ('int', 'long')
+    reading = float(rnd.randrange(10, 90)) if integral else 10.0 + rnd.random() * 80.0
+    steps = (-1.0, 0.0, 0.0, 1.0) if integral else (-0.01, 0.0, 0.0, 0.01)
+    lo, hi = (0.0, 1000.0) if integral else (0.0, 100.0)
+    for n in range(rows_per_series):
+        reading += steps[rnd.getrandbits(2)]
+        if reading < lo:
+            reading = lo
+        elif reading > hi:
+            reading = hi
+        if n % 500 == 499:
+            flag = not flag
+        if kind == 'boolean':
+            text, extra = ('true', True) if flag else ('false', False)
+        elif integral:
+            text, extra = '%d' % reading, reading
+        else:
+            text, extra = '%.2f' % reading, round(reading, 2)
+        row = (EPOCH + datetime.timedelta(seconds=n * SAMPLE_SECONDS),
+               ATTRIBUTE_EMPTY,
+               ERROR_CODE_NONE,
+               rnd.randint(1, 999),
+               QUALITY_GOOD,
+               text)
+        yield row if kind == 'string' else row + (extra,)
 
 
 def load_slice(args):
+    from cassandra.query import BatchStatement, BatchType
     worker, total_series, rows_per_series, table = args
     loaders = LOADERS
     cluster, session = connect()
-    insert = session.prepare(
-        "INSERT INTO %s.%s (series, ts, value) VALUES (?, ?, ?)" % (KEYSPACE, table))
-    written = 0
+    statics = session.prepare(INSERT_STATICS % (KEYSPACE, table))
+    inserts = {k: session.prepare(q % (KEYSPACE, table)) for k, q in INSERT_BY_KIND.items()}
     started = time.time()
-    pending = []
     for s in range(worker, total_series, loaders):
-        name = series_name(s)
+        name = tag_id(s)
+        session.execute(statics, statics_for(s))
+        insert = inserts[kind_of(tag_type(s))]
+        pending = []
         batch = BatchStatement(batch_type=BatchType.UNLOGGED)
         n = 0
-        for i in range(rows_per_series):
-            batch.add(insert, (name, EPOCH + datetime.timedelta(seconds=i), sample_value(i)))
+        for row in partition_rows(s, rows_per_series):
+            batch.add(insert, (name,) + row)
             n += 1
             if n == BATCH_ROWS:
                 pending.append(session.execute_async(batch))
@@ -77,14 +237,11 @@ def load_slice(args):
                 if len(pending) >= IN_FLIGHT:
                     for f in pending:
                         f.result()
-                    written += IN_FLIGHT * BATCH_ROWS
                     pending = []
         if n:
             pending.append(session.execute_async(batch))
         for f in pending:
             f.result()
-        written += n + len(pending) * 0   # remainder counted below
-        pending = []
         if worker == 0:
             done = (s // loaders) + 1
             per = (time.time() - started) or 1
@@ -96,12 +253,16 @@ def load_slice(args):
     return worker
 
 
+def cmd_ddl(a):
+    sys.stdout.write(DDL.format(ks=KEYSPACE, tbl=a.table))
+
+
 def cmd_load(a):
     global LOADERS
     LOADERS = a.loaders
     rows_per_series = a.rows // a.series
-    print('   %d partitions x %d rows = %d rows' % (a.series, rows_per_series,
-                                                    a.series * rows_per_series))
+    print('   %d tags x %d rows = %d rows (1 sample / %ds / tag)'
+          % (a.series, rows_per_series, a.series * rows_per_series, SAMPLE_SECONDS))
     started = time.time()
     with multiprocessing.Pool(a.loaders, initializer=_init_loaders, initargs=(a.loaders,)) as pool:
         pool.map(load_slice, [(w, a.series, rows_per_series, a.table) for w in range(a.loaders)])
@@ -120,7 +281,7 @@ def _init_loaders(n):
 
 # --------------------------------------------------------------------------- query phase
 
-def fmt_rows(rows, limit=8):
+def fmt_rows(rows, limit=6, width=26):
     if not rows:
         return '(0 rows)'
     out = []
@@ -131,11 +292,12 @@ def fmt_rows(rows, limit=8):
         vals = []
         for v in r:
             if isinstance(v, float):
-                vals.append('%.6g' % v)
+                s = '%.6g' % v
             elif isinstance(v, datetime.datetime):
-                vals.append(v.strftime('%Y-%m-%d %H:%M:%S%z'))
+                s = v.strftime('%Y-%m-%d %H:%M:%S%z')
             else:
-                vals.append(str(v))
+                s = str(v)
+            vals.append(s if len(s) <= width else s[:width - 1] + '~')
         out.append(' | '.join(vals))
     if len(rows) > limit:
         out.append('... (%d rows total)' % len(rows))
@@ -155,82 +317,142 @@ def timed(session, cql):
         return ms, '', '%s: %s' % (type(exc).__name__, exc)
 
 
-def cmd_query(a):
-    rows_per_series = a.rows // a.series
-    one = series_name(0)
-    ten = ', '.join("'%s'" % series_name(i) for i in range(10))
-    hundred = ', '.join("'%s'" % series_name(i) for i in range(100))
-    span_end = EPOCH + datetime.timedelta(seconds=rows_per_series)
-    t0 = EPOCH.strftime('%Y-%m-%d %H:%M:%S+0000')
-    t1 = span_end.strftime('%Y-%m-%d %H:%M:%S+0000')
-    t6h = (EPOCH + datetime.timedelta(hours=6)).strftime('%Y-%m-%d %H:%M:%S+0000')
-    tbl = '%s.%s' % (KEYSPACE, TABLE)
+def first_tag_of_kind(kind, total_series):
+    for i in range(total_series):
+        if kind_of(tag_type(i)) == kind:
+            return i
+    return 0
 
-    plan = [
-        ('single partition (%d rows)' % rows_per_series, [
-            ("count(*)", "SELECT count(*) FROM %s WHERE series='%s';" % (tbl, one)),
-            ("time_bucket 1h + avg/min/max",
-             "SELECT time_bucket(1h, ts), avg(value), min(value), max(value) FROM %s "
-             "WHERE series='%s' GROUP BY series, time_bucket(1h, ts);" % (tbl, one)),
-            ("time_bucket 5m + avg",
-             "SELECT time_bucket(5m, ts), avg(value) FROM %s WHERE series='%s' "
-             "GROUP BY series, time_bucket(5m, ts);" % (tbl, one)),
-            ("first/last/delta/rate per hour",
-             "SELECT time_bucket(1h, ts), first(value, ts), last(value, ts), delta(value, ts), "
-             "rate(value, ts) FROM %s WHERE series='%s' GROUP BY series, time_bucket(1h, ts);"
-             % (tbl, one)),
-            ("derivative per hour",
-             "SELECT time_bucket(1h, ts), derivative(value, ts) FROM %s WHERE series='%s' "
-             "GROUP BY series, time_bucket(1h, ts);" % (tbl, one)),
-            ("percentile p50/p95/p99 (whole partition)",
-             "SELECT percentile(value, 0.5), percentile(value, 0.95), percentile(value, 0.99) "
-             "FROM %s WHERE series='%s';" % (tbl, one)),
-            ("variance/stddev (whole partition)",
-             "SELECT variance(value), stddev(value) FROM %s WHERE series='%s';" % (tbl, one)),
-            ("histogram 20 buckets",
-             "SELECT histogram(value, 0, 100, 20) FROM %s WHERE series='%s';" % (tbl, one)),
-            ("approx_count_distinct",
-             "SELECT approx_count_distinct(value) FROM %s WHERE series='%s';" % (tbl, one)),
-            ("integral + time_weighted_average",
-             "SELECT integral(value, ts), time_weighted_average(value, ts) FROM %s "
-             "WHERE series='%s';" % (tbl, one)),
+
+def build_plan(a, rows_per_series):
+    one = tag_id(0)
+    one_kind = tag_type(0)
+    num_i = first_tag_of_kind('numeric', a.series)
+    numeric_tag = tag_id(num_i)
+    numeric_kind = tag_type(num_i)
+    ten = ', '.join("'%s'" % tag_id(i) for i in range(10))
+    hundred = ', '.join("'%s'" % tag_id(i) for i in range(100))
+    span = datetime.timedelta(seconds=rows_per_series * SAMPLE_SECONDS)
+    fmt = '%Y-%m-%d %H:%M:%S+0000'
+    t0 = EPOCH.strftime(fmt)
+    t1 = (EPOCH + span).strftime(fmt)
+    t1h = (EPOCH + datetime.timedelta(hours=1)).strftime(fmt)
+    t6h = (EPOCH + datetime.timedelta(hours=6)).strftime(fmt)
+    tbl = '%s.%s' % (KEYSPACE, a.table)
+    hours = max(1, int(span.total_seconds() // 3600))
+
+    return [
+        # Numeric aggregates all run on `latency`: an always-present, high-entropy int. `value` is
+        # text in production and `value_numeric` is null in production, so neither can be averaged;
+        # that asymmetry is faithful, not an oversight.
+        ("single partition, aggregates over latency (int; tag-000000, type='%s', %d rows/tag)"
+         % (one_kind, rows_per_series), [
+            ("count(*)", "SELECT count(*) FROM %s WHERE tag_id='%s';" % (tbl, one)),
+            ("time_bucket 1h + avg/min/max(latency)",
+             "SELECT time_bucket(1h, timestamp), avg(latency), min(latency), max(latency) FROM %s "
+             "WHERE tag_id='%s' GROUP BY tag_id, time_bucket(1h, timestamp);" % (tbl, one)),
+            ("time_bucket 5m + avg(latency)",
+             "SELECT time_bucket(5m, timestamp), avg(latency) FROM %s WHERE tag_id='%s' "
+             "GROUP BY tag_id, time_bucket(5m, timestamp);" % (tbl, one)),
+            ("first/last/delta/rate(latency) per hour",
+             "SELECT time_bucket(1h, timestamp), first(latency, timestamp), "
+             "last(latency, timestamp), delta(latency, timestamp), rate(latency, timestamp) "
+             "FROM %s WHERE tag_id='%s' GROUP BY tag_id, time_bucket(1h, timestamp);" % (tbl, one)),
+            ("derivative(latency) per hour",
+             "SELECT time_bucket(1h, timestamp), derivative(latency, timestamp) FROM %s "
+             "WHERE tag_id='%s' GROUP BY tag_id, time_bucket(1h, timestamp);" % (tbl, one)),
+            ("percentile p50/p95/p99(latency) (whole partition)",
+             "SELECT percentile(latency, 0.5), percentile(latency, 0.95), "
+             "percentile(latency, 0.99) FROM %s WHERE tag_id='%s';" % (tbl, one)),
+            ("variance/stddev(latency) (whole partition)",
+             "SELECT variance(latency), stddev(latency) FROM %s WHERE tag_id='%s';" % (tbl, one)),
+            ("histogram(latency, 0, 1000, 20)",
+             "SELECT histogram(latency, 0, 1000, 20) FROM %s WHERE tag_id='%s';" % (tbl, one)),
+            ("approx_count_distinct(latency)",
+             "SELECT approx_count_distinct(latency) FROM %s WHERE tag_id='%s';" % (tbl, one)),
+            ("integral + time_weighted_average(latency)",
+             "SELECT integral(latency, timestamp), time_weighted_average(latency, timestamp) "
+             "FROM %s WHERE tag_id='%s';" % (tbl, one)),
         ]),
-        ('gap-fill', [
-            ("gapfill 1h + locf over the full span",
-             "SELECT time_bucket_gapfill(1h, ts, '%s', '%s'), locf(avg(value)) FROM %s "
-             "WHERE series='%s' GROUP BY series, time_bucket_gapfill(1h, ts, '%s', '%s');"
-             % (t0, t1, tbl, one, t0, t1)),
+        # Row reads are where the wide shape actually costs something: a tiered read has to
+        # rebuild all 13 non-static columns out of one chunk payload, and a projection should be
+        # able to skip the columns it did not ask for.
+        ('row reads (all 16 columns vs. projections)', [
+            ("newest 1000 rows, SELECT * -- type='%s' tag" % one_kind,
+             "SELECT * FROM %s WHERE tag_id='%s' LIMIT 1000;" % (tbl, one)),
+            ("newest 1000 rows, SELECT * -- type='%s' tag (%s)" % (numeric_kind, numeric_tag),
+             "SELECT * FROM %s WHERE tag_id='%s' LIMIT 1000;" % (tbl, numeric_tag)),
+            ("1 hour of rows, SELECT * (all columns)",
+             "SELECT * FROM %s WHERE tag_id='%s' AND timestamp >= '%s' AND timestamp < '%s';"
+             % (tbl, one, t0, t1h)),
+            ("1 hour of rows, project timestamp+value only",
+             "SELECT timestamp, value FROM %s WHERE tag_id='%s' AND timestamp >= '%s' "
+             "AND timestamp < '%s';" % (tbl, one, t0, t1h)),
+            ("1 hour of rows, project timestamp+latency only",
+             "SELECT timestamp, latency FROM %s WHERE tag_id='%s' AND timestamp >= '%s' "
+             "AND timestamp < '%s';" % (tbl, one, t0, t1h)),
+            ("static columns only (1 row)",
+             "SELECT tag_id, site_id, area_id, line_id, asset_id, opc_id, tag_name, type "
+             "FROM %s WHERE tag_id='%s' LIMIT 1;" % (tbl, one)),
+            ("column presence, type='%s' tag: which columns are populated" % one_kind,
+             "SELECT count(latency) AS latency, count(value) AS value, "
+             "count(value_numeric) AS value_numeric, count(value_boolean) AS value_boolean, "
+             "count(quality) AS quality, count(attribute) AS attribute "
+             "FROM %s WHERE tag_id='%s';" % (tbl, one)),
+            ("column presence, type='%s' tag: which columns are populated" % numeric_kind,
+             "SELECT count(latency) AS latency, count(value) AS value, "
+             "count(value_numeric) AS value_numeric, count(value_boolean) AS value_boolean, "
+             "count(quality) AS quality, count(attribute) AS attribute "
+             "FROM %s WHERE tag_id='%s';" % (tbl, numeric_tag)),
+            ("avg/min/max(value_numeric) on a type='%s' tag" % numeric_kind,
+             "SELECT avg(value_numeric), min(value_numeric), max(value_numeric) FROM %s "
+             "WHERE tag_id='%s';" % (tbl, numeric_tag)),
+        ]),
+        # ORDER BY timestamp ASC: the table is clustered DESC (production idiom), and the gap-fill
+        # densifier walks buckets forwards, so the ascending order has to be asked for explicitly.
+        ('gap-fill (locf/interpolate over avg(latency))', [
+            ("gapfill 1h + locf over the full %dh span" % hours,
+             "SELECT time_bucket_gapfill(1h, timestamp, '%s', '%s'), locf(avg(latency)) FROM %s "
+             "WHERE tag_id='%s' GROUP BY tag_id, time_bucket_gapfill(1h, timestamp, '%s', '%s') "
+             "ORDER BY timestamp ASC;" % (t0, t1, tbl, one, t0, t1)),
             ("gapfill 5m + interpolate over 6h",
-             "SELECT time_bucket_gapfill(5m, ts, '%s', '%s'), interpolate(avg(value)) FROM %s "
-             "WHERE series='%s' AND ts >= '%s' AND ts < '%s' "
-             "GROUP BY series, time_bucket_gapfill(5m, ts, '%s', '%s');"
-             % (t0, t6h, tbl, one, t0, t6h, t0, t6h)),
+             "SELECT time_bucket_gapfill(5m, timestamp, '%s', '%s'), interpolate(avg(latency)) "
+             "FROM %s WHERE tag_id='%s' AND timestamp >= '%s' AND timestamp < '%s' "
+             "GROUP BY tag_id, time_bucket_gapfill(5m, timestamp, '%s', '%s') "
+             "ORDER BY timestamp ASC;" % (t0, t6h, tbl, one, t0, t6h, t0, t6h)),
         ]),
         ('multi-partition', [
-            ("10 series, hourly avg (%d rows)" % (10 * rows_per_series),
-             "SELECT series, time_bucket(1h, ts), avg(value) FROM %s WHERE series IN (%s) "
-             "GROUP BY series, time_bucket(1h, ts);" % (tbl, ten)),
-            ("100 series, hourly avg (%d rows)" % (100 * rows_per_series),
-             "SELECT series, time_bucket(1h, ts), avg(value) FROM %s WHERE series IN (%s) "
-             "GROUP BY series, time_bucket(1h, ts);" % (tbl, hundred)),
-            ("100 series, p95 per series",
-             "SELECT series, percentile(value, 0.95) FROM %s WHERE series IN (%s) "
-             "GROUP BY series;" % (tbl, hundred)),
+            ("10 tags, hourly avg(latency) (%d rows)" % (10 * rows_per_series),
+             "SELECT tag_id, time_bucket(1h, timestamp), avg(latency) FROM %s "
+             "WHERE tag_id IN (%s) GROUP BY tag_id, time_bucket(1h, timestamp);" % (tbl, ten)),
+            ("100 tags, hourly avg(latency) (%d rows)" % (100 * rows_per_series),
+             "SELECT tag_id, time_bucket(1h, timestamp), avg(latency) FROM %s "
+             "WHERE tag_id IN (%s) GROUP BY tag_id, time_bucket(1h, timestamp);" % (tbl, hundred)),
+            ("100 tags, p95(latency) per tag",
+             "SELECT tag_id, percentile(latency, 0.95) FROM %s WHERE tag_id IN (%s) "
+             "GROUP BY tag_id;" % (tbl, hundred)),
         ]),
         ('dashboard query', [
-            ("OHLC + change + p95 per hour",
-             "SELECT time_bucket(1h, ts) AS bucket, count(value) AS samples, "
-             "first(value, ts) AS open, last(value, ts) AS close, min(value) AS low, "
-             "max(value) AS high, avg(value) AS mean, delta(value, ts) AS change, "
-             "rate(value, ts) AS per_second, percentile(value, 0.95) AS p95 "
-             "FROM %s WHERE series='%s' GROUP BY series, time_bucket(1h, ts);" % (tbl, one)),
+            ("OHLC + change + p95 of latency per hour",
+             "SELECT time_bucket(1h, timestamp) AS bucket, count(latency) AS samples, "
+             "first(latency, timestamp) AS open, last(latency, timestamp) AS close, "
+             "min(latency) AS low, max(latency) AS high, avg(latency) AS mean, "
+             "delta(latency, timestamp) AS change, rate(latency, timestamp) AS per_second, "
+             "percentile(latency, 0.95) AS p95 FROM %s WHERE tag_id='%s' "
+             "GROUP BY tag_id, time_bucket(1h, timestamp);" % (tbl, one)),
         ]),
-        ('full table scan (%d rows)' % a.rows, [
+        # KNOWN LIMITATION, not a benchmark result: a range scan does not merge chunk data back in,
+        # so on a fully tiered table this returns 0. A "0 in 3 ms" line below is a WRONG ANSWER.
+        ('full table scan (%d rows) -- returns 0 on a tiered table (known limitation)' % a.rows, [
             ("count(*) over the whole table",
              "SELECT count(*) FROM %s;" % tbl),
         ]),
     ]
 
+
+def cmd_query(a):
+    rows_per_series = a.rows // a.series
+    plan = build_plan(a, rows_per_series)
     cluster, session = connect()
     results = []
     for section, items in plan:
@@ -247,6 +469,8 @@ def cmd_query(a):
     if a.json_out:
         with open(a.json_out, 'w') as fh:
             json.dump({'image': a.image, 'rows': a.rows, 'series': a.series,
+                       'table': a.table, 'rows_per_series': rows_per_series,
+                       'sample_seconds': SAMPLE_SECONDS,
                        'load_secs': a.load_secs,
                        'queries': [{'section': None if k == 'row' else d,
                                     'desc': d, 'cql': c, 'ms': ms,
@@ -259,13 +483,19 @@ def cmd_query(a):
         sys.stderr.write('   markdown report written to %s\n' % a.md_out)
 
 
-def emit_html(a, results, rows_per_series):
+def headline(a, rows_per_series):
     total = a.series * rows_per_series
+    hours = rows_per_series * SAMPLE_SECONDS / 3600.0
+    return total, hours
+
+
+def emit_html(a, results, rows_per_series):
+    total, hours = headline(a, rows_per_series)
     thr = total / a.load_secs if a.load_secs else 0
     w = sys.stdout.write
     w("""<!doctype html>
 <meta charset="utf-8">
-<title>cassandra-timeseries · time-series CQL scale test</title>
+<title>cassandra-timeseries · tm_tag_point scale test</title>
 <style>
   :root { color-scheme: light dark; --bg:#fff; --fg:#1a1a1a; --muted:#666; --line:#e3e3e3;
           --accent:#0a6cbd; --warn:#c62828; --code:#f6f7f9; }
@@ -293,13 +523,16 @@ def emit_html(a, results, rows_per_series):
   td:nth-child(2) { width:30%; } td:nth-child(3) { width:34%; }
 </style>
 """)
-    w('<h1>time-series CQL scale test</h1>\n')
-    w('<div class="meta">image <code>%s</code> · single node in a container · %s</div>\n'
-      % (html.escape(a.image), time.strftime('%Y-%m-%d %H:%M UTC', time.gmtime())))
+    w('<h1>tm_tag_point scale test</h1>\n')
+    w('<div class="meta">image <code>%s</code> · table <code>%s.%s</code> · single node in a '
+      'container · %s</div>\n'
+      % (html.escape(a.image), KEYSPACE, html.escape(a.table),
+         time.strftime('%Y-%m-%d %H:%M UTC', time.gmtime())))
     w('<div class="cards">')
     w('<div class="card"><b>%s</b><span>rows loaded</span></div>' % f'{total:,}')
-    w('<div class="card"><b>%s</b><span>partitions (%s rows each)</span></div>'
-      % (f'{a.series:,}', f'{rows_per_series:,}'))
+    w('<div class="card"><b>%s</b><span>tags (partitions)</span></div>' % f'{a.series:,}')
+    w('<div class="card"><b>%s</b><span>rows per tag (%.1f h @ 1 sample/%ds)</span></div>'
+      % (f'{rows_per_series:,}', hours, SAMPLE_SECONDS))
     w('<div class="card"><b>%s s</b><span>load time (%s rows/s)</span></div>'
       % (f'{a.load_secs:,}', f'{int(thr):,}'))
     w('</div>\n')
@@ -317,14 +550,15 @@ def emit_html(a, results, rows_per_series):
 
 
 def emit_md(a, results, rows_per_series, out):
-    total = a.series * rows_per_series
+    total, hours = headline(a, rows_per_series)
     thr = total / a.load_secs if a.load_secs else 0
     w = out.write
-    w('# time-series CQL scale test\n\n')
-    w('image `%s` · single node in a container · %s\n\n'
-      % (a.image, time.strftime('%Y-%m-%d %H:%M UTC', time.gmtime())))
+    w('# tm_tag_point scale test\n\n')
+    w('image `%s` · table `%s.%s` · single node in a container · %s\n\n'
+      % (a.image, KEYSPACE, a.table, time.strftime('%Y-%m-%d %H:%M UTC', time.gmtime())))
     w('- **%s** rows loaded\n' % f'{total:,}')
-    w('- **%s** partitions (%s rows each)\n' % (f'{a.series:,}', f'{rows_per_series:,}'))
+    w('- **%s** tags (partitions), **%s rows per tag** = %.1f h of history at 1 sample/%ds\n'
+      % (f'{a.series:,}', f'{rows_per_series:,}', hours, SAMPLE_SECONDS))
     w('- **%s s** load time (%s rows/s)\n' % (f'{a.load_secs:,}', f'{int(thr):,}'))
     w('\n## Query times\n\n| section | query | first result row | CQL time |\n|---|---|---|---|\n')
     section = ''
@@ -336,7 +570,7 @@ def emit_md(a, results, rows_per_series, out):
         lines = (err or out_text).splitlines()
         value = lines[2] if len(lines) > 2 else (lines[0] if lines else '')
         w('| %s | %s | `%s` | **%s ms** |\n'
-          % (section, desc, value.replace('|', '\\|')[:60], f'{ms:,.0f}'))
+          % (section, desc, value.replace('|', '\\|')[:70], f'{ms:,.0f}'))
     w('\n## Details\n')
     section = ''
     for kind, desc, cql, ms, payload in results:
@@ -353,18 +587,18 @@ def emit_md(a, results, rows_per_series, out):
 def main():
     p = argparse.ArgumentParser()
     sub = p.add_subparsers(dest='cmd', required=True)
-    for name in ('load', 'query'):
+    for name in ('ddl', 'load', 'query'):
         s = sub.add_parser(name)
-        s.add_argument('--rows', type=int, default=100_000_000)
-        s.add_argument('--series', type=int, default=3000)
+        s.add_argument('--rows', type=int, default=20_000_000)
+        s.add_argument('--series', type=int, default=500)
         s.add_argument('--loaders', type=int, default=12)
         s.add_argument('--load-secs', type=int, default=0)
         s.add_argument('--image', default='cassandra-timeseries:6.0.0')
         s.add_argument('--md-out', default='', help='also write a Markdown report to this path')
         s.add_argument('--json-out', default='', help='also write machine-readable results here')
-        s.add_argument('--table', default=TABLE, help='table to load into (write benchmark)')
+        s.add_argument('--table', default=TABLE, help='table to load into / query')
     a = p.parse_args()
-    (cmd_load if a.cmd == 'load' else cmd_query)(a)
+    {'ddl': cmd_ddl, 'load': cmd_load, 'query': cmd_query}[a.cmd](a)
 
 
 if __name__ == '__main__':
