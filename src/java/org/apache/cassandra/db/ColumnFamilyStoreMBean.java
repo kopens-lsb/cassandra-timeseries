@@ -331,6 +331,34 @@ public interface ColumnFamilyStoreMBean
     public int[] getSSTableCountPerTWCSBucket();
 
     /**
+     * Windows that TimeSeriesCompactionStrategy's no-progress guard has parked, mapped to the sstables
+     * they are parked at. Empty unless time-series compaction is used, and empty is the healthy state.
+     * <p>
+     * A parked window is deliberately skipped by freeze and split selection, so it drops out of the
+     * backlogs and out of {@code getEstimatedRemainingTasks()} - the table then looks exactly like one
+     * with nothing to do. It is not: a parked window never reaches FROZEN, so nothing downstream of the
+     * freeze (tiered-storage compression included) runs for it. Un-parking is automatic on any change
+     * to the window; the remedy for a window that stays parked is named in the WARN logged when it was
+     * parked (usually a partition too large to window-route, or {@code nodetool relocatesstables}).
+     *
+     * @return window start (epoch millis) -&gt; the sstables that window is parked at.
+     */
+    public Map<Long, List<String>> getParkedTimeSeriesWindows();
+
+    /**
+     * SSTables TimeSeriesCompactionStrategy has excluded from every automatic path (delegate
+     * compaction, freeze, split and retention) because their window lies beyond {@code
+     * max_future_window} - a writer clock or {@code USING TIMESTAMP} far in the future. Empty unless
+     * time-series compaction is used, and empty is the healthy state.
+     * <p>
+     * They accumulate permanently, one per flush, until an operator intervenes: fix the timestamp
+     * source, then rewrite them with a user-defined or maximal compaction (both still include them).
+     *
+     * @return the excluded sstables.
+     */
+    public List<String> getFarFutureTimeSeriesSSTables();
+
+    /**
      * @return sstable fanout size for level compaction strategy.
      */
     public int getLevelFanoutSize();

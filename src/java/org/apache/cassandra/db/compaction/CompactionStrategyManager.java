@@ -879,6 +879,64 @@ public class CompactionStrategyManager implements INotificationConsumer
         }
     }
 
+    /**
+     * Aggregates {@link TimeSeriesCompactionStrategy#getParkedWindows()} over every strategy instance
+     * of this table. The instances are per repair status and per disk, so a window can legitimately be
+     * parked in one of them and healthy in another; the sstable lists are concatenated under the one
+     * window key, which is what an operator wants to see.
+     *
+     * @return window start (epoch millis) -&gt; the sstables the no-progress guard is parked at, or an
+     * empty map when the table does not use {@link TimeSeriesCompactionStrategy} (or nothing is
+     * parked, which is the healthy state).
+     */
+    public Map<Long, List<String>> getParkedTimeSeriesWindows()
+    {
+        readLock.lock();
+        try
+        {
+            Map<Long, List<String>> parked = new TreeMap<>();
+            for (AbstractCompactionStrategy strategy : getAllStrategies())
+            {
+                if (!(strategy instanceof TimeSeriesCompactionStrategy))
+                    continue;
+                for (Map.Entry<Long, Set<SSTableReader>> window : ((TimeSeriesCompactionStrategy) strategy).getParkedWindows().entrySet())
+                    for (SSTableReader sstable : window.getValue())
+                        parked.computeIfAbsent(window.getKey(), start -> new ArrayList<>()).add(sstable.toString());
+            }
+            return parked;
+        }
+        finally
+        {
+            readLock.unlock();
+        }
+    }
+
+    /**
+     * @return the sstables {@link TimeSeriesCompactionStrategy} has excluded from every automatic path
+     * because their window lies beyond {@code max_future_window}, across every strategy instance of
+     * this table; empty when the table does not use it (or, healthily, when there are none).
+     */
+    public List<String> getFarFutureTimeSeriesSSTables()
+    {
+        readLock.lock();
+        try
+        {
+            List<String> farFuture = new ArrayList<>();
+            for (AbstractCompactionStrategy strategy : getAllStrategies())
+            {
+                if (!(strategy instanceof TimeSeriesCompactionStrategy))
+                    continue;
+                for (SSTableReader sstable : ((TimeSeriesCompactionStrategy) strategy).getFarFutureSSTables())
+                    farFuture.add(sstable.toString());
+            }
+            return farFuture;
+        }
+        finally
+        {
+            readLock.unlock();
+        }
+    }
+
     static int[] sumCountsByBucket(List<Map<Long, Integer>> countsByBucket, int max)
     {
         TreeMap<Long, Integer> merged = new TreeMap<>(Comparator.reverseOrder());

@@ -126,15 +126,26 @@ public final class WindowRoutingIterator
      * <p><b>Why that does not livelock.</b> The spanning sstable classifies FREEZING, so
      * {@code nextSplitRefreezeCandidate} selects it and {@code SplitRefreezeCompactionTask} re-routes
      * it — with the same budget, so the same partition overflows again and the same window keeps a
-     * spanning sstable. The strategy's no-progress guard is what bounds that, and it does so because
-     * the rewrite is provably shape-preserving here: the window holds one sstable before and one
-     * after, and the overflowing partition's timestamps are unchanged by a rewrite that neither drops
-     * nor splits them, so the sstable's min/max — and hence the window's
-     * {@code (sstable count, windows spanned)} signature — come out identical. The guard compares
-     * exactly that signature across a completed rewrite, so each futile split scores a strike and the
-     * window is parked after {@code NO_PROGRESS_STRIKES} of them, with a WARN naming the sstable.
-     * (Purging can shrink the span, in which case the rewrite made real progress, the guard resets,
-     * and the next round starts the count again from a strictly smaller span — still finite.)
+     * spanning sstable. What bounds that is the strategy's no-progress guard
+     * ({@code TimeSeriesCompactionStrategy#recordCompletedRewrite}), and the guarantee it gives is
+     * about a <em>chain</em> of rewrites, not about any single one:
+     * <ul>
+     *   <li>when the source sstable holds nothing but the overflowing partition, the split is
+     *       shape-preserving — one sstable in, one out, with the same timestamps, hence the same
+     *       {@code (sstable count, windows spanned)} signature — so each futile split immediately
+     *       repeats a shape the chain has already produced;</li>
+     *   <li>when it also holds ordinary data, the split is <b>not</b> shape-preserving: the
+     *       overflowing partition goes to one window's writer and the ordinary rows to their own, so
+     *       the window ends up with two sstables and is then a <em>freeze</em> candidate, and the
+     *       freeze merges them back into one still-spanning sstable. Each path changes the shape, and
+     *       each undoes the other. The guard scores this because it asks whether a chain of rewrites
+     *       has returned the window to a shape that same chain produced before — which this
+     *       alternation does on its second lap — not whether one rewrite changed anything.</li>
+     * </ul>
+     * Either way the window is parked after {@code NO_PROGRESS_STRIKES} such repeats, with a WARN
+     * naming the sstables. (Purging can shrink the span, in which case the rewrite reaches a shape the
+     * chain has not been at, the strike count resets, and the next round starts again from a strictly
+     * smaller span — still finite.)
      *
      * <p>Failing instead was rejected: this routing is on the memtable flush path, where an exception
      * fails the whole flush and blocks writes.
@@ -150,7 +161,7 @@ public final class WindowRoutingIterator
      * being routed. Size it accordingly rather than against a heap headroom figure.
      */
     @VisibleForTesting
-    static volatile long maxBufferedBytesPerPartition = 64L * 1024 * 1024;
+    public static volatile long maxBufferedBytesPerPartition = 64L * 1024 * 1024;
 
     private WindowRoutingIterator()
     {

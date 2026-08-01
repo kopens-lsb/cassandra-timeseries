@@ -23,6 +23,7 @@ import java.util.Collection;
 import java.util.Collections;
 import java.util.HashMap;
 import java.util.HashSet;
+import java.util.LinkedHashSet;
 import java.util.List;
 import java.util.Map;
 import java.util.NavigableMap;
@@ -104,25 +105,50 @@ public class TimeSeriesCompactionStrategy extends AbstractCompactionStrategy
     private volatile NavigableMap<Long, Set<SSTableReader>> parkedWindows = Collections.emptyNavigableMap();
 
     /**
-     * How many <em>completed</em> rewrites of one window may leave that window's shape unchanged before
-     * it is parked; a genuinely stuck window is therefore rewritten exactly this many times and then
-     * never again. Two allows one futile rewrite - enough to absorb a rewrite that lost a race with
-     * concurrent work - while keeping a stuck window's cost bounded instead of unbounded.
+     * How many <em>completed</em> rewrites of one window may return it to a shape the current chain of
+     * rewrites has already produced before it is parked; a genuinely stuck window is therefore
+     * rewritten a bounded number of times and then never again. Two allows one futile rewrite - enough
+     * to absorb a rewrite that lost a race with concurrent work - while keeping a stuck window's cost
+     * bounded instead of unbounded.
      */
     @VisibleForTesting
     static final int NO_PROGRESS_STRIKES = 2;
 
-    /** What the guard remembers about a window whose rewrite completed without changing it. */
+    /**
+     * How many distinct shapes one chain remembers. Only short cycles need catching - the freeze
+     * <-> split alternation is a 2-cycle and a futile rewrite is a 1-cycle - and a chain that has
+     * produced this many <em>different</em> shapes in a row is making progress by any reading, so the
+     * eldest is evicted rather than letting the set grow with the chain.
+     */
+    private static final int MAX_TRACKED_SHAPES = 8;
+
+    /**
+     * What the guard remembers about one uninterrupted <em>chain</em> of rewrites over a window: a run
+     * of completed rewrites in which each one started from the shape the previous one left behind, so
+     * nothing outside compaction has touched the window in between. See {@link #recordCompletedRewrite}.
+     */
     private static final class WindowProgress
     {
-        /** The window's shape after that rewrite; see {@link #windowSignature}. */
-        private final long signature;
+        /** Every shape this chain has produced, in order; see {@link #windowSignature}. */
+        private final Set<Long> shapes = new LinkedHashSet<>();
+        /** The shape the most recent rewrite in this chain left behind. */
+        private long lastSignature;
         private int strikes;
         private boolean parked;
 
-        private WindowProgress(long signature)
+        /**
+         * @return {@code true} if this chain has already produced {@code signature} - the window has
+         * come back to a shape these rewrites have been at before, so the rewrites are going round in
+         * a circle. Records it otherwise.
+         */
+        private boolean revisits(long signature)
         {
-            this.signature = signature;
+            if (shapes.contains(signature))
+                return true;
+            if (shapes.size() == MAX_TRACKED_SHAPES)
+                shapes.remove(shapes.iterator().next());
+            shapes.add(signature);
+            return false;
         }
     }
 
@@ -313,7 +339,7 @@ public class TimeSeriesCompactionStrategy extends AbstractCompactionStrategy
                                  "and from retention, so they accumulate permanently - one per flush while the bad " +
                                  "clock persists. Remedy: fix the writer clock or USING TIMESTAMP input, then " +
                                  "rewrite them with a user-defined or maximal compaction (both still include them). " +
-                                 "The current set is available programmatically via getFarFutureSSTables().",
+                                 "The current set is on the table's MBean as FarFutureTimeSeriesSSTables.",
                                  cfs.getKeyspaceName(), cfs.getTableName(), farFuture.size(),
                                  tsOptions.maxFutureWindowMillis, sstable, windowStart);
                 continue;
@@ -472,18 +498,35 @@ public class TimeSeriesCompactionStrategy extends AbstractCompactionStrategy
      * </ul>
      * Candidate equality cannot detect either: every rewrite produces a fresh generation, so the
      * candidate set differs each round while the window's <em>shape</em> is unchanged. The guard
-     * therefore compares the shape - {@link #windowSignature} - immediately before and immediately
-     * after each rewrite, and parks a window that survives {@link #NO_PROGRESS_STRIKES} rewrites which
-     * each left it exactly as they found it.
+     * therefore tracks the shape - {@link #windowSignature} - immediately before and immediately after
+     * each rewrite, and parks a window whose rewrites keep returning it to a shape they have already
+     * produced ({@link #NO_PROGRESS_STRIKES} times).
      * <p>
-     * <b>Before-and-after, not round-to-round.</b> Comparing the shape a window has when a task is
-     * handed out with the shape it had at the previous hand-out cannot tell a stuck window from a
-     * healthy one under steady late data: a closed window that receives one late flush per round
-     * oscillates 2 sstables -> 1 -> 2, and every round samples it at 2 with an identical signature, so
-     * three <em>successful</em> freezes would park a window that is working perfectly. Attributing the
-     * shape change to the rewrite that caused it fixes that - the freeze took the window from 2 to 1
-     * and the guard sees it - while still catching the real loops, where the rewrite provably changed
-     * nothing.
+     * <b>Chains, not single rewrites.</b> "The rewrite changed nothing" is too narrow a test, because
+     * the two paths can undo <em>each other</em> while each one changes the window. A closed window
+     * whose single spanning sstable holds an un-routable (over-budget) partition <em>and</em> ordinary
+     * data alternates forever: the split writes the overflowing partition unsplit into one sstable and
+     * the ordinary data into another, so the window goes 1 sstable -> 2 and classifies FREEZING; the
+     * freeze merges those 2 back into 1 still-spanning sstable, so it classifies FREEZING again and is
+     * re-split. Both rewrites change the shape, so a per-rewrite test resets on every one of them and
+     * the giant partition is rewritten end to end forever. (Parking on shape alone only ever worked
+     * when the sstable held <em>nothing but</em> the overflowing partition.)
+     * <p>
+     * So the unit is a <b>chain</b>: consecutive completed rewrites in which each one started from the
+     * shape the previous one left behind. Inside a chain nothing but compaction has touched the
+     * window, so a shape the chain has produced before means the rewrites are going round in a circle,
+     * whichever paths they came from - which is exactly what has to be bounded. A rewrite that starts
+     * from a shape no rewrite produced (a late flush, streaming, an operator's compaction landed in
+     * between) begins a fresh chain and forgets everything.
+     * <p>
+     * <b>Chains, not round-to-round.</b> Comparing the shape a window has when a task is handed out
+     * with the shape it had at the previous hand-out cannot tell a stuck window from a healthy one
+     * under steady late data: a closed window that receives one late flush per round oscillates 2
+     * sstables -> 1 -> 2, and every round samples it at 2 with an identical signature, so three
+     * <em>successful</em> freezes would park a window that is working perfectly. Chaining fixes that
+     * for the same reason it catches the alternation: the freeze left the window at 1 sstable and the
+     * next freeze starts from 2, so the late flush - not a rewrite - is what moved it, the chain
+     * breaks, and nothing is scored.
      * <p>
      * <b>Completed rewrites only.</b> This is called strictly post-commit by the task itself, so a
      * freeze aborted by the disk-space pre-flight, stopped by {@code nodetool stop COMPACTION} or
@@ -491,12 +534,12 @@ public class TimeSeriesCompactionStrategy extends AbstractCompactionStrategy
      * rounds parked a window, and freeing the disk did not un-park it: nothing about the window had
      * changed, so nothing reset the guard, and only a restart or a shape change recovered it.
      * <p>
-     * Parking is deliberately self-healing: the record is keyed on the signature, so any change to the
-     * window (a late flush, an operator's {@code nodetool relocatesstables} or major compaction)
-     * silently un-parks it. Parking is a safety net, not a fix - a parked window never freezes, so
-     * {@link org.apache.cassandra.db.compaction.timeseries.WindowFrozenListener} never fires for it and
-     * downstream consumers never see it. That is why it warns, and why {@link #getParkedWindows()}
-     * exposes the current set.
+     * Parking is deliberately self-healing: it is keyed on the shape the chain was parked at, so any
+     * change to the window (a late flush, an operator's {@code nodetool relocatesstables} or major
+     * compaction) silently un-parks it. Parking is a safety net, not a fix - a parked window never
+     * freezes, so {@link org.apache.cassandra.db.compaction.timeseries.WindowFrozenListener} never
+     * fires for it and downstream consumers never see it. That is why it warns, and why
+     * {@link #getParkedWindows()} exposes the current set.
      *
      * @param signatureBefore the window's shape when this rewrite was handed out
      */
@@ -505,28 +548,35 @@ public class TimeSeriesCompactionStrategy extends AbstractCompactionStrategy
     {
         Set<SSTableReader> after = windows().getOrDefault(windowStartMillis, Set.of());
         long signatureAfter = windowSignature(after);
-        if (signatureAfter != signatureBefore)
-        {
-            // The rewrite changed the window: real progress, and any earlier strikes are stale.
-            windowProgress.remove(windowStartMillis);
-            return;
-        }
 
         WindowProgress progress = windowProgress.get(windowStartMillis);
-        if (progress == null || progress.signature != signatureAfter)
+        if (progress == null || progress.lastSignature != signatureBefore)
         {
-            progress = new WindowProgress(signatureAfter);
+            // This rewrite started from a shape no rewrite of this window produced, so something
+            // outside compaction moved it: whatever the previous chain was doing is history.
+            progress = new WindowProgress();
+            progress.revisits(signatureBefore);
             windowProgress.put(windowStartMillis, progress);
+        }
+        progress.lastSignature = signatureAfter;
+
+        if (!progress.revisits(signatureAfter))
+        {
+            // A shape this chain has never been at: the rewrites are still getting somewhere.
+            progress.strikes = 0;
+            return;
         }
         if (++progress.strikes < NO_PROGRESS_STRIKES)
             return;
 
         progress.parked = true;
-        logger.warn("Parking window {} of {}.{}: {} completed {} time(s) without changing the window " +
-                    "({} sstable(s), spanning windows {}). Not re-selecting it until the window changes - " +
-                    "it will not freeze, so downstream consumers of the frozen-window event will not see it. " +
-                    "Investigate: for a still-spanning single sstable check for partitions too large to " +
-                    "window-route; for a window stuck at several sstables on JBOD, run nodetool relocatesstables.",
+        logger.warn("Parking window {} of {}.{}: {} completed {} time(s) returning the window to a shape its " +
+                    "rewrites had already produced ({} sstable(s), spanning windows {}). Not re-selecting it " +
+                    "for freeze or split until something outside compaction changes the window - it will not " +
+                    "freeze, so downstream consumers of the frozen-window event will not see it. Investigate: " +
+                    "for a window alternating between one spanning sstable and two, check for a partition too " +
+                    "large to window-route sharing an sstable with ordinary data; for a window stuck at several " +
+                    "sstables on JBOD, run nodetool relocatesstables.",
                     windowStartMillis, cfs.getKeyspaceName(), cfs.getTableName(), what, progress.strikes,
                     after.size(), describeSpans(after));
     }
@@ -536,7 +586,7 @@ public class TimeSeriesCompactionStrategy extends AbstractCompactionStrategy
     synchronized boolean isParked(long windowStartMillis, Set<SSTableReader> windowSSTables)
     {
         WindowProgress progress = windowProgress.get(windowStartMillis);
-        return progress != null && progress.parked && progress.signature == windowSignature(windowSSTables);
+        return progress != null && progress.parked && progress.lastSignature == windowSignature(windowSSTables);
     }
 
     /**
@@ -605,6 +655,9 @@ public class TimeSeriesCompactionStrategy extends AbstractCompactionStrategy
      * <p>
      * Refreshed on every background round; empty is the healthy state. Un-parking is automatic on any
      * change to the window - see {@link #recordCompletedRewrite}.
+     * <p>
+     * Reaches operators via the table's own MBean, aggregated over this table's strategy instances:
+     * {@link org.apache.cassandra.db.ColumnFamilyStoreMBean#getParkedTimeSeriesWindows()}.
      */
     public NavigableMap<Long, Set<SSTableReader>> getParkedWindows()
     {
@@ -618,6 +671,9 @@ public class TimeSeriesCompactionStrategy extends AbstractCompactionStrategy
      * rather than only warned about; the remedy is a user-defined or maximal compaction over them
      * (both still include far-future sstables) once the writer clock or {@code USING TIMESTAMP} input
      * that produced them is fixed.
+     * <p>
+     * Reaches operators via the table's own MBean, aggregated over this table's strategy instances:
+     * {@link org.apache.cassandra.db.ColumnFamilyStoreMBean#getFarFutureTimeSeriesSSTables()}.
      */
     public Set<SSTableReader> getFarFutureSSTables()
     {

@@ -3102,6 +3102,18 @@ public <T> T withAllSSTables(final OperationType operationType, Function<Lifecyc
     }
 
     @Override
+    public Map<Long, List<String>> getParkedTimeSeriesWindows()
+    {
+        return compactionStrategyManager.getParkedTimeSeriesWindows();
+    }
+
+    @Override
+    public List<String> getFarFutureTimeSeriesSSTables()
+    {
+        return compactionStrategyManager.getFarFutureTimeSeriesSSTables();
+    }
+
+    @Override
     public int getLevelFanoutSize()
     {
         return compactionStrategyManager.getLevelFanoutSize();

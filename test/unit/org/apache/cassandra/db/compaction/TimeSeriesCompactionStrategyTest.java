@@ -606,6 +606,66 @@ public class TimeSeriesCompactionStrategyTest
     }
 
     /**
+     * The freeze <-> split alternation, which parking on "this rewrite changed nothing" could not
+     * catch because <em>both</em> rewrites change the window.
+     * <p>
+     * A closed window holding one spanning sstable that carries an over-budget (un-routable) partition
+     * <b>and</b> ordinary data: the split writes the overflowing partition unsplit into one sstable and
+     * the ordinary rows into their own, so the window goes 1 sstable -> 2 and is now a FREEZE
+     * candidate; the freeze merges those 2 back into 1 still-spanning sstable, so it is a SPLIT
+     * candidate again. Each path changed the shape, so each reset the other's strikes and the giant
+     * partition was rewritten end to end forever.
+     * <p>
+     * Deliberately many more rounds than {@code NO_PROGRESS_STRIKES}: the loop must stop on its own,
+     * and the assertion is that it stopped, not that it stopped after some particular count.
+     */
+    @Test
+    public void freezeAndSplitCannotClearEachOthersStrikes()
+    {
+        UnifiedCompactionStrategy delegate = mock(UnifiedCompactionStrategy.class);
+        when(delegate.getNextBackgroundTasks(anyLong())).thenReturn(List.of());
+        ColumnFamilyStore cfs = mock(ColumnFamilyStore.class, Mockito.RETURNS_DEEP_STUBS);
+        stubTracker(cfs);
+        TimeSeriesCompactionStrategy tscs = new TimeSeriesCompactionStrategy(cfs, options(), delegate);
+
+        // The whole window keys off max timestamp, so both the spanning sstable and the ordinary one
+        // sit in the same (old, closed) window - which is what makes the two paths fight over it.
+        SSTableReader spanning = sstableSpanning(NOW - 11 * HOUR, NOW - 10 * HOUR);
+        setWindow(tscs, cfs, Set.of(spanning));
+
+        int rewrites = 0;
+        for (int round = 0; round < 4 * TimeSeriesCompactionStrategy.NO_PROGRESS_STRIKES + 4; round++)
+        {
+            Collection<AbstractCompactionTask> tasks = tscs.getNextBackgroundTasksAt(NOW, 0);
+            if (tasks.isEmpty())
+                break;                                    // the guard parked the window: the loop ended
+
+            AbstractCompactionTask task = onlyTask(tasks);
+            rewrites++;
+            if (task instanceof SplitRefreezeCompactionTask)
+            {
+                // The split re-routes the un-routable partition unsplit (same span as before) and lands
+                // the ordinary rows in their own, contained sstable: two sstables, same window.
+                setWindow(tscs, cfs, Set.of(sstableSpanning(NOW - 11 * HOUR, NOW - 10 * HOUR),
+                                            sstableAt(NOW - 10 * HOUR + 60_000)));
+            }
+            else
+            {
+                assertTrue("round " + round, task instanceof FreezeCompactionTask);
+                // The freeze merges them back into one sstable that still spans, because the partition
+                // it cannot split is still in it.
+                setWindow(tscs, cfs, Set.of(sstableSpanning(NOW - 11 * HOUR, NOW - 10 * HOUR)));
+            }
+            complete(task);
+        }
+
+        assertTrue("the alternation must stop, not run for every round: " + rewrites + " rewrites",
+                   rewrites <= 4 * TimeSeriesCompactionStrategy.NO_PROGRESS_STRIKES);
+        assertTrue("the window must end up parked", tscs.isParked(oldWindow(), tscs.getSSTables()));
+        assertEquals(List.of(), List.copyOf(tscs.getNextBackgroundTasksAt(NOW, 0)));
+    }
+
+    /**
      * I1: a rewrite that never ran must never score a strike.
      * <p>
      * The guard used to count hand-outs, so a freeze aborted by the disk-space pre-flight, stopped by

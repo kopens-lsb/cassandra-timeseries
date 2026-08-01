@@ -43,6 +43,7 @@ import org.apache.cassandra.db.RowUpdateBuilder;
 import org.apache.cassandra.db.compaction.timeseries.TimeWindowSplittingMultiWriter;
 import org.apache.cassandra.db.compaction.timeseries.WindowFrozenListener;
 import org.apache.cassandra.db.compaction.timeseries.WindowFrozenListeners;
+import org.apache.cassandra.db.compaction.timeseries.WindowRoutingIterator;
 import org.apache.cassandra.db.lifecycle.LifecycleTransaction;
 import org.apache.cassandra.exceptions.ConfigurationException;
 import org.apache.cassandra.io.sstable.format.SSTableReader;
@@ -659,6 +660,134 @@ public class TimeSeriesCompactionStrategyE2ETest extends SchemaLoader
         {
             TimeWindowSplittingMultiWriter.maxWindowWriters = saved;
         }
+    }
+
+    /**
+     * The freeze &lt;-&gt; split alternation, end to end, through the real completion path.
+     * <p>
+     * A window whose single spanning sstable holds a partition too large to window-route <b>and</b>
+     * ordinary data: the split writes the un-routable partition unsplit into one sstable and the
+     * ordinary rows into their own, leaving the window with two sstables - which makes it a FREEZE
+     * candidate - and the freeze merges them straight back into one still-spanning sstable, which makes
+     * it a SPLIT candidate again. Both rewrites change the window's shape, so parking on "this rewrite
+     * changed nothing" reset on every single one of them and the giant partition was rewritten end to
+     * end forever.
+     * <p>
+     * Deliberately driven by real {@code task.execute(...)} calls rather than by running the guard
+     * callbacks by hand: the strike is scored from inside {@code FreezeCompactionTask#finish} and
+     * {@code SplitRefreezeCompactionTask#runMayThrow}, post-commit, and the unit tests' direct
+     * {@code onCompleted().run()} could not tell a task that fires it from one that does not. Deleting
+     * either call fails this test, because nothing scores and the loop never terminates.
+     */
+    @Test
+    public void testFreezeSplitAlternationTerminatesThroughTheRealCompletionPath()
+    {
+        Keyspace keyspace = Keyspace.open(KEYSPACE1);
+        ColumnFamilyStore cfs = keyspace.getColumnFamilyStore(CF_STANDARD1);
+        cfs.truncateBlocking();
+        cfs.disableAutoCompaction();
+        cfs.setCompactionParameters(ImmutableMap.of("class", "SizeTieredCompactionStrategy"));
+
+        long savedBudget = WindowRoutingIterator.maxBufferedBytesPerPartition;
+        try
+        {
+            ByteBuffer value = ByteBuffer.wrap(new byte[16]);
+            long now = System.currentTimeMillis();
+
+            // One partition across eight one-minute windows, in clustering (= time) order, flushed while
+            // the strategy is still SizeTiered so nothing splits it on the way in.
+            DecoratedKey huge = Util.dk("alternation-unroutable");
+            for (int i = 0; i < 8; i++)
+                new RowUpdateBuilder(cfs.metadata(), now - TimeUnit.MINUTES.toMillis(10L - i), huge.getKey())
+                    .clustering("c" + i).add("val", value).build().applyUnsafe();
+            // Ordinary data in the newest of those windows, in its own partition. This is the half the
+            // split CAN route, and therefore the second sstable that turns a futile split into a freeze.
+            DecoratedKey ordinary = Util.dk("alternation-ordinary");
+            new RowUpdateBuilder(cfs.metadata(), now - TimeUnit.MINUTES.toMillis(3), ordinary.getKey())
+                .clustering("c").add("val", value).build().applyUnsafe();
+            Util.flush(cfs);
+            assertEquals(1, cfs.getLiveSSTables().size());
+            SSTableReader spanning = cfs.getLiveSSTables().iterator().next();
+
+            // Budget 1 byte: any partition of more than one unfiltered overflows, so the eight-window
+            // partition is written unsplit every time while the one-row partition still routes normally.
+            WindowRoutingIterator.maxBufferedBytesPerPartition = 1;
+            cfs.setCompactionParameters(ImmutableMap.of("class", "TimeSeriesCompactionStrategy",
+                                                        "timestamp_resolution", "MILLISECONDS",
+                                                        "window_size", "1m",
+                                                        "freeze_after", "1m"));
+            TimeSeriesCompactionStrategy tscs =
+                (TimeSeriesCompactionStrategy) cfs.getCompactionStrategyManager().getCompactionStrategyFor(spanning);
+
+            int maxRounds = 4 * TimeSeriesCompactionStrategy.NO_PROGRESS_STRIKES + 4;
+            int rewrites = 0;
+            boolean sawSplit = false;
+            boolean sawFreeze = false;
+            for (int round = 0; round < maxRounds; round++)
+            {
+                AbstractCompactionTask task = Iterables.getOnlyElement(tscs.getNextBackgroundTasks(nowInSeconds()), null);
+                if (task == null)
+                    break;                                // parked: the alternation stopped on its own
+                sawSplit |= task instanceof SplitRefreezeCompactionTask;
+                sawFreeze |= task instanceof FreezeCompactionTask;
+                rewrites++;
+                task.execute(ActiveCompactionsTracker.NOOP);
+            }
+
+            assertTrue("both paths must take part, or this is not the alternation: split=" + sawSplit +
+                       " freeze=" + sawFreeze, sawSplit && sawFreeze);
+            assertTrue("the alternation must terminate; it ran " + rewrites + " rewrites", rewrites < maxRounds);
+            assertFalse("the window must end up parked", tscs.getParkedWindows().isEmpty());
+            assertEquals("...and it must be visible on the table's MBean",
+                         tscs.getParkedWindows().keySet(), cfs.getParkedTimeSeriesWindows().keySet());
+
+            // Nothing was lost on the way round the loop.
+            assertEquals(8, Util.getOnlyPartition(Util.cmd(cfs, huge).build()).rowCount());
+            assertEquals(1, Util.getOnlyPartition(Util.cmd(cfs, ordinary).build()).rowCount());
+        }
+        finally
+        {
+            WindowRoutingIterator.maxBufferedBytesPerPartition = savedBudget;
+        }
+    }
+
+    /**
+     * The other thing the strategy tracks for operators and could not previously be seen from outside
+     * the JVM: sstables whose window is beyond {@code max_future_window}. They are excluded from the
+     * UCS delegate, from freeze, from split and from retention, so they accumulate permanently - one
+     * per flush for as long as the bad clock or {@code USING TIMESTAMP} input persists - while the
+     * table reports nothing to do. Only a throttled WARN said so before this reached the MBean.
+     */
+    @Test
+    public void testFarFutureSSTablesAreVisibleOnTheMBean()
+    {
+        Keyspace keyspace = Keyspace.open(KEYSPACE1);
+        ColumnFamilyStore cfs = keyspace.getColumnFamilyStore(CF_STANDARD1);
+        cfs.truncateBlocking();
+        cfs.disableAutoCompaction();
+        cfs.setCompactionParameters(ImmutableMap.of("class", "SizeTieredCompactionStrategy"));
+
+        ByteBuffer value = ByteBuffer.wrap(new byte[16]);
+        long farFuture = System.currentTimeMillis() + TimeUnit.DAYS.toMillis(30);
+        new RowUpdateBuilder(cfs.metadata(), farFuture, Util.dk("bad-clock").getKey())
+            .clustering("c").add("val", value).build().applyUnsafe();
+        Util.flush(cfs);
+        assertEquals(1, cfs.getLiveSSTables().size());
+        SSTableReader ahead = cfs.getLiveSSTables().iterator().next();
+
+        cfs.setCompactionParameters(ImmutableMap.of("class", "TimeSeriesCompactionStrategy",
+                                                    "timestamp_resolution", "MILLISECONDS",
+                                                    "window_size", "1m",
+                                                    "freeze_after", "1m",
+                                                    "max_future_window", "1d"));
+        TimeSeriesCompactionStrategy tscs =
+            (TimeSeriesCompactionStrategy) cfs.getCompactionStrategyManager().getCompactionStrategyFor(ahead);
+
+        assertTrue("nothing is excluded until a background round classifies it",
+                   cfs.getFarFutureTimeSeriesSSTables().isEmpty());
+        tscs.getNextBackgroundTasks(nowInSeconds());
+
+        assertEquals(List.of(ahead.toString()), cfs.getFarFutureTimeSeriesSSTables());
     }
 
     private static long windowOfMinute(long ms)
