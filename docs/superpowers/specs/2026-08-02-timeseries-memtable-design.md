@@ -1,8 +1,13 @@
 # 시계열 전용 Memtable 설계
 
-**목표:** 창 단위로 샤딩된 컬럼 지향 memtable을 추가해 flush가 이미 창 정렬된 SSTable을
-내보내게 하고, 그 결과 컴팩션 총량과 flush 비용을 줄인다. 테이블별 옵트인이며 기본
-memtable을 대체하지 않는다.
+**목표:** 창 배정을 flush 시점이 아니라 쓰기 시점으로 옮겨, 파티션 크기에 걸린 분할
+상한(64 MiB)과 flush 시점 라우팅 비용을 없앤다. 테이블별 옵트인이며 기본 memtable을
+대체하지 않는다.
+
+**창 경계 분할 자체는 이미 동작한다.** `TimeSeriesCompactionStrategy`가 flush writer로
+`TimeWindowSplittingMultiWriter`를 설치하며, 2026-08-02 프로덕션에서 메모테이블 하나가
+창 경계에 맞춰 SSTable 6개로 쪼개지는 것을 확인했다. 따라서 이 설계의 이득은 "창 정렬
+SSTable"이 아니고, **컴팩션 총량도 크게 변하지 않는다.** 얻는 것은 §8의 단계별로 다르다.
 
 **배경:** 2026-08-02 프로덕션(192.168.0.41) 실측에서 `tm_tag_point` 계열 창이 파킹됐다.
 원인은 `SSTableWriter`가 파티션 하나를 한 번에 받아야 해서, 창 경계로 쪼개려면 파티션
@@ -19,9 +24,24 @@ Cassandra 5.x 이후 memtable은 플러그인이다(`src/java/org/apache/cassand
 `Memtable.Factory`를 제공하면 되며, 통계·커밋로그 구간 추적·메모리 관리는
 `AbstractAllocatorMemtable`이 제공한다. **업스트림 파일을 수정하지 않는다.**
 
-```sql
-ALTER TABLE pp.tm_tag_point WITH memtable = {'class': 'TimeSeriesMemtable'};
+memtable은 **클래스명이 아니라 설정 키**로 선택된다. `memtable` 테이블 속성은 문자열이고,
+맵을 주면 `SyntaxException: Invalid value for property 'memtable'. It should be a string` 이 난다.
+
+```yaml
+# 모든 노드의 cassandra.yaml — 재시작 필요
+memtable:
+  configurations:
+    timeseries:
+      class_name: TimeSeriesMemtable
 ```
+```sql
+ALTER TABLE pp.tm_tag_point WITH memtable = 'timeseries';
+```
+
+짧은 `class_name`은 `org.apache.cassandra.db.memtable.` 아래에서 찾으므로 구현 클래스를 그
+패키지에 직접 둔다. 없는 키는 `MemtableParams.getWithFallback`이 기본값으로 떨어뜨리고 ERROR만
+남기므로, **오타가 어디서도 크게 실패하지 않는다** — 배포 후 실제 적용 여부를 반드시 확인해야
+한다.
 
 ## 2. 구조
 
@@ -65,15 +85,28 @@ Cassandra는 셀 단위 LWW를 보장해야 한다. `INSERT` 후 특정 컬럼�
 클러스터링이 직전보다 작으면 dirty 플래그만 세우고, 읽기 또는 flush 시점에 한 번 정렬한다.
 정상 유입에서는 정렬이 발생하지 않는다.
 
-### 3.3 원시 배열로 담지 않는 것
+### 3.3 스키마 제약 — TSCS 사용 여부 하나뿐
 
-- **톰스톤**(행 삭제 · 범위 삭제 · 파티션 삭제): 파티션별 리스트, 읽기 시 병합
-- **static 행**: 파티션당 하나, 기존 객체 표현
-- **비frozen 컬렉션 · counter**: **미지원**
+**클러스터링 모양·컬럼 타입에 제약을 두지 않는다.** 창은 클러스터링 값이 아니라 **셀의 쓰기
+타임스탬프**로 정해지기 때문이다(`WindowRoutingIterator`가 `windowOf(cell.timestamp(), ...)`로
+라우팅한다). 모든 스키마의 모든 셀이 쓰기 타임스탬프를 가지므로 창은 언제나 계산된다.
 
-마지막 항목은 팩토리가 스키마를 검사해 판정하고, 지원 불가면 **기본 memtable로 폴백**한다.
-`TieringPolicy`의 스키마 적합성 판정과 같은 패턴이다. 범용 memtable을 다시 만들지 않는
-것이 이 설계가 감당 가능한 이유다.
+근거는 기존 코드가 이미 그렇게 동작한다는 것이다:
+
+- `TimeSeriesCompactionStrategy`·`TimeWindowSplittingMultiWriter`·`WindowRoutingIterator`
+  어디에도 counter 검사, 클러스터링 검사, multi-cell 검사가 **없다**
+- flush 시점 창 분할이 TSCS를 쓰는 **모든** 테이블에서 이미 돈다 — 운영에는 PK가
+  `((site_id, year, month, day, hour), minute, second, tuuid)` 인 테이블도 있다
+- 비frozen 컬렉션은 `for (Cell<?> cell : complex)` 루프에서 **셀 단위로** 나뉜다
+
+계층화(`TieringPolicy`)의 스키마 제약을 그대로 가져오면 안 된다. 거기서는 청크가 정준 행
+모양을 요구해서 필요하지만, memtable에는 그런 요구가 없다.
+
+유일한 요건은 **`TimeSeriesCompactionStrategy` 사용**이다 — `window_size`를 거기서 읽기
+때문이다. 아니면 나눌 창 자체가 정의되지 않는다.
+
+원시 배열에 담기 어려운 것(톰스톤, static 행, 셀별 타임스탬프가 필요한 행)은 **거부 사유가
+아니라 저장 방식의 문제**이며, 보조 구조로 처리한다(§3.1).
 
 ### 3.4 동시성
 
@@ -144,7 +177,7 @@ memtable 결함은 **조용한 데이터 손실**로 나타난다. 통과 여부
 
 ## 7. 범위 밖 (YAGNI)
 
-- 범용 memtable을 만들지 않는다 — 비frozen 컬렉션 · counter 테이블은 기본 memtable로 폴백
+- TSCS를 쓰지 않는 테이블은 기본 memtable로 폴백한다(창이 정의되지 않으므로)
 - 자체 내구성 메커니즘 없음 (`writesAreDurable()` = false, 커밋로그 그대로 사용)
 - `streamFromMemtable` 미지원 — 스트리밍은 기존 경로
 - 질의 읽기 경로를 바꾸지 않는다
@@ -161,4 +194,6 @@ memtable 결함은 **조용한 데이터 손실**로 나타난다. 통과 여부
 | 3 | 원시 컬럼 저장 (fast/slow path) | 차등 테스트 0건, 행당 힙 실측 |
 | 4 | 콜드 창 청크 flush (§5.1 순서 규칙) | 재인코더 경유 결과와 청크 내용 일치, 강제 종료 후 손실 0 |
 
-1단계만으로도 파킹 원천 제거와 컴팩션 총량 감소를 얻는다. 3단계 이후가 메모리 이득이다.
+1단계만으로 얻는 것은 **파킹을 내는 원인 제거(64 MiB 상한 소멸), flush 시 라우팅·버퍼링 비용
+제거, flush 힙 스파이크 제거**다. 창 분할은 이미 되고 있으므로 컴팩션 총량은 크게 변하지 않는다.
+행당 메모리는 3단계, 재인코더 왕복 제거는 4단계의 몫이다.

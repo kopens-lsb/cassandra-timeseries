@@ -32,7 +32,7 @@
 - 모든 새 파일에 Apache License 2.0 헤더를 붙인다(기존 파일에서 그대로 복사).
 - 이 memtable은 **테이블별 옵트인**이다. 기본 memtable을 바꾸지 않는다.
 - 창 크기는 테이블의 `TimeSeriesCompactionStrategyOptions.window_size`에서 읽는다. 별도 옵션을 만들지 않는다.
-- 비frozen 컬렉션 · counter 컬럼이 있는 테이블은 **지원하지 않는다** — 팩토리가 판정해 기본 memtable로 폴백한다.
+- 스키마 제약은 **TSCS 사용 여부 하나뿐**이다. 창은 셀의 쓰기 타임스탬프로 정해지므로 클러스터링 모양·컬럼 타입과 무관하다. TSCS가 아닌 테이블만 기본 memtable로 폴백한다.
 - `writesAreDurable()` = false, `streamFromMemtable()` = false (기본값 유지).
 - 최종 완료 기준은 **프로덕션 노드 192.168.0.41에서의 실측**이다(Task 5).
 
@@ -42,16 +42,41 @@
 
 | 파일 | 책임 |
 | --- | --- |
-| `db/memtable/timeseries/TimeSeriesMemtable.java` | `Memtable` 구현. 창 샤드 맵 소유, `put`/`rowIterator`/`partitionIterator`/`getFlushSet` |
-| `db/memtable/timeseries/WindowShard.java` | 한 창의 파티션 저장소. 파티션별 클러스터링 정렬 유지 |
-| `db/memtable/timeseries/TimeSeriesMemtableFactory.java` | `Memtable.Factory`. 스키마 적합성 판정 + 폴백 |
-| `db/memtable/timeseries/WindowGroupedFlushSet.java` | flush 시 `창 → 정렬된 파티션 이터레이터` 를 노출하는 인터페이스 |
-| `db/memtable/timeseries/FlyweightRowView.java` | flush 전용 무할당 `Row` 뷰 (Task 3) |
-| `db/memtable/timeseries/ColumnarPartition.java` | 원시 배열 컬럼 저장 (Task 4) |
-| `test/unit/.../TimeSeriesMemtableDifferentialTest.java` | 기준 memtable과의 차등 테스트 |
-| `test/unit/.../TimeSeriesMemtableSchemaSupportTest.java` | 스키마 판정·폴백 |
-| `test/unit/.../TimeSeriesMemtableFlushTest.java` | flush가 창당 SSTable 1개를 내는지 |
+| `db/memtable/TimeSeriesMemtable.java` | `Memtable` 구현 + 중첩 `Factory` + 스키마 판정 `unsupportedReason` |
+| `db/memtable/timeseries/WindowShard.java` | 한 창의 파티션 저장소 |
+| `db/memtable/timeseries/WindowGroupedFlushSet.java` | flush 시 `창 → 정렬된 파티션 이터레이터` |
+| `db/memtable/timeseries/FlyweightRowView.java` | flush 전용 무할당 `Row` 뷰 (Task 4) |
+| `test/unit/org/apache/cassandra/db/memtable/TimeSeriesMemtableSchemaSupportTest.java` | 스키마 판정·폴백 |
+| `test/unit/org/apache/cassandra/db/memtable/TimeSeriesMemtableDifferentialTest.java` | 기준 memtable과의 차등 테스트 |
+| `test/unit/org/apache/cassandra/db/memtable/TimeSeriesMemtableFlushTest.java` | flush가 창당 SSTable 1개를 내는지 |
+| `test/conf/cassandra.yaml` | 테스트용 `timeseries` 설정 키 |
 | `test/distributed/.../TimeSeriesMemtableDistributedTest.java` | 3노드: 부트스트랩·스트리밍·재시작 |
+
+### ⚠️ memtable은 클래스명이 아니라 **설정 키**로 선택됩니다
+
+`memtable` 테이블 속성은 **문자열**입니다. CQL에 클래스명을 쓰면
+`SyntaxException: Invalid value for property 'memtable'. It should be a string` 이 납니다.
+
+```yaml
+# 모든 노드의 cassandra.yaml — 재시작 필요
+memtable:
+  configurations:
+    timeseries:
+      class_name: TimeSeriesMemtable
+```
+```sql
+ALTER TABLE ks.tbl WITH memtable = 'timeseries';
+```
+
+따라서:
+
+- 짧은 `class_name`은 `org.apache.cassandra.db.memtable.` 아래에서 찾습니다. 그래서 구현 클래스를
+  **그 패키지에 직접** 둡니다 — 서브패키지에 두면 운영자가 FQCN을 써야 합니다.
+- `MemtableParams`는 그 클래스의 static `factory(Map<String,String>)` 또는 `FACTORY` 필드를 찾고,
+  소비되지 않은 파라미터가 남으면 설정을 거부합니다.
+- 없는 키는 `getWithFallback`이 기본값으로 떨어뜨리고 ERROR만 남깁니다 — 조용히 폴백하므로
+  오타가 어디서도 크게 실패하지 않습니다. 배포 후 반드시 실제 적용 여부를 확인해야 합니다.
+- 테스트도 같은 방식입니다 — `test/conf/cassandra.yaml`에 키를 넣고 `WITH memtable = '<key>'`.
 
 ---
 

@@ -66,6 +66,8 @@ TESTS=(
   "test-jvm-dtest-some|org.apache.cassandra.distributed.test.timeseries.ChunkTableSchemaPropagationTest"
   "test-jvm-dtest-some|org.apache.cassandra.distributed.test.timeseries.TieredStorageDistributedTest"
   "test-jvm-dtest-some|org.apache.cassandra.distributed.test.timeseries.TimeSeriesCompactionDistributedTest"
+  "testsome|org.apache.cassandra.db.memtable.TimeSeriesMemtableSchemaSupportTest"
+  "testsome|org.apache.cassandra.db.memtable.TimeSeriesMemtableDifferentialTest"
 )
 
 # Reads the JUnit XML rather than trusting ant's exit code. Prints "tests failures errors"
