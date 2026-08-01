@@ -101,14 +101,20 @@ cql "SELECT count(*) AS chunks FROM scale.metrics__chunks;" | sed 's/^/   /'
 
 echo "-- query pass over TIERED data (transparent reads), $PASSES pass(es)"
 $RUNTIME cp docker/scale-workload.py "$CONTAINER":/tmp/scale-workload.py
+mkdir -p "$(dirname "$REPORT")"
+# Flag names and output plumbing must match scale-test.sh, the caller that is actually exercised:
+# `query` writes its HTML report to STDOUT and takes --md-out/--json-out for the other two formats.
+# There is no --report flag. Passing one made argparse exit 2, which errexit turned into a silent
+# stop right after the storage numbers had printed -- so the run looked like it had produced a
+# result and was simply missing its query section.
 LAST=""
 for p in $(seq 1 "$PASSES"); do
     echo "   pass $p/$PASSES"
     $RUNTIME exec "$CONTAINER" python3 /tmp/scale-workload.py query \
         --rows "$ROWS" --series "$SERIES" --load-secs 0 --image "$IMAGE (tiered)" \
-        --report /tmp/tiering-report.html
+        --md-out /tmp/tiering-report.md --json-out /tmp/tiering-results.json > "$REPORT"
     LAST=$p
 done
-mkdir -p "$(dirname "$REPORT")"
-$RUNTIME cp "$CONTAINER":/tmp/tiering-report.html "$REPORT"
+$RUNTIME cp "$CONTAINER":/tmp/tiering-report.md "${REPORT%.html}.md"
+$RUNTIME cp "$CONTAINER":/tmp/tiering-results.json "${REPORT%.html}.json"
 echo "== tiering benchmark done: report=$REPORT retier=${RETIER_SECS}s =="
