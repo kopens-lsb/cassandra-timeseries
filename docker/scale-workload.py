@@ -325,13 +325,26 @@ def first_tag_of_kind(kind, total_series):
 
 
 def build_plan(a, rows_per_series):
-    one = tag_id(0)
-    one_kind = tag_type(0)
-    num_i = first_tag_of_kind('numeric', a.series)
-    numeric_tag = tag_id(num_i)
-    numeric_kind = tag_type(num_i)
-    ten = ', '.join("'%s'" % tag_id(i) for i in range(10))
-    hundred = ', '.join("'%s'" % tag_id(i) for i in range(100))
+    # Aggregates run on value_numeric -- the actual sensor reading. It is populated only when the
+    # tag's static `type` is numeric (int/long/float/double), which is ~18% of tags, so every
+    # aggregate query is aimed at numeric-typed tags. `latency` (collection latency, a metadata
+    # column present for every type) is measured once, as a secondary comparison, not as the
+    # headline. Row-shaped queries are type-independent and cover both a boolean and a numeric tag.
+    numeric = [i for i in range(a.series) if kind_of(tag_type(i)) == 'numeric']
+    if not numeric:
+        numeric = [0]
+    agg_i = numeric[0]
+    agg = tag_id(agg_i)
+    agg_kind = tag_type(agg_i)
+    bool_i = first_tag_of_kind('boolean', a.series)
+    bool_tag = tag_id(bool_i)
+    bool_kind = tag_type(bool_i)
+    ten_ids = numeric[:10]
+    hundred_ids = numeric[:100]
+    ten = ', '.join("'%s'" % tag_id(i) for i in ten_ids)
+    hundred = ', '.join("'%s'" % tag_id(i) for i in hundred_ids)
+    # int/long tags walk over 0..1000; double/float tags over 0..100.
+    hist_hi = 1000 if agg_kind in ('int', 'long') else 100
     span = datetime.timedelta(seconds=rows_per_series * SAMPLE_SECONDS)
     fmt = '%Y-%m-%d %H:%M:%S+0000'
     t0 = EPOCH.strftime(fmt)
@@ -340,110 +353,122 @@ def build_plan(a, rows_per_series):
     t6h = (EPOCH + datetime.timedelta(hours=6)).strftime(fmt)
     tbl = '%s.%s' % (KEYSPACE, a.table)
     hours = max(1, int(span.total_seconds() // 3600))
-
+    scan1 = rows_per_series
     return [
-        # Numeric aggregates all run on `latency`: an always-present, high-entropy int. `value` is
-        # text in production and `value_numeric` is null in production, so neither can be averaged;
-        # that asymmetry is faithful, not an oversight.
-        ("single partition, aggregates over latency (int; tag-000000, type='%s', %d rows/tag)"
-         % (one_kind, rows_per_series), [
-            ("count(*)", "SELECT count(*) FROM %s WHERE tag_id='%s';" % (tbl, one)),
-            ("time_bucket 1h + avg/min/max(latency)",
+        ("single partition, aggregates over value_numeric (%s, type='%s', %s rows scanned)"
+         % (agg, agg_kind, f'{scan1:,}'), [
+            ("count(*) [%s rows]" % f'{scan1:,}',
+             "SELECT count(*) FROM %s WHERE tag_id='%s';" % (tbl, agg)),
+            ("time_bucket 1h + avg/min/max(value_numeric) [%s rows]" % f'{scan1:,}',
+             "SELECT time_bucket(1h, timestamp), avg(value_numeric), min(value_numeric), "
+             "max(value_numeric) FROM %s WHERE tag_id='%s' "
+             "GROUP BY tag_id, time_bucket(1h, timestamp);" % (tbl, agg)),
+            ("time_bucket 5m + avg(value_numeric) [%s rows]" % f'{scan1:,}',
+             "SELECT time_bucket(5m, timestamp), avg(value_numeric) FROM %s WHERE tag_id='%s' "
+             "GROUP BY tag_id, time_bucket(5m, timestamp);" % (tbl, agg)),
+            ("first/last/delta/rate(value_numeric) per hour [%s rows]" % f'{scan1:,}',
+             "SELECT time_bucket(1h, timestamp), first(value_numeric, timestamp), "
+             "last(value_numeric, timestamp), delta(value_numeric, timestamp), "
+             "rate(value_numeric, timestamp) FROM %s WHERE tag_id='%s' "
+             "GROUP BY tag_id, time_bucket(1h, timestamp);" % (tbl, agg)),
+            ("derivative(value_numeric) per hour [%s rows]" % f'{scan1:,}',
+             "SELECT time_bucket(1h, timestamp), derivative(value_numeric, timestamp) FROM %s "
+             "WHERE tag_id='%s' GROUP BY tag_id, time_bucket(1h, timestamp);" % (tbl, agg)),
+            ("percentile p50/p95/p99(value_numeric) [%s rows]" % f'{scan1:,}',
+             "SELECT percentile(value_numeric, 0.5), percentile(value_numeric, 0.95), "
+             "percentile(value_numeric, 0.99) FROM %s WHERE tag_id='%s';" % (tbl, agg)),
+            ("variance/stddev(value_numeric) [%s rows]" % f'{scan1:,}',
+             "SELECT variance(value_numeric), stddev(value_numeric) FROM %s WHERE tag_id='%s';"
+             % (tbl, agg)),
+            ("histogram(value_numeric, 0, %d, 20) [%s rows]" % (hist_hi, f'{scan1:,}'),
+             "SELECT histogram(value_numeric, 0, %d, 20) FROM %s WHERE tag_id='%s';"
+             % (hist_hi, tbl, agg)),
+            ("approx_count_distinct(value_numeric) [%s rows]" % f'{scan1:,}',
+             "SELECT approx_count_distinct(value_numeric) FROM %s WHERE tag_id='%s';" % (tbl, agg)),
+            ("integral + time_weighted_average(value_numeric) [%s rows]" % f'{scan1:,}',
+             "SELECT integral(value_numeric, timestamp), "
+             "time_weighted_average(value_numeric, timestamp) FROM %s WHERE tag_id='%s';"
+             % (tbl, agg)),
+            ("SECONDARY: time_bucket 1h + avg/min/max(latency) [%s rows]" % f'{scan1:,}',
              "SELECT time_bucket(1h, timestamp), avg(latency), min(latency), max(latency) FROM %s "
-             "WHERE tag_id='%s' GROUP BY tag_id, time_bucket(1h, timestamp);" % (tbl, one)),
-            ("time_bucket 5m + avg(latency)",
-             "SELECT time_bucket(5m, timestamp), avg(latency) FROM %s WHERE tag_id='%s' "
-             "GROUP BY tag_id, time_bucket(5m, timestamp);" % (tbl, one)),
-            ("first/last/delta/rate(latency) per hour",
-             "SELECT time_bucket(1h, timestamp), first(latency, timestamp), "
-             "last(latency, timestamp), delta(latency, timestamp), rate(latency, timestamp) "
-             "FROM %s WHERE tag_id='%s' GROUP BY tag_id, time_bucket(1h, timestamp);" % (tbl, one)),
-            ("derivative(latency) per hour",
-             "SELECT time_bucket(1h, timestamp), derivative(latency, timestamp) FROM %s "
-             "WHERE tag_id='%s' GROUP BY tag_id, time_bucket(1h, timestamp);" % (tbl, one)),
-            ("percentile p50/p95/p99(latency) (whole partition)",
-             "SELECT percentile(latency, 0.5), percentile(latency, 0.95), "
-             "percentile(latency, 0.99) FROM %s WHERE tag_id='%s';" % (tbl, one)),
-            ("variance/stddev(latency) (whole partition)",
-             "SELECT variance(latency), stddev(latency) FROM %s WHERE tag_id='%s';" % (tbl, one)),
-            ("histogram(latency, 0, 1000, 20)",
-             "SELECT histogram(latency, 0, 1000, 20) FROM %s WHERE tag_id='%s';" % (tbl, one)),
-            ("approx_count_distinct(latency)",
-             "SELECT approx_count_distinct(latency) FROM %s WHERE tag_id='%s';" % (tbl, one)),
-            ("integral + time_weighted_average(latency)",
-             "SELECT integral(latency, timestamp), time_weighted_average(latency, timestamp) "
-             "FROM %s WHERE tag_id='%s';" % (tbl, one)),
+             "WHERE tag_id='%s' GROUP BY tag_id, time_bucket(1h, timestamp);" % (tbl, agg)),
         ]),
-        # Row reads are where the wide shape actually costs something: a tiered read has to
-        # rebuild all 13 non-static columns out of one chunk payload, and a projection should be
-        # able to skip the columns it did not ask for.
-        ('row reads (all 16 columns vs. projections)', [
-            ("newest 1000 rows, SELECT * -- type='%s' tag" % one_kind,
-             "SELECT * FROM %s WHERE tag_id='%s' LIMIT 1000;" % (tbl, one)),
-            ("newest 1000 rows, SELECT * -- type='%s' tag (%s)" % (numeric_kind, numeric_tag),
-             "SELECT * FROM %s WHERE tag_id='%s' LIMIT 1000;" % (tbl, numeric_tag)),
-            ("1 hour of rows, SELECT * (all columns)",
+        # Row reads are where the wide shape actually costs something: a tiered read has to rebuild
+        # all 8 regular columns out of one chunk payload, and a projection should be able to skip
+        # the columns it did not ask for.
+        ('row reads (all 16 columns vs. projections) -- type-independent', [
+            ("newest 1000 rows, SELECT * -- type='%s' tag (%s)" % (bool_kind, bool_tag),
+             "SELECT * FROM %s WHERE tag_id='%s' LIMIT 1000;" % (tbl, bool_tag)),
+            ("newest 1000 rows, SELECT * -- type='%s' tag (%s)" % (agg_kind, agg),
+             "SELECT * FROM %s WHERE tag_id='%s' LIMIT 1000;" % (tbl, agg)),
+            ("1 hour of rows, SELECT * (all columns) [3,600 rows]",
              "SELECT * FROM %s WHERE tag_id='%s' AND timestamp >= '%s' AND timestamp < '%s';"
-             % (tbl, one, t0, t1h)),
-            ("1 hour of rows, project timestamp+value only",
+             % (tbl, agg, t0, t1h)),
+            ("1 hour of rows, project timestamp+value only [3,600 rows]",
              "SELECT timestamp, value FROM %s WHERE tag_id='%s' AND timestamp >= '%s' "
-             "AND timestamp < '%s';" % (tbl, one, t0, t1h)),
-            ("1 hour of rows, project timestamp+latency only",
-             "SELECT timestamp, latency FROM %s WHERE tag_id='%s' AND timestamp >= '%s' "
-             "AND timestamp < '%s';" % (tbl, one, t0, t1h)),
+             "AND timestamp < '%s';" % (tbl, agg, t0, t1h)),
+            ("1 hour of rows, project timestamp+value_numeric only [3,600 rows]",
+             "SELECT timestamp, value_numeric FROM %s WHERE tag_id='%s' AND timestamp >= '%s' "
+             "AND timestamp < '%s';" % (tbl, agg, t0, t1h)),
             ("static columns only (1 row)",
              "SELECT tag_id, site_id, area_id, line_id, asset_id, opc_id, tag_name, type "
-             "FROM %s WHERE tag_id='%s' LIMIT 1;" % (tbl, one)),
-            ("column presence, type='%s' tag: which columns are populated" % one_kind,
+             "FROM %s WHERE tag_id='%s' LIMIT 1;" % (tbl, agg)),
+            ("column presence, type='%s' tag [%s rows]" % (bool_kind, f'{scan1:,}'),
              "SELECT count(latency) AS latency, count(value) AS value, "
              "count(value_numeric) AS value_numeric, count(value_boolean) AS value_boolean, "
              "count(quality) AS quality, count(attribute) AS attribute "
-             "FROM %s WHERE tag_id='%s';" % (tbl, one)),
-            ("column presence, type='%s' tag: which columns are populated" % numeric_kind,
+             "FROM %s WHERE tag_id='%s';" % (tbl, bool_tag)),
+            ("column presence, type='%s' tag [%s rows]" % (agg_kind, f'{scan1:,}'),
              "SELECT count(latency) AS latency, count(value) AS value, "
              "count(value_numeric) AS value_numeric, count(value_boolean) AS value_boolean, "
              "count(quality) AS quality, count(attribute) AS attribute "
-             "FROM %s WHERE tag_id='%s';" % (tbl, numeric_tag)),
-            ("avg/min/max(value_numeric) on a type='%s' tag" % numeric_kind,
-             "SELECT avg(value_numeric), min(value_numeric), max(value_numeric) FROM %s "
-             "WHERE tag_id='%s';" % (tbl, numeric_tag)),
+             "FROM %s WHERE tag_id='%s';" % (tbl, agg)),
         ]),
         # ORDER BY timestamp ASC: the table is clustered DESC (production idiom), and the gap-fill
-        # densifier walks buckets forwards, so the ascending order has to be asked for explicitly.
-        ('gap-fill (locf/interpolate over avg(latency))', [
-            ("gapfill 1h + locf over the full %dh span" % hours,
-             "SELECT time_bucket_gapfill(1h, timestamp, '%s', '%s'), locf(avg(latency)) FROM %s "
-             "WHERE tag_id='%s' GROUP BY tag_id, time_bucket_gapfill(1h, timestamp, '%s', '%s') "
-             "ORDER BY timestamp ASC;" % (t0, t1, tbl, one, t0, t1)),
-            ("gapfill 5m + interpolate over 6h",
-             "SELECT time_bucket_gapfill(5m, timestamp, '%s', '%s'), interpolate(avg(latency)) "
-             "FROM %s WHERE tag_id='%s' AND timestamp >= '%s' AND timestamp < '%s' "
+        # densifier walks buckets forwards, so ascending order has to be asked for explicitly.
+        ('gap-fill (locf/interpolate over avg(value_numeric), numeric tag %s)' % agg, [
+            ("gapfill 1h + locf over the full %dh span [%s rows]" % (hours, f'{scan1:,}'),
+             "SELECT time_bucket_gapfill(1h, timestamp, '%s', '%s'), locf(avg(value_numeric)) "
+             "FROM %s WHERE tag_id='%s' "
+             "GROUP BY tag_id, time_bucket_gapfill(1h, timestamp, '%s', '%s') "
+             "ORDER BY timestamp ASC;" % (t0, t1, tbl, agg, t0, t1)),
+            ("gapfill 5m + interpolate over 6h [21,600 rows]",
+             "SELECT time_bucket_gapfill(5m, timestamp, '%s', '%s'), "
+             "interpolate(avg(value_numeric)) FROM %s WHERE tag_id='%s' "
+             "AND timestamp >= '%s' AND timestamp < '%s' "
              "GROUP BY tag_id, time_bucket_gapfill(5m, timestamp, '%s', '%s') "
-             "ORDER BY timestamp ASC;" % (t0, t6h, tbl, one, t0, t6h, t0, t6h)),
+             "ORDER BY timestamp ASC;" % (t0, t6h, tbl, agg, t0, t6h, t0, t6h)),
         ]),
-        ('multi-partition', [
-            ("10 tags, hourly avg(latency) (%d rows)" % (10 * rows_per_series),
-             "SELECT tag_id, time_bucket(1h, timestamp), avg(latency) FROM %s "
+        ('multi-partition (numeric-typed tags only -- %d of %d tags are numeric)'
+         % (len(numeric), a.series), [
+            ("%d numeric tags, hourly avg(value_numeric) [%s rows]"
+             % (len(ten_ids), f'{len(ten_ids) * rows_per_series:,}'),
+             "SELECT tag_id, time_bucket(1h, timestamp), avg(value_numeric) FROM %s "
              "WHERE tag_id IN (%s) GROUP BY tag_id, time_bucket(1h, timestamp);" % (tbl, ten)),
-            ("100 tags, hourly avg(latency) (%d rows)" % (100 * rows_per_series),
-             "SELECT tag_id, time_bucket(1h, timestamp), avg(latency) FROM %s "
+            ("%d numeric tags, hourly avg(value_numeric) [%s rows]"
+             % (len(hundred_ids), f'{len(hundred_ids) * rows_per_series:,}'),
+             "SELECT tag_id, time_bucket(1h, timestamp), avg(value_numeric) FROM %s "
              "WHERE tag_id IN (%s) GROUP BY tag_id, time_bucket(1h, timestamp);" % (tbl, hundred)),
-            ("100 tags, p95(latency) per tag",
-             "SELECT tag_id, percentile(latency, 0.95) FROM %s WHERE tag_id IN (%s) "
+            ("%d numeric tags, p95(value_numeric) per tag [%s rows]"
+             % (len(hundred_ids), f'{len(hundred_ids) * rows_per_series:,}'),
+             "SELECT tag_id, percentile(value_numeric, 0.95) FROM %s WHERE tag_id IN (%s) "
              "GROUP BY tag_id;" % (tbl, hundred)),
         ]),
-        ('dashboard query', [
-            ("OHLC + change + p95 of latency per hour",
-             "SELECT time_bucket(1h, timestamp) AS bucket, count(latency) AS samples, "
-             "first(latency, timestamp) AS open, last(latency, timestamp) AS close, "
-             "min(latency) AS low, max(latency) AS high, avg(latency) AS mean, "
-             "delta(latency, timestamp) AS change, rate(latency, timestamp) AS per_second, "
-             "percentile(latency, 0.95) AS p95 FROM %s WHERE tag_id='%s' "
-             "GROUP BY tag_id, time_bucket(1h, timestamp);" % (tbl, one)),
+        ('dashboard query (numeric tag %s)' % agg, [
+            ("OHLC + change + p95 of value_numeric per hour [%s rows]" % f'{scan1:,}',
+             "SELECT time_bucket(1h, timestamp) AS bucket, count(value_numeric) AS samples, "
+             "first(value_numeric, timestamp) AS open, last(value_numeric, timestamp) AS close, "
+             "min(value_numeric) AS low, max(value_numeric) AS high, avg(value_numeric) AS mean, "
+             "delta(value_numeric, timestamp) AS change, "
+             "rate(value_numeric, timestamp) AS per_second, "
+             "percentile(value_numeric, 0.95) AS p95 FROM %s WHERE tag_id='%s' "
+             "GROUP BY tag_id, time_bucket(1h, timestamp);" % (tbl, agg)),
         ]),
         # KNOWN LIMITATION, not a benchmark result: a range scan does not merge chunk data back in,
-        # so on a fully tiered table this returns 0. A "0 in 3 ms" line below is a WRONG ANSWER.
-        ('full table scan (%d rows) -- returns 0 on a tiered table (known limitation)' % a.rows, [
+        # so on a fully tiered table this returns only the surviving static rows. A near-instant
+        # answer below is a WRONG ANSWER, never a speedup.
+        ('full table scan (%s rows) -- WRONG ANSWER on a tiered table (known limitation)'
+         % f'{a.rows:,}', [
             ("count(*) over the whole table",
              "SELECT count(*) FROM %s;" % tbl),
         ]),
