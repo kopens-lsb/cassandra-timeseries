@@ -29,6 +29,7 @@ import java.util.concurrent.TimeUnit;
 import org.slf4j.Logger;
 import org.slf4j.LoggerFactory;
 
+import org.apache.cassandra.cql3.ColumnIdentifier;
 import org.apache.cassandra.cql3.QueryProcessor;
 import org.apache.cassandra.cql3.UntypedResultSet;
 import org.apache.cassandra.db.Clustering;
@@ -250,9 +251,12 @@ public final class TransparentReads
                 tagPredicate.append(" AND ");
             tagPredicate.append(column.name.toCQLString()).append(" = ?");
         }
-        String select = String.format("SELECT window_start, max_row_writetime, payload FROM %s.\"%s\" " +
-                                      "WHERE %s AND window_start >= ? AND window_start < ?",
-                                      metadata.keyspace, ChunkTables.chunkTableName(metadata.name), tagPredicate);
+        // Both sides quoted: a mixed-case or reserved-word keyspace name is as real as a mixed-case
+        // table name, and an unquoted keyspace here would send this SELECT to the wrong (lowercased)
+        // keyspace -- or to none at all.
+        String select = format("SELECT window_start, max_row_writetime, payload FROM %s " +
+                               "WHERE %s AND window_start >= ? AND window_start < ?",
+                               chunkRef(metadata), tagPredicate);
         List<ByteBuffer> values = new ArrayList<>(tagColumns.size() + 2);
         // A composite partition key arrives as one CompositeType-encoded buffer; split it back into the
         // per-column values the chunk table's own key columns expect.
@@ -316,11 +320,10 @@ public final class TransparentReads
                 // so on every future read. Fail the query instead, loudly and with the window that
                 // proved it, so the condition is impossible to miss.
                 String detail = format("%s.%s: the chunk for window %s was written by an older build and cannot " +
-                                        "be read (%s). Drop %s.\"%s\" and let tiering re-run -- that data is not " +
+                                        "be read (%s). Drop %s and let tiering re-run -- that data is not " +
                                         "recoverable, its base rows were deleted when it was encoded.",
                                         metadata.keyspace, metadata.name, chunk.getTimestamp("window_start"),
-                                        e.getMessage(), metadata.keyspace,
-                                        ChunkTables.chunkTableName(metadata.name));
+                                        e.getMessage(), chunkRef(metadata));
                 NoSpamLogger.log(logger, NoSpamLogger.Level.ERROR,
                                  metadata.keyspace + '.' + metadata.name + ":chunk-unsupported", 1, TimeUnit.MINUTES,
                                  "{}", detail);
@@ -338,4 +341,14 @@ public final class TransparentReads
         return result;
     }
 
+    /**
+     * @return {@code base}'s chunk table as a CQL-safe qualified name, both sides quoted if they need
+     * it. Mirrors {@code TieredStorageService.quotedRef}.
+     */
+    private static String chunkRef(TableMetadata base)
+    {
+        return format("%s.%s",
+                      ColumnIdentifier.maybeQuote(base.keyspace),
+                      ColumnIdentifier.maybeQuote(ChunkTables.chunkTableName(base.name)));
+    }
 }
