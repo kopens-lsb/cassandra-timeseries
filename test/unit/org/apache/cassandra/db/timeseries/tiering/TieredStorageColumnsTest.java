@@ -495,6 +495,86 @@ public class TieredStorageColumnsTest extends CQLTester
                           .one().getDouble("value"), 0.0);
     }
 
+    @Test
+    public void insertIfNotExistsAppliesOnAChunkedClustering() throws Throwable
+    {
+        // The other direction of the same limitation, documented in tiered-storage.md §5.1.2: a CAS
+        // precondition read cannot see the chunk, so `IF NOT EXISTS` finds no row and writes. Nothing
+        // is lost -- writing a real value to a cold clustering is legal, and the following SELECT
+        // merges the chunk's other columns back into the "new" row -- but it does not mean what an
+        // application using it as a duplicate guard over historical data would expect.
+        chunkOneRow();
+        UntypedResultSet applied = execute("INSERT INTO %s (tag, ts, quality) VALUES ('t', ?, 7) IF NOT EXISTS",
+                                           new Date(0L));
+        assertTrue("IF NOT EXISTS applies against a chunked row, because the condition cannot see it",
+                   applied.one().getBoolean("[applied]"));
+
+        UntypedResultSet rows = execute("SELECT value, quality FROM %s WHERE tag = 't' AND ts = ?", new Date(0L));
+        assertEquals(7, rows.one().getInt("quality"));
+        assertEquals("the columns the INSERT did not name still come from the chunk",
+                     1.5, rows.one().getDouble("value"), 0.0);
+    }
+
+    // ---- projection push-down must be observationally invisible ----
+
+    /**
+     * For <b>every</b> subset of the regular columns, {@code SELECT <subset>} must return exactly
+     * what {@code SELECT *} says about those columns -- same row count, same order, byte-identical
+     * values -- even though a projected read decodes only the subset out of the chunk.
+     * <p>
+     * The shape is the production one, so the subsets sweep across a column that is always null
+     * ({@code value_numeric}), constant columns ({@code error_code}, {@code quality}), a
+     * high-entropy one ({@code latency}), a dictionary-encoded frozen map, columns with holes, and
+     * -- added after the window was encoded -- a column <b>no chunk carries at all</b>. That last one
+     * is the case a projected read cannot get right by accident: it decodes nothing, so every row
+     * reaches the primary-key-liveness fallback, and if that fallback were missing the rows would
+     * simply vanish from the result.
+     */
+    @Test
+    public void everyColumnSubsetReadsExactlyWhatSelectStarSays() throws Throwable
+    {
+        createProductionShapedTable();
+        loadProductionShapedRows();
+        assertEquals(1, new TieredStorageService().runOnce(KEYSPACE, currentTable(), 5 * HOUR).windowsEncoded);
+        execute("ALTER TABLE %s ADD added_later int");
+
+        List<String> columns = List.of("attribute", "error_code", "latency", "quality",
+                                       "value", "value_boolean", "value_numeric", "added_later");
+        List<Map<String, ByteBuffer>> reference = readColumns("SELECT * FROM %s WHERE tag_id = 't1'", columns);
+        // Six chunked rows plus the hot one: whatever a subset selects, it must see all seven.
+        assertEquals(TS.length + 1, reference.size());
+
+        for (int subset = 1; subset < (1 << columns.size()); subset++)
+        {
+            List<String> selected = new ArrayList<>();
+            for (int c = 0; c < columns.size(); c++)
+                if ((subset & (1 << c)) != 0)
+                    selected.add(columns.get(c));
+
+            String cql = "SELECT " + String.join(", ", selected) + " FROM %s WHERE tag_id = 't1'";
+            List<Map<String, ByteBuffer>> actual = readColumns(cql, selected);
+            assertEquals(cql, reference.size(), actual.size());
+            for (int r = 0; r < reference.size(); r++)
+                for (String column : selected)
+                    assertEquals(cql + ", row " + r + ", column " + column,
+                                 reference.get(r).get(column), actual.get(r).get(column));
+        }
+    }
+
+    /** @return {@code query}'s rows as raw per-column bytes ({@code null} where the column has no cell). */
+    private List<Map<String, ByteBuffer>> readColumns(String query, List<String> columns) throws Throwable
+    {
+        List<Map<String, ByteBuffer>> rows = new ArrayList<>();
+        for (UntypedResultSet.Row row : execute(query))
+        {
+            Map<String, ByteBuffer> cells = new LinkedHashMap<>();
+            for (String column : columns)
+                cells.put(column, row.has(column) ? row.getBytes(column) : null);
+            rows.add(cells);
+        }
+        return rows;
+    }
+
     // ---- immutability is keyed on real chunk coverage, not on the policy being installed ----
 
     /**

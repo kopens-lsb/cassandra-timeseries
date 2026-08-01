@@ -23,6 +23,7 @@ import java.util.ArrayList;
 import java.util.Collections;
 import java.util.Date;
 import java.util.List;
+import java.util.Set;
 
 import org.apache.cassandra.db.Clustering;
 import org.apache.cassandra.db.LivenessInfo;
@@ -69,6 +70,35 @@ import org.apache.cassandra.utils.ByteBufferUtil;
  * </ul>
  * The writetime is still an approximation for {@code writetime(col)} selections (documented
  * limitation): every column of every reconstructed row reports the same value.
+ *
+ * <h2>Projection</h2>
+ * A read decodes only the columns it queries ({@code projection}), not every column the chunk
+ * carries. Cassandra itself always <em>fetches</em> all regular columns
+ * ({@code ColumnFilter.fetchedColumns()} is the full set for every CQL SELECT), so pushing the
+ * <em>fetched</em> set down would save nothing; the set worth pushing down is
+ * {@code queriedColumns()}, and doing so is observationally equivalent for one reason and subject to
+ * one precondition:
+ * <ul>
+ *   <li><b>Why the equivalence holds.</b> The only thing the extra columns buy Cassandra is the
+ *       ability to distinguish "row exists, your column is null" from "no row". These rows carry
+ *       that distinction themselves: a sample whose decoded columns are all null takes the
+ *       primary-key-liveness branch below and stays visible. Everything else a query reads from a
+ *       row -- selected columns, {@code WHERE}-restricted columns ({@code nonPKRestrictedColumns}
+ *       are added to the queried set), ordering columns -- is by definition inside
+ *       {@code queriedColumns()}. Digests and read repair never see these rows: they are computed on
+ *       replicas from base-table data, below every hook that merges chunks in.</li>
+ *   <li><b>The precondition: cold data is immutable</b> ({@link TieredWrites}). Projection changes
+ *       one thing structurally -- a row that today carries a cell for a non-queried column may now
+ *       carry primary-key liveness instead. The two differ only if that cell would have been
+ *       shadowed, leaving the row empty, which needs a cell tombstone at or above the chunk's
+ *       {@code max_row_writetime + 1} on a chunked clustering. That is precisely the write
+ *       {@link TieredWrites} refuses (a tombstone written <em>before</em> the window was encoded
+ *       cannot be it: the re-encoder would have read the column as null and stored null). Weaken
+ *       that guard and this optimisation stops being a no-op.</li>
+ * </ul>
+ * A projected row therefore carries a <em>subset</em> of the columns its iterator declares
+ * ({@code metadata.regularAndStaticColumns()}), which is always legal; the illegal direction --
+ * carrying a cell for an undeclared column -- is impossible here.
  */
 public final class ChunkReadSupport
 {
@@ -88,6 +118,12 @@ public final class ChunkReadSupport
      *                          flag: on a table declared {@code WITH CLUSTERING ORDER BY (ts DESC)}
      *                          an <em>un</em>-reversed read already runs newest-first
      *                          (see {@code emitDescending} in {@link TransparentReads})
+     * @param projection        decode only these columns, or {@code null} for all of them. The
+     *                          decoder skips the data section of every column outside the set (each
+     *                          directory entry carries its own length), so a
+     *                          {@code SELECT one_column} pays for one column rather than all of
+     *                          them. Safe because a row left with no cells still gets primary-key
+     *                          liveness below -- see the class javadoc.
      * @return synthetic rows in the requested order
      * @throws IllegalArgumentException on a corrupt payload - callers decide whether to
      *         skip-and-warn (read path, plan R4) or propagate (tests, re-encoder)
@@ -100,9 +136,10 @@ public final class ChunkReadSupport
                                           long maxRowWritetime,
                                           long startMsInclusive,
                                           long endMsExclusive,
-                                          boolean descending)
+                                          boolean descending,
+                                          Set<String> projection)
     {
-        ColumnarCursor cursor = ColumnarChunkCodec.cursor(payload, null);
+        ColumnarCursor cursor = ColumnarChunkCodec.cursor(payload, projection);
         // See the class javadoc: at max_row_writetime itself the re-encoder's own range tombstone
         // (issued at exactly that timestamp) shadows every row rebuilt here. Saturate rather than
         // overflow -- a corrupt chunk could carry Long.MAX_VALUE.
@@ -147,10 +184,16 @@ public final class ChunkReadSupport
             }
             if (!anyCell)
             {
-                // Every column null on this sample. The row still EXISTS - the re-encoder chunked it
-                // precisely so its existence would not be lost to the range delete - and a row with
-                // neither cells nor primary-key liveness is indistinguishable from no row at all, so
-                // give it the liveness a bare `INSERT INTO t (key, ts) VALUES (...)` would have had.
+                // Every DECODED column null on this sample. The row still EXISTS - the re-encoder
+                // chunked it precisely so its existence would not be lost to the range delete - and a
+                // row with neither cells nor primary-key liveness is indistinguishable from no row at
+                // all, so give it the liveness a bare `INSERT INTO t (key, ts) VALUES (...)` would
+                // have had.
+                //
+                // This is also what makes `projection` safe. Cassandra normally fetches every regular
+                // column so it can tell "row exists, queried column is null" from "no row"; a
+                // projected read cannot, so it reaches this branch instead and reconstructs the same
+                // distinction from liveness. See the class javadoc for why that is equivalent.
                 builder.addPrimaryKeyLivenessInfo(LivenessInfo.create(cellTimestamp));
             }
             rows.add(builder.build());

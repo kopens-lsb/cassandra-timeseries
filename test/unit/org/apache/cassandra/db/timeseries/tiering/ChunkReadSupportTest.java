@@ -107,7 +107,7 @@ public class ChunkReadSupportTest
 
     private static List<Row> decode(ByteBuffer payload)
     {
-        return ChunkReadSupport.rowsFromChunk(metadata, payload, WRITETIME, Long.MIN_VALUE, Long.MAX_VALUE, false);
+        return ChunkReadSupport.rowsFromChunk(metadata, payload, WRITETIME, Long.MIN_VALUE, Long.MAX_VALUE, false, null);
     }
 
     @Test
@@ -132,7 +132,7 @@ public class ChunkReadSupportTest
     {
         ByteBuffer payload = chunk(10, 1000);
         // [BASE+2000, BASE+5000): expect samples at +2000, +3000, +4000
-        List<Row> rows = ChunkReadSupport.rowsFromChunk(metadata, payload, WRITETIME, BASE + 2000, BASE + 5000, false);
+        List<Row> rows = ChunkReadSupport.rowsFromChunk(metadata, payload, WRITETIME, BASE + 2000, BASE + 5000, false, null);
         assertEquals(3, rows.size());
         assertRow(rows.get(0), BASE + 2000, 20.2);
         assertRow(rows.get(2), BASE + 4000, 20.4);
@@ -142,14 +142,14 @@ public class ChunkReadSupportTest
     public void emptyRangeYieldsNoRows()
     {
         ByteBuffer payload = chunk(10, 1000);
-        assertTrue(ChunkReadSupport.rowsFromChunk(metadata, payload, WRITETIME, BASE + 100_000, BASE + 200_000, false).isEmpty());
+        assertTrue(ChunkReadSupport.rowsFromChunk(metadata, payload, WRITETIME, BASE + 100_000, BASE + 200_000, false, null).isEmpty());
     }
 
     @Test
     public void reversedEmitsDescending()
     {
         List<Row> rows = ChunkReadSupport.rowsFromChunk(metadata, chunk(5, 1000), WRITETIME,
-                                                        Long.MIN_VALUE, Long.MAX_VALUE, true);
+                                                        Long.MIN_VALUE, Long.MAX_VALUE, true, null);
         assertEquals(5, rows.size());
         assertRow(rows.get(0), BASE + 4000, 20.4);
         assertRow(rows.get(4), BASE, 20.0);
@@ -240,7 +240,7 @@ public class ChunkReadSupportTest
         corrupt.put(0, (byte) 99);                                   // unknown version byte
         try
         {
-            ChunkReadSupport.rowsFromChunk(metadata, corrupt, WRITETIME, Long.MIN_VALUE, Long.MAX_VALUE, false);
+            ChunkReadSupport.rowsFromChunk(metadata, corrupt, WRITETIME, Long.MIN_VALUE, Long.MAX_VALUE, false, null);
             fail("expected IllegalArgumentException");
         }
         catch (IllegalArgumentException expected)

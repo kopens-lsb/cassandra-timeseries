@@ -18,6 +18,7 @@
 
 package org.apache.cassandra.db.timeseries.tiering;
 
+import java.util.Collections;
 import java.util.Date;
 
 import org.junit.Test;
@@ -27,14 +28,17 @@ import org.apache.cassandra.cql3.UntypedResultSet;
 import org.apache.cassandra.db.DecoratedKey;
 import org.apache.cassandra.db.EmptyIterators;
 import org.apache.cassandra.db.SinglePartitionReadCommand;
+import org.apache.cassandra.db.filter.ColumnFilter;
 import org.apache.cassandra.db.marshal.UTF8Type;
 import org.apache.cassandra.db.partitions.UnfilteredPartitionIterator;
 import org.apache.cassandra.db.timeseries.UnsupportedChunkFormatException;
+import org.apache.cassandra.schema.ColumnMetadata;
 import org.apache.cassandra.schema.TableMetadata;
 import org.apache.cassandra.utils.ByteBufferUtil;
 import org.apache.cassandra.utils.FBUtilities;
 
 import static org.junit.Assert.assertEquals;
+import static org.junit.Assert.assertNull;
 import static org.junit.Assert.assertSame;
 import static org.junit.Assert.assertTrue;
 import static org.junit.Assert.fail;
@@ -425,6 +429,32 @@ public class TransparentReadTest extends CQLTester
         {
             assertTrue(expected.getMessage(), expected.getMessage().contains("payload"));
         }
+    }
+
+    /**
+     * The premise the projection push-down rests on, asserted rather than assumed: a CQL SELECT of
+     * one column <b>fetches</b> every regular column but <b>queries</b> only that one. Projecting a
+     * chunk decode on {@code fetchedColumns()} would therefore decode everything and save nothing;
+     * only {@code queriedColumns()} is worth pushing down.
+     * <p>
+     * The filter here is built exactly the way {@code ColumnFilterFactory.fromColumns} builds one for
+     * a real SELECT -- {@code allRegularColumnsBuilder} plus the selected/restricted columns.
+     */
+    @Test
+    public void projectionIsQueriedColumnsBecauseEverySelectFetchesThemAll() throws Throwable
+    {
+        createTable("CREATE TABLE %s (tag text, ts timestamp, value double, quality int, PRIMARY KEY (tag, ts))");
+        TableMetadata metadata = currentTableMetadata();
+        ColumnMetadata value = metadata.getColumn(ByteBufferUtil.bytes("value"));
+
+        ColumnFilter oneColumn = ColumnFilter.allRegularColumnsBuilder(metadata, false).add(value).build();
+        assertEquals("every CQL SELECT fetches all regular columns -- so pushing fetchedColumns() down is a no-op",
+                     2, oneColumn.fetchedColumns().regulars.size());
+        assertEquals(Collections.singleton("value"), TransparentReads.chunkProjection(oneColumn));
+
+        // SELECT *: queried == fetched, so there is nothing to project and the codec is handed null.
+        assertNull(TransparentReads.chunkProjection(ColumnFilter.all(metadata)));
+        assertNull(TransparentReads.chunkProjection(null));
     }
 
     /** @return what {@link TransparentReads#maybeWrap} does to {@code hot} for a full-partition read of 't1'. */

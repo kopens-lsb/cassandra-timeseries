@@ -57,6 +57,18 @@ import java.util.TreeSet;
  * also throw {@link IndexOutOfBoundsException} or {@link java.nio.BufferUnderflowException}):
  * every parsing path here is wrapped so truncated/malformed payloads are reported uniformly.
  * Buffers are read big-endian and never mutated.
+ * <p>
+ * <b>Buffer contract for decoded values.</b> The {@link ByteBuffer}s a {@link ColumnarCursor} hands
+ * back are read-only <em>by contract, not by type</em> ({@code asReadOnlyBuffer()} is deliberately
+ * not used -- a read-only heap buffer reports {@code hasArray() == false}, which sends Cassandra's
+ * {@code FastByteOperations} down its direct-buffer branch and segfaults the JVM on the first
+ * comparison). A caller must therefore treat every returned buffer as immutable, because within one
+ * cursor <b>backing arrays are shared</b>: a constant column returns duplicates over a single array,
+ * and a dictionary-encoded text/opaque column returns one array per distinct value shared by every
+ * row that uses it. Sharing rather than copying is the point of those two encodings -- a constant
+ * column over 10k rows would otherwise allocate 10k identical arrays, which is exactly the cost the
+ * O(1) encoding exists to avoid -- and it is safe because cursors are per-decode and Cassandra never
+ * mutates a cell value. (Fixed-width columns happen to allocate per row; do not rely on that.)
  */
 public final class ColumnarChunkCodec
 {

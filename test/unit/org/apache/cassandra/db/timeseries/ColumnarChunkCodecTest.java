@@ -379,18 +379,27 @@ public class ColumnarChunkCodecTest
         ByteBuffer[] varyingDouble = new ByteBuffer[n];       // normal fixed-width data section
         ByteBuffer[] text = new ByteBuffer[n];                // TEXT dictionary path
         ByteBuffer[] opaque = new ByteBuffer[n];              // OPAQUE dictionary path
+        ByteBuffer[] ints = new ByteBuffer[n];                // TYPE_INT32 fixed-width path
+        ByteBuffer[] longs = new ByteBuffer[n];               // TYPE_INT64 fixed-width path
+        ByteBuffer[] bools = new ByteBuffer[n];               // TYPE_BOOLEAN path
         for (int i = 0; i < n; i++)
         {
             constantDouble[i] = bytesOf(1.5);
             varyingDouble[i] = bytesOf(i * 1.25);
             text[i] = bytesOf("label-" + (i % 3));
             opaque[i] = ByteBuffer.wrap(new byte[]{ (byte) i, (byte) (i + 1) });
+            ints[i] = bytesOf(100 + i);
+            longs[i] = bytesOf(1_000_000_000_000L + i);
+            bools[i] = bytesOf(i % 2 == 0);
         }
         SortedMap<String, ColumnarChunkCodec.ColumnInput> columns = new TreeMap<>();
         columns.put("constant", new ColumnarChunkCodec.ColumnInput(ColumnarChunkCodec.TYPE_DOUBLE_CHIMP, constantDouble));
         columns.put("varying", new ColumnarChunkCodec.ColumnInput(ColumnarChunkCodec.TYPE_DOUBLE_CHIMP, varyingDouble));
         columns.put("label", new ColumnarChunkCodec.ColumnInput(ColumnarChunkCodec.TYPE_TEXT, text));
         columns.put("blobish", new ColumnarChunkCodec.ColumnInput(ColumnarChunkCodec.TYPE_OPAQUE, opaque));
+        columns.put("counter32", new ColumnarChunkCodec.ColumnInput(ColumnarChunkCodec.TYPE_INT32, ints));
+        columns.put("counter64", new ColumnarChunkCodec.ColumnInput(ColumnarChunkCodec.TYPE_INT64, longs));
+        columns.put("flag", new ColumnarChunkCodec.ColumnInput(ColumnarChunkCodec.TYPE_BOOLEAN, bools));
 
         ColumnarCursor cursor = ColumnarChunkCodec.cursor(ColumnarChunkCodec.encode(ts, n, columns), null);
         assertTrue(cursor.advance());
@@ -400,11 +409,19 @@ public class ColumnarChunkCodecTest
         assertComparable("label", cursor.getBytes("label"), bytesOf("label-0"), bytesOf("label-9"));
         assertComparable("blobish", cursor.getBytes("blobish"),
                          ByteBuffer.wrap(new byte[]{ 0, 1 }), ByteBuffer.wrap(new byte[]{ 9, 9 }));
+        assertComparable("counter32", cursor.getBytes("counter32"), bytesOf(100), bytesOf(999));
+        assertComparable("counter64", cursor.getBytes("counter64"),
+                         bytesOf(1_000_000_000_000L), bytesOf(9_000_000_000_000L));
+        assertComparable("flag", cursor.getBytes("flag"), bytesOf(true), ByteBuffer.wrap(new byte[]{ 9 }));
 
         // A second row, so the per-row (non-constant) sections are exercised at an offset too.
         assertTrue(cursor.advance());
         assertComparable("constant", cursor.getBytes("constant"), bytesOf(1.5), bytesOf(9.0));
         assertComparable("varying", cursor.getBytes("varying"), bytesOf(1.25), bytesOf(9.0));
+        assertComparable("counter32", cursor.getBytes("counter32"), bytesOf(101), bytesOf(999));
+        assertComparable("counter64", cursor.getBytes("counter64"),
+                         bytesOf(1_000_000_000_001L), bytesOf(9_000_000_000_000L));
+        assertComparable("flag", cursor.getBytes("flag"), bytesOf(false), bytesOf(true));
     }
 
     /**

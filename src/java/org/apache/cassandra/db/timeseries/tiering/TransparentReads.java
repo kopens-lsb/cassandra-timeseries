@@ -22,9 +22,13 @@ import java.nio.ByteBuffer;
 import java.util.ArrayList;
 import java.util.Collections;
 import java.util.Date;
+import java.util.HashSet;
 import java.util.List;
 import java.util.NavigableSet;
+import java.util.Set;
 import java.util.concurrent.TimeUnit;
+
+import com.google.common.annotations.VisibleForTesting;
 
 import org.slf4j.Logger;
 import org.slf4j.LoggerFactory;
@@ -41,6 +45,7 @@ import org.apache.cassandra.db.Slices;
 import org.apache.cassandra.db.filter.ClusteringIndexFilter;
 import org.apache.cassandra.db.filter.ClusteringIndexNamesFilter;
 import org.apache.cassandra.db.filter.ClusteringIndexSliceFilter;
+import org.apache.cassandra.db.filter.ColumnFilter;
 import org.apache.cassandra.db.marshal.CompositeType;
 import org.apache.cassandra.db.marshal.TimestampType;
 import org.apache.cassandra.db.partitions.UnfilteredPartitionIterator;
@@ -256,13 +261,16 @@ public final class TransparentReads
         // an operator shrinks chunk_window, every wider legacy chunk sits further before the range
         // start than one current window, and a look-back of one current window would never find it.
         long lookbackMs = coverage.lookbackMillis();
+        // Decode only the columns this query reads. Computed once per query, not per chunk.
+        Set<String> projection = chunkProjection(query.columnFilter());
         // chunkRows is told the TIMESTAMP order to emit in; the merge decorator is told whether the
         // iterators run against clustering-comparator order, which is filter.isReversed() -- the
         // comparator itself already encodes the DESC-ness.
         return ChunkMergeUnfilteredIterator.wrap(hot, keys,
                                                  key -> chunkRows(metadata, select, lookbackMs, key,
                                                                   queryStartMs, queryEndMsExcl,
-                                                                  exact, slicesToHonour, emitDescending, cl),
+                                                                  exact, slicesToHonour, emitDescending,
+                                                                  projection, cl),
                                                  metadata, filter.isReversed());
     }
 
@@ -289,8 +297,36 @@ public final class TransparentReads
     }
 
     /**
+     * The columns a chunk actually has to be decoded for, or {@code null} for "all of them".
+     * <p>
+     * Deliberately {@link ColumnFilter#queriedColumns()} and not {@code fetchedColumns()}: every CQL
+     * SELECT is built through {@code ColumnFilter.allRegularColumnsBuilder}, so its <em>fetched</em>
+     * set is always every regular column and projecting on it would save nothing. Cassandra fetches
+     * that superset so it can tell "row exists, your column is null" from "no row"; the synthetic
+     * rows carry that distinction as primary-key liveness instead, which is what makes the narrower
+     * set safe -- see {@link ChunkReadSupport}'s class javadoc for the full argument and its one
+     * precondition.
+     * <p>
+     * Static columns are left out: the re-encoder never chunks them (its range delete cannot reach
+     * them), so no chunk directory has ever carried one.
+     */
+    @VisibleForTesting
+    static Set<String> chunkProjection(ColumnFilter filter)
+    {
+        // A wildcard SELECT queries everything, so an intersection would only cost hashing.
+        if (filter == null || filter.allFetchedColumnsAreQueried())
+            return null;
+
+        Set<String> names = new HashSet<>();
+        for (ColumnMetadata column : filter.queriedColumns().regulars)
+            names.add(column.name.toString());
+        return names;
+    }
+
+    /**
      * @param lookbackMs how far before {@code startMs} a chunk's {@code window_start} may sit and
      *                   still reach into the range -- {@link ChunkCoverage.Coverage#lookbackMillis()}
+     * @param projection the columns to decode, or {@code null} for all (see {@link #chunkProjection})
      * @param slicesToHonour non-null only for a multi-slice filter, whose {@code [startMs, endMsExcl)}
      *                   hull spans gaps the query does not select
      * @param descending emit rows newest-timestamp-first (see {@code emitDescending} in {@link #maybeWrap})
@@ -304,6 +340,7 @@ public final class TransparentReads
                                        NavigableSet<Clustering<?>> exactClusterings,
                                        Slices slicesToHonour,
                                        boolean descending,
+                                       Set<String> projection,
                                        ConsistencyLevel cl)
     {
         // A chunk of width W starting at S holds timestamps in [S, S+W), so it can reach into the
@@ -363,7 +400,8 @@ public final class TransparentReads
                 List<Row> rows = ChunkReadSupport.rowsFromChunk(metadata,
                                                                 chunk.getBytes("payload"),
                                                                 chunk.getLong("max_row_writetime"),
-                                                                startMs, endMsExcl, descending);
+                                                                startMs, endMsExcl, descending,
+                                                                projection);
                 if (exactClusterings != null)
                 {
                     for (Row row : rows)

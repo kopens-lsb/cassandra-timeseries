@@ -143,30 +143,34 @@ public final class TieringPolicy
         this.consistency = consistency;
     }
 
+    // Parsed policies, keyed by the raw extension bytes. fromTable is on the hot path of every read
+    // (up to three times per read command via the tiered-read hooks, and twice more under replica
+    // filtering protection) and of every write, so re-parsing the JSON each time is pure waste. The
+    // key is the extension value's content, so a policy edit is a different key and cannot be served
+    // stale; the number of distinct policy documents in a cluster is tiny, and the map is cleared
+    // wholesale rather than grown without bound if that ever stops being true.
+    private static final ConcurrentHashMap<ByteBuffer, TieringPolicy> PARSED = new ConcurrentHashMap<>();
+    private static final int MAX_CACHED_POLICIES = 1024;
+
     /**
      * @return the policy configured on {@code metadata}, or {@code null} if the table has no
      * {@code timeseries_tiering} extension.
      * @throws ConfigurationException if the extension value is present but invalid (malformed JSON,
      * unknown keys, or a rule violation).
      */
-    /**
-     * Parsed policies, keyed by the raw extension bytes. {@link #fromTable} is on the hot path of
-     * every read (up to three times per read command via the tiered-read hooks, and twice more under
-     * replica filtering protection) and of every write, so re-parsing the JSON each time is pure
-     * waste. The key is the immutable extension value itself, so a policy edit is a different key and
-     * cannot be served stale; the number of distinct policy documents in a cluster is tiny, and the
-     * map is cleared wholesale rather than grown without bound if that ever stops being true.
-     */
-    private static final ConcurrentHashMap<ByteBuffer, TieringPolicy> PARSED = new ConcurrentHashMap<>();
-    private static final int MAX_CACHED_POLICIES = 1024;
-
     public static TieringPolicy fromTable(TableMetadata metadata)
     {
         ByteBuffer value = metadata.params.extensions.get(EXTENSION_KEY);
         if (value == null)
             return null;
 
-        TieringPolicy cached = PARSED.get(value);
+        // A ByteBuffer's hashCode covers its content BETWEEN position and limit, so the key must not
+        // be the live schema buffer: any relative get() on that shared instance would move its
+        // position and strand this entry -- a permanent cache miss plus a key that never matches
+        // anything again, retained until the wholesale clear. A duplicate has its own position.
+        ByteBuffer key = value.duplicate();
+
+        TieringPolicy cached = PARSED.get(key);
         if (cached != null)
             return cached;
 
@@ -185,7 +189,7 @@ public final class TieringPolicy
         TieringPolicy policy = parse(json);
         if (PARSED.size() >= MAX_CACHED_POLICIES)
             PARSED.clear();
-        PARSED.put(value, policy);
+        PARSED.put(key, policy);
         return policy;
     }
 
