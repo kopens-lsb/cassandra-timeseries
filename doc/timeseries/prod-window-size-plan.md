@@ -16,10 +16,13 @@
  limitations under the License.
 -->
 
-# 프로덕션 `window_size` 조정 계획 (pp 키스페이스, 2026-08-02 실측 기준)
+# 프로덕션 TSCS `window_size` 점검 결과 (pp 키스페이스, 2026-08-02 실측)
 
-대상 노드 192.168.0.41, TSCS 적용 테이블 **75개**. 아래 표는 실측에 근거한 것이며,
-바꿀 필요가 없는 테이블은 "변경 없음"으로 명시했습니다.
+대상 노드 192.168.0.41, TSCS 적용 테이블 **75개**.
+
+**결론부터: 75개 전부 변경하지 않는다.** 파킹된 창은 `window_size`가 아니라 쓰기
+타임스탬프 오염 때문이었고, 오염 데이터를 걷어내 해소했다. 이 문서는 그 판단 과정과
+근거를 남긴 것이다 — 나중에 같은 증상을 보고 `window_size`부터 손대지 않도록.
 
 ## 0. 먼저 알아야 할 것 — `window_size`가 해결하지 못하는 문제가 섞여 있습니다
 
@@ -59,53 +62,40 @@ TSCS는 **쓰기 타임스탬프로 창을 정합니다.** 따라서 그 SSTable
 작아 **이후의 어떤 정상 쓰기에도 무조건 집니다**(같은 셀을 다시 쓰면 조용히 덮어써집니다).
 파킹은 이 문제의 증상일 뿐이고, 근본 해결은 오염 데이터를 걷어내는 것입니다(재적재 또는 삭제).
 
-## 1. 변경 대상 — 3개 테이블
+## 1. 결론 — `window_size`는 바꾸지 않는다
 
-`window_size`를 바꾸는 이유는 **파킹 해소가 아닙니다**(위 §0 참고). 보존 기간 대비 창 개수가
-지나치게 많아서입니다. 창 하나당 동결 SSTable 하나가 남으므로, 창 개수가 그대로 파일 수가 됩니다.
+처음에는 `tm_tag_point` 계열을 `1d` → `7d`로 올리자고 적었다. 10년 보존에 창 3,651개는
+많아 보였기 때문이다. **실측이 그 근거를 지지하지 않아 철회한다.**
 
-| 테이블 | 현재 `window_size` | 현재 창 개수 | **권장 `window_size`** | 변경 후 창 개수 | 현재 `retention` | **변경 후 `retention`** | TTL |
-| --- | --- | --- | --- | --- | --- | --- | --- |
-| `tm_tag_point` | `1d` | **3,651** | **`7d`** | 522 | `3651d` | **`3657d`** | 3650d (10년) |
-| `tm_tag_point_archive` | `1d` | 366 | **`7d`** | 53 | `366d` | **`372d`** | 365d (1년) |
-| `tm_tag_point_snapshot` | `1d` | 94 | **`7d`** | 14 | `94d` | **`100d`** | 93d |
+| 근거 | 값 |
+| --- | --- |
+| 읽기당 SSTable (`nodetool tablehistograms pp.tm_tag_point`) | p50 **1.00**, p95 **1.00**, p99 2.00 |
+| 읽기 지연 | p50 642 µs, p99 2.3 ms |
 
-### ⚠️ `retention`은 반드시 같이 바꿔야 합니다
+창이 3,651개여도 읽기가 전혀 나빠지지 않는다. 오히려 `1d`가 낫다:
 
-`retention`은 **`TTL + window_size`** 여야 합니다. 만료 판정이
-`windowStart <= now - retention - window_size` 이므로, `window_size`만 키우고 `retention`을
-그대로 두면 **TTL이 지난 데이터가 창째로 삭제되지 않고 남습니다.**
+- **만료 granularity가 곱다** — 하루 단위로 회수된다
+- **동결 SSTable이 작다** — 하루치 ≈ 120 MB. `7d`면 ≈ 850 MB가 되어 스트리밍·repair·컴팩션
+  중 디스크 여유 요구가 함께 커진다
 
-현재 값들은 모두 이 규칙을 지키고 있습니다(예: `tm_asset_alarm_timeline` TTL 30d + window 7d
-= retention 37d). 바꿀 때도 지켜야 합니다.
+`window_size`를 바꾸면 해당 테이블 전체가 재컴팩션된다. 얻는 것이 없는 재컴팩션은 하지 않는다.
 
-### 적용 CQL
+**`tm_asset_*` 68개는 이미 `7d`이고, `tm_asset_data*`·`tm_blob*`도 TTL과 정합한다.
+즉 75개 테이블 전부 변경 없음이다.**
+
+### 파킹은 어떻게 해소했는가
+
+`window_size`가 아니라 **오염 데이터 제거**로 해소했다(2026-08-02 04:12).
 
 ```sql
-ALTER TABLE pp.tm_tag_point WITH compaction = {
-  'class': 'org.apache.cassandra.db.compaction.TimeSeriesCompactionStrategy',
-  'window_size': '7d', 'freeze_after': '2d', 'retention': '3657d',
-  'min_threshold': '4', 'max_threshold': '32',
-  'scaling_parameters': 'T8', 'target_sstable_size': '512MiB'
-};
-
-ALTER TABLE pp.tm_tag_point_archive WITH compaction = {
-  'class': 'org.apache.cassandra.db.compaction.TimeSeriesCompactionStrategy',
-  'window_size': '7d', 'freeze_after': '2d', 'retention': '372d',
-  'min_threshold': '4', 'max_threshold': '32',
-  'scaling_parameters': 'T8', 'target_sstable_size': '512MiB'
-};
-
-ALTER TABLE pp.tm_tag_point_snapshot WITH compaction = {
-  'class': 'org.apache.cassandra.db.compaction.TimeSeriesCompactionStrategy',
-  'window_size': '7d', 'freeze_after': '2d', 'retention': '100d',
-  'min_threshold': '4', 'max_threshold': '32',
-  'scaling_parameters': 'T8', 'target_sstable_size': '512MiB'
-};
+TRUNCATE pp.tm_tag_point;
+TRUNCATE pp.tm_tag_point_archive;
+TRUNCATE pp.tm_tag_point_snapshot;
 ```
 
-**컴팩션 전략 옵션 변경은 해당 테이블 전체 재컴팩션을 유발합니다.** `tm_tag_point`는 7.5 GB이고,
-현재 노드 CPU가 포화 상태(load 45/48코어)이므로 **부하가 낮은 시간대에, 한 노드씩** 적용하십시오.
+결과: Load 449.08 → 434.61 GiB, 이후 `Parking window` **0건**,
+`window-routing buffer` 오버플로 **0건**. 현재 유입되는 쓰기의 타임스탬프는 정상(16자리 µs)이라
+재발하지 않는다.
 
 ## 2. 변경하지 않는 테이블 — 72개
 
@@ -119,18 +109,27 @@ ALTER TABLE pp.tm_tag_point_snapshot WITH compaction = {
 만료시킬 대상이 없습니다. 나머지 4개(`tm_asset_alarm_timeline*`)는 TTL과 retention이
 `TTL + window_size` 규칙을 이미 만족합니다.
 
-## 3. 순서
+## 3. 같은 증상을 다시 만났을 때
 
-1. **오염 데이터 처리 방침을 먼저 정하십시오** (§0). 이걸 정하지 않으면
-   `tm_tag_point` 계열의 파킹은 `window_size`를 어떻게 바꾸든 남습니다.
-   - 데이터를 걷어내기로 했다면 → 그 뒤에 `window_size`를 바꾸는 것이 순서상 낫습니다
-     (재컴팩션을 한 번만 하면 됩니다).
-2. 부하가 낮은 시간대에 §1의 `ALTER TABLE` 3건 적용.
-3. 적용 후 확인:
-   - `nodetool compactionstats` — 재컴팩션이 진행되고 백로그가 다시 줄어드는지
-   - `system.log`에서 `Parking window`, `window-routing buffer` 발생 테이블
-   - JMX `org.apache.cassandra.db:type=Tables,keyspace=pp,table=<t>` 의
-     `ParkedTimeSeriesWindows` — 비어 있는 것이 정상
+1. **`window_size`부터 의심하지 말 것.** 먼저 파킹 메시지의 창 범위를 본다:
+
+   ```
+   grep "Parking window" system.log | grep -oE '\[[0-9]+\.\.[0-9]+\]'
+   ```
+
+   범위가 **수십 년**이면 타임스탬프 오염이다(§0). 며칠~몇 주면 전략 전환 전 레거시
+   SSTable이고, 이 경우에만 `window_size`가 선택지가 된다.
+
+2. 오염 여부는 `sstablemetadata`의 최소 타임스탬프로 확정한다. 16자리(µs)가 정상이고,
+   13자리면 ms를 µs로 해석한 것이다.
+
+3. `window_size`를 바꾸기로 했다면 **`retention`을 반드시 같이 바꾼다** —
+   `retention = TTL + window_size`. 만료 판정이
+   `windowStart <= now - retention - window_size`이므로, `window_size`만 키우면
+   TTL이 지난 데이터가 창째로 삭제되지 않고 남는다.
+
+4. 어느 쪽이든 컴팩션 전략 옵션 변경은 해당 테이블 **전체 재컴팩션**을 유발한다.
+   부하가 낮은 시간대에, 노드 하나씩.
 
 ## 4. 참고 — 파킹된 창을 그대로 둘 때의 실제 비용
 
