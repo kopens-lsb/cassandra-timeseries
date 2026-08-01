@@ -97,6 +97,12 @@ timeseries-tests:
     - ant testsome -Dtest.name=org.apache.cassandra.db.compaction.timeseries.WindowFrozenListenersTest
     - ant testsome -Dtest.name=org.apache.cassandra.db.compaction.timeseries.WindowRoutingIteratorTest
     - ant testsome -Dtest.name=org.apache.cassandra.db.compaction.timeseries.TimeWindowSplittingMultiWriterTest
+    # tiered storage on a real cluster: the chunk table's schema change must be expressible as CQL,
+    # because TCM stores schema transformations as CQL TEXT and re-parses them on read. A
+    # programmatic SchemaTransformation serialises its cql() default -- the literal string "null" --
+    # which peers cannot parse, freezing schema propagation cluster-wide, and which the writing node
+    # itself cannot replay at startup. This is the only automated proof of both; ~70s, worth it.
+    - ant test-jvm-dtest-some -Dtest.name=org.apache.cassandra.distributed.test.timeseries.ChunkTableSchemaPropagationTest
 
 # Build the Testcontainers-compatible Docker image (see docker/) and publish it as a loadable tarball to
 # the GitLab GENERIC PACKAGE registry — this instance has no container registry configured (no
