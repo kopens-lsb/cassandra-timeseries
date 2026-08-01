@@ -484,6 +484,143 @@ check "system_views.timeseries_tiering exposes policy and run stats" \
        FROM system_views.timeseries_tiering;" \
     'it \| +sensor \| +1 \| +1 \| +1'
 
+# The delete timestamp: the re-encoder tombstones the encoded window with USING TIMESTAMP
+# max_row_writetime, so a chunk that recorded no writetime could not have deleted anything safely.
+check "chunk records max_row_writetime (the delete's USING TIMESTAMP)" \
+    "SELECT max_row_writetime FROM it.sensor__chunks WHERE tag_id='pump-01' AND window_start=$WIN_MS;" \
+    '^ *1[0-9]{15}'
+
+# --- the deletion gate ---
+# Every assertion above is satisfied whether or not the re-encoder ever deleted the base rows:
+# transparent reads reconcile the chunk's rows with any live base rows at the same clustering, so
+# count(*) is 4 and avg(value) is 25 either way. A regression that silently stopped issuing the
+# range delete -- the thing that actually reclaims the disk -- would pass all of them green.
+#
+# A shell script cannot reach TransparentReads.enterInternalBypass to read the raw hot rows, so the
+# one signal available from cqlsh that the merge cannot fabricate is to take the chunk away: with
+# the chunk row deleted there is nothing left to reconstruct from, and anything the base table still
+# returns for that window is a row the re-encoder failed to delete. 0 rows means the delete ran;
+# 4 rows means it did not.
+cql "DELETE FROM it.sensor__chunks WHERE tag_id='pump-01' AND window_start=$WIN_MS;" > /dev/null
+check "re-encoded base rows are physically gone (window empty once the chunk is removed)" \
+    "SELECT count(*) FROM it.sensor WHERE tag_id='pump-01' AND timestamp >= $WIN_MS AND timestamp < $WIN_END_MS;" \
+    '^ *0$'
+
+section "tiered storage: the production table shape (tm_tag_point)"
+# pp.tm_tag_point's exact shape -- 7 statics, 7 regular columns spanning text/int/double/boolean and
+# a frozen map, DESC clustering -- written with pp's measured column behaviour: quality constantly
+# 192, error_code constantly 0, attribute constantly {}, value_numeric and value_boolean never
+# written, latency high-entropy, value a short numeric-looking text. Those are exactly the v3
+# columnar format's CONSTANT / all-null / dictionary paths.
+cql "
+CREATE TABLE IF NOT EXISTS it.tm_tag_point (
+    tag_id text,
+    timestamp timestamp,
+    area_id text static, asset_id text static, line_id text static,
+    opc_id text static, site_id text static, tag_name text static, type text static,
+    attribute frozen<map<text,text>>,
+    error_code int, latency int, quality int,
+    value text, value_boolean boolean, value_numeric double,
+    PRIMARY KEY (tag_id, timestamp)
+) WITH CLUSTERING ORDER BY (timestamp DESC);
+" > /dev/null
+
+check "ALTER TABLE installs the tiering policy on the production shape" \
+    "ALTER TABLE it.tm_tag_point WITH extensions = {'timeseries_tiering': '$TIERING_JSON'};
+     SELECT extensions FROM system_schema.tables WHERE keyspace_name='it' AND table_name='tm_tag_point';" \
+    'timeseries_tiering'
+
+cql "
+INSERT INTO it.tm_tag_point (tag_id, area_id, asset_id, line_id, opc_id, site_id, tag_name, type)
+     VALUES ('TAG-001', 'A1', 'AS1', 'L1', 'OPC1', 'S1', 'boiler.temp', 'analog');
+INSERT INTO it.tm_tag_point (tag_id, timestamp, attribute, error_code, latency, quality, value)
+     VALUES ('TAG-001', $(( WIN_MS +  60000 )), {}, 0,  17, 192, '23.4');
+INSERT INTO it.tm_tag_point (tag_id, timestamp, attribute, error_code, latency, quality, value)
+     VALUES ('TAG-001', $(( WIN_MS + 120000 )), {}, 0, 431, 192, '23.6');
+INSERT INTO it.tm_tag_point (tag_id, timestamp, attribute, error_code, latency, quality, value)
+     VALUES ('TAG-001', $(( WIN_MS + 180000 )), {}, 0,   3, 192, '23.5');
+INSERT INTO it.tm_tag_point (tag_id, timestamp, attribute, error_code, latency, quality, value)
+     VALUES ('TAG-001', $(( WIN_MS + 240000 )), {}, 0, 902, 192, '23.9');
+INSERT INTO it.tm_tag_point (tag_id, timestamp, attribute, error_code, latency, quality, value)
+     VALUES ('TAG-001', $(( WIN_MS + 300000 )), {}, 0,  44, 192, '24.1');
+" > /dev/null
+
+check_nodetool "nodetool retier encodes the production-shaped window" '' retier it tm_tag_point
+check "chunk row created for the production shape (samples = 5)" \
+    "SELECT samples FROM it.tm_tag_point__chunks WHERE tag_id='TAG-001' AND window_start=$WIN_MS;" \
+    '^ *5'
+
+check "every column of a re-encoded row reads back through the merge" \
+    "SELECT attribute, error_code, latency, quality, value FROM it.tm_tag_point
+      WHERE tag_id='TAG-001' AND timestamp = $(( WIN_MS + 120000 ));" \
+    '\{\} \| +0 \| +431 \| +192 \| +23\.6'
+check "columns that were never written stay null after re-encoding" \
+    "SELECT value_boolean, value_numeric FROM it.tm_tag_point
+      WHERE tag_id='TAG-001' AND timestamp = $(( WIN_MS + 120000 ));" \
+    'null \| +null'
+check "static columns survive the re-encoder's range delete" \
+    "SELECT site_id, tag_name, type FROM it.tm_tag_point WHERE tag_id='TAG-001' LIMIT 1;" \
+    'S1 \| +boiler\.temp \| +analog'
+
+# DESC clustering end to end. A bound-arithmetic bug here previously returned ZERO cold rows with no
+# error at all, so both bound directions and both orderings are asserted, not just the row count.
+# `check` greps line by line, so ordering is asserted with LIMIT 1 (which row comes FIRST) rather
+# than with a multi-line regex -- and LIMIT 1 through the merge is itself worth pinning.
+check "unqualified SELECT returns the whole merged window (5 rows)" \
+    "SELECT timestamp, value FROM it.tm_tag_point WHERE tag_id='TAG-001';" \
+    '\(5 rows\)'
+check "DESC table serves the merged window newest-first (LIMIT 1 = 24.1)" \
+    "SELECT value FROM it.tm_tag_point WHERE tag_id='TAG-001' LIMIT 1;" \
+    '^ *24\.1'
+check "WHERE timestamp < X on a DESC table (3 of 5 rows)" \
+    "SELECT count(*) FROM it.tm_tag_point WHERE tag_id='TAG-001' AND timestamp < $(( WIN_MS + 240000 ));" \
+    '^ *3'
+check "WHERE timestamp > X on a DESC table (2 of 5 rows)" \
+    "SELECT count(*) FROM it.tm_tag_point WHERE tag_id='TAG-001' AND timestamp > $(( WIN_MS + 180000 ));" \
+    '^ *2'
+check "ORDER BY timestamp ASC re-reverses the merged window (LIMIT 1 = 23.4)" \
+    "SELECT value FROM it.tm_tag_point WHERE tag_id='TAG-001' ORDER BY timestamp ASC LIMIT 1;" \
+    '^ *23\.4'
+check "ORDER BY timestamp ASC still returns every merged row (5 rows)" \
+    "SELECT timestamp, value FROM it.tm_tag_point WHERE tag_id='TAG-001' ORDER BY timestamp ASC;" \
+    '\(5 rows\)'
+
+# Cold immutability (Task 3 rule C): once a clustering is older than hot_window it is immutable,
+# because a tombstone against it would only mask the chunk's copy until gc_grace_seconds purged it.
+check "a cold row DELETE is rejected and points at cold_window" \
+    "DELETE FROM it.tm_tag_point WHERE tag_id='TAG-001' AND timestamp = $(( WIN_MS + 120000 ));" \
+    'cold_window'
+check "UPDATE ... SET col = null on a cold row is rejected (it writes a cell tombstone)" \
+    "UPDATE it.tm_tag_point SET latency = null WHERE tag_id='TAG-001' AND timestamp = $(( WIN_MS + 120000 ));" \
+    'cold_window'
+check "a whole-partition DELETE is rejected (it has no clustering bound at all)" \
+    "DELETE FROM it.tm_tag_point WHERE tag_id='TAG-001';" \
+    'cold_window'
+check "the rejected deletes changed nothing (all 5 rows still there)" \
+    "SELECT count(*) FROM it.tm_tag_point WHERE tag_id='TAG-001';" \
+    '^ *5'
+
+# ...and a write inside the hot window is untouched by the rule.
+cql "INSERT INTO it.tm_tag_point (tag_id, timestamp, latency, quality, value)
+          VALUES ('TAG-001', $NOW_MS, 9, 192, '25.0');" > /dev/null
+check "a DELETE inside the hot window still works" \
+    "DELETE FROM it.tm_tag_point WHERE tag_id='TAG-001' AND timestamp = $NOW_MS;
+     SELECT count(*) FROM it.tm_tag_point WHERE tag_id='TAG-001' AND timestamp = $NOW_MS;" \
+    '^ *0$'
+
+# Same deletion gate as above, on the shape that matters: with the chunk removed, a base table that
+# still answers for this window is one the re-encoder never deleted.
+# The clustering bound is not decoration: an unrestricted count on a partition whose clustered rows
+# have all been deleted still returns 1, for the static-only row (the statics are meant to survive).
+cql "DELETE FROM it.tm_tag_point__chunks WHERE tag_id='TAG-001' AND window_start=$WIN_MS;" > /dev/null
+check "production-shaped rows are physically gone once their chunk is removed" \
+    "SELECT count(*) FROM it.tm_tag_point
+      WHERE tag_id='TAG-001' AND timestamp >= $WIN_MS AND timestamp < $WIN_END_MS;" \
+    '^ *0$'
+check "...and the statics are still there, because the range delete never reached them" \
+    "SELECT site_id, tag_name FROM it.tm_tag_point WHERE tag_id='TAG-001';" \
+    'S1 \| +boiler\.temp'
+
 echo
 echo "== $PASS passed, $FAIL failed =="
 write_report
