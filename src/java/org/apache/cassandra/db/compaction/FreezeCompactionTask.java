@@ -46,9 +46,20 @@ public class FreezeCompactionTask extends CompactionTask
     /**
      * A freeze must be deterministic: silently dropping the largest input on low disk (the CompactionTask
      * default) breaks the whole-window-to-one-sstable contract. Better to fail whole and retry next round.
+     * <p>
+     * This is expressed by refusing <em>partial</em> compactions rather than by overriding
+     * {@code shouldReduceScopeForSpace()}, which reads as if it meant the same thing and does not:
+     * {@link CompactionTask#runMayThrow} guards the whole disk-space pre-flight with it
+     * ({@code shouldReduceScopeForSpace() && !buildCompactionCandidatesForAvailableDiskSpace(...)}), so
+     * returning false there skips the check entirely. A freeze of a window larger than the free space
+     * would then start writing, hit ENOSPC, throw {@code FSWriteError}, and under the shipped
+     * {@code disk_failure_policy: stop} take the node out of the ring. With
+     * {@code partialCompactionsAcceptable() == false} the pre-flight runs, {@code reduceScopeForLimitedSpace}
+     * refuses to shrink the freeze, and the task aborts cleanly with "Not enough space for compaction"
+     * before writing a byte - the same choice {@link LeveledCompactionTask} and {@link SSTableSplitter} make.
      */
     @Override
-    protected boolean shouldReduceScopeForSpace()
+    protected boolean partialCompactionsAcceptable()
     {
         return false;
     }
@@ -57,8 +68,16 @@ public class FreezeCompactionTask extends CompactionTask
      * Fires the listeners strictly post-commit: {@code super.finish} is the "point of no return" in
      * {@link CompactionTask#runMayThrow} - once it returns, the single output sstable is durably committed.
      * Zero outputs means the whole window was expired data and no longer exists - no event (there is nothing
-     * to hand to a consumer). More than one output cannot happen with {@code DefaultCompactionWriter}, which
-     * never switches writers; log rather than half-fire if that invariant is ever broken upstream.
+     * to hand to a consumer).
+     * <p>
+     * More than one output is unlikely but <b>possible</b>: {@code DefaultCompactionWriter} only suppresses
+     * {@code shouldSwitchWriterInCurrentLocation}, while {@code CompactionAwareWriter.maybeSwitchLocation}
+     * still switches at JBOD disk boundaries, and an sstable is assigned to a per-disk strategy instance by
+     * its <em>first</em> key, so a boundary or topology change can leave one instance holding sstables that
+     * cross the new boundary. The window then still has two sstables and classifies FREEZING again; the
+     * strategy's no-progress guard is what stops that becoming a permanent refreeze loop
+     * ({@code TimeSeriesCompactionStrategy#allowRewrite}). No event fires for a split output, because no
+     * single sstable represents the window.
      */
     @Override
     protected Collection<SSTableReader> finish(AbstractCompactionPipeline pipeline)
@@ -70,7 +89,9 @@ public class FreezeCompactionTask extends CompactionTask
             logger.debug("Freeze of window {} in {} produced no sstable (window fully expired); no event fired",
                          windowStartMillis, cfs.getTableName());
         else
-            logger.warn("Freeze of window {} in {} unexpectedly produced {} sstables; no event fired",
+            logger.warn("Freeze of window {} in {} produced {} sstables instead of 1 (a JBOD disk-boundary " +
+                        "writer switch); no event fired. The window stays FREEZING; nodetool relocatesstables " +
+                        "will realign it. Until then the strategy's no-progress guard stops it refreezing forever.",
                         windowStartMillis, cfs.getTableName(), newSStables.size());
         return newSStables;
     }

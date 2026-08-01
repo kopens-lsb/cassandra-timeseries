@@ -20,7 +20,9 @@ package org.apache.cassandra.db.compaction;
 
 import java.nio.ByteBuffer;
 import java.util.Collection;
+import java.util.HashSet;
 import java.util.List;
+import java.util.Set;
 import java.util.concurrent.CopyOnWriteArrayList;
 import java.util.concurrent.TimeUnit;
 
@@ -40,6 +42,7 @@ import org.apache.cassandra.db.Keyspace;
 import org.apache.cassandra.db.RowUpdateBuilder;
 import org.apache.cassandra.db.compaction.timeseries.WindowFrozenListener;
 import org.apache.cassandra.db.compaction.timeseries.WindowFrozenListeners;
+import org.apache.cassandra.db.lifecycle.LifecycleTransaction;
 import org.apache.cassandra.exceptions.ConfigurationException;
 import org.apache.cassandra.io.sstable.format.SSTableReader;
 import org.apache.cassandra.schema.KeyspaceParams;
@@ -50,6 +53,7 @@ import static org.junit.Assert.assertEquals;
 import static org.junit.Assert.assertFalse;
 import static org.junit.Assert.assertNotNull;
 import static org.junit.Assert.assertTrue;
+import static org.junit.Assert.fail;
 
 /**
  * End-to-end coverage for the retention-driven whole-window drop, mirroring
@@ -203,12 +207,208 @@ public class TimeSeriesCompactionStrategyE2ETest extends SchemaLoader
     {
         final List<Long> windowStarts = new CopyOnWriteArrayList<>();
         final List<SSTableReader> frozen = new CopyOnWriteArrayList<>();
+        /** Whether the reported sstable was already in the tracker's live set at the moment of the call. */
+        final List<Boolean> liveAtFireTime = new CopyOnWriteArrayList<>();
+        volatile ColumnFamilyStore observed;
 
         @Override
         public void onWindowFrozen(TableMetadata table, long windowStartMillis, SSTableReader sstable)
         {
             windowStarts.add(windowStartMillis);
             frozen.add(sstable);
+            if (observed != null)
+                liveAtFireTime.add(observed.getLiveSSTables().contains(sstable));
+        }
+    }
+
+    /**
+     * T2-I5: pins the post-commit ordering of the frozen-window event, which until now nothing
+     * discriminated - moving {@code WindowFrozenListeners.fire} above {@code super.finish(pipeline)} in
+     * {@link FreezeCompactionTask} left every test green. {@code super.finish} is the point of no
+     * return: it runs prepareToCommit + commit, so by the time it returns the output sstable is durably
+     * committed and visible in the tracker. Firing earlier would hand consumers an sstable that is not
+     * yet live (and might never become live), so asserting that the listener sees it ALREADY live is
+     * exactly the discriminating observation.
+     */
+    @Test
+    public void testFrozenEventFiresOnlyAfterTheOutputIsCommitted()
+    {
+        Keyspace keyspace = Keyspace.open(KEYSPACE1);
+        ColumnFamilyStore cfs = keyspace.getColumnFamilyStore(CF_STANDARD1);
+        cfs.truncateBlocking();
+        cfs.disableAutoCompaction();
+
+        ByteBuffer value = ByteBuffer.wrap(new byte[100]);
+        long windowSizeMillis = 60_000L;
+        long base = ((System.currentTimeMillis() - TimeUnit.HOURS.toMillis(1)) / windowSizeMillis) * windowSizeMillis;
+        for (int i = 0; i < 2; i++)
+        {
+            new RowUpdateBuilder(cfs.metadata(), base + 1000 + i, Util.dk("commit-" + i).getKey())
+                .clustering("column").add("val", value).build().applyUnsafe();
+            Util.flush(cfs);
+        }
+        assertEquals(2, cfs.getLiveSSTables().size());
+
+        cfs.setCompactionParameters(ImmutableMap.of("class", "TimeSeriesCompactionStrategy",
+                                                    "timestamp_resolution", "MILLISECONDS",
+                                                    "window_size", "1m",
+                                                    "freeze_after", "1m"));
+
+        RecordingListener listener = new RecordingListener();
+        listener.observed = cfs;
+        WindowFrozenListeners.registerListener(listener);
+        try
+        {
+            TimeSeriesCompactionStrategy tscs = (TimeSeriesCompactionStrategy)
+                cfs.getCompactionStrategyManager().getCompactionStrategyFor(cfs.getLiveSSTables().iterator().next());
+            AbstractCompactionTask task = Iterables.getOnlyElement(tscs.getNextBackgroundTasks(nowInSeconds()), null);
+            assertNotNull(task);
+            assertTrue(task instanceof FreezeCompactionTask);
+            task.execute(ActiveCompactionsTracker.NOOP);
+
+            assertEquals(1, listener.windowStarts.size());
+            assertEquals(1, listener.liveAtFireTime.size());
+            assertTrue("the frozen sstable must already be live when the event fires",
+                       listener.liveAtFireTime.get(0));
+        }
+        finally
+        {
+            WindowFrozenListeners.unsafeClearListeners();
+        }
+    }
+
+    /** An interrupted freeze commits nothing, so it must fire nothing. */
+    @Test
+    public void testInterruptedFreezeFiresNothing()
+    {
+        Keyspace keyspace = Keyspace.open(KEYSPACE1);
+        ColumnFamilyStore cfs = keyspace.getColumnFamilyStore(CF_STANDARD1);
+        cfs.truncateBlocking();
+        cfs.disableAutoCompaction();
+
+        ByteBuffer value = ByteBuffer.wrap(new byte[100]);
+        long windowSizeMillis = 60_000L;
+        long base = ((System.currentTimeMillis() - TimeUnit.HOURS.toMillis(1)) / windowSizeMillis) * windowSizeMillis;
+        for (int i = 0; i < 2; i++)
+        {
+            new RowUpdateBuilder(cfs.metadata(), base + 1000 + i, Util.dk("interrupt-" + i).getKey())
+                .clustering("column").add("val", value).build().applyUnsafe();
+            Util.flush(cfs);
+        }
+
+        cfs.setCompactionParameters(ImmutableMap.of("class", "TimeSeriesCompactionStrategy",
+                                                    "timestamp_resolution", "MILLISECONDS",
+                                                    "window_size", "1m",
+                                                    "freeze_after", "1m"));
+
+        RecordingListener listener = new RecordingListener();
+        WindowFrozenListeners.registerListener(listener);
+        try
+        {
+            TimeSeriesCompactionStrategy tscs = (TimeSeriesCompactionStrategy)
+                cfs.getCompactionStrategyManager().getCompactionStrategyFor(cfs.getLiveSSTables().iterator().next());
+            AbstractCompactionTask task = Iterables.getOnlyElement(tscs.getNextBackgroundTasks(nowInSeconds()), null);
+            assertNotNull(task);
+
+            // Stop the compaction the moment it registers itself, so it aborts mid-iteration.
+            ActiveCompactionsTracker stopImmediately = new ActiveCompactionsTracker()
+            {
+                public void beginCompaction(CompactionInfo.Holder ci)
+                {
+                    ci.stop();
+                }
+
+                public void finishCompaction(CompactionInfo.Holder ci)
+                {
+                }
+            };
+
+            try
+            {
+                task.execute(stopImmediately);
+                fail("interrupted freeze should have thrown");
+            }
+            catch (CompactionInterruptedException expected)
+            {
+                // the transaction rolls back; the window simply classifies FREEZING again next round
+            }
+
+            assertEquals("an interrupted freeze commits nothing and must fire nothing", 0, listener.windowStarts.size());
+            assertEquals(2, cfs.getLiveSSTables().size());
+        }
+        finally
+        {
+            WindowFrozenListeners.unsafeClearListeners();
+        }
+    }
+
+    /**
+     * T2-C1: a freeze must run the disk-space pre-flight like any other compaction, and must refuse to
+     * shrink its scope. Overriding {@code shouldReduceScopeForSpace()} to false expressed the second
+     * intent but silently disabled the first, because {@link CompactionTask#runMayThrow} guards the
+     * whole pre-flight with that flag - so a freeze larger than the free space started writing, hit
+     * ENOSPC, and under the shipped {@code disk_failure_policy: stop} took the node out of the ring.
+     */
+    @Test
+    public void testFreezeRunsDiskSpaceCheckAndRefusesToShrink()
+    {
+        Keyspace keyspace = Keyspace.open(KEYSPACE1);
+        ColumnFamilyStore cfs = keyspace.getColumnFamilyStore(CF_STANDARD1);
+        cfs.truncateBlocking();
+        cfs.disableAutoCompaction();
+
+        ByteBuffer value = ByteBuffer.wrap(new byte[100]);
+        long windowSizeMillis = 60_000L;
+        long base = ((System.currentTimeMillis() - TimeUnit.HOURS.toMillis(1)) / windowSizeMillis) * windowSizeMillis;
+        for (int i = 0; i < 2; i++)
+        {
+            new RowUpdateBuilder(cfs.metadata(), base + 1000 + i, Util.dk("space-" + i).getKey())
+                .clustering("column").add("val", value).build().applyUnsafe();
+            Util.flush(cfs);
+        }
+
+        cfs.setCompactionParameters(ImmutableMap.of("class", "TimeSeriesCompactionStrategy",
+                                                    "timestamp_resolution", "MILLISECONDS",
+                                                    "window_size", "1m",
+                                                    "freeze_after", "1m"));
+
+        TimeSeriesCompactionStrategy tscs = (TimeSeriesCompactionStrategy)
+            cfs.getCompactionStrategyManager().getCompactionStrategyFor(cfs.getLiveSSTables().iterator().next());
+        AbstractCompactionTask task = Iterables.getOnlyElement(tscs.getNextBackgroundTasks(nowInSeconds()), null);
+        assertNotNull(task);
+        assertTrue(task instanceof FreezeCompactionTask);
+
+        try
+        {
+            FreezeCompactionTask freeze = (FreezeCompactionTask) task;
+
+            // A freeze never drops its largest input to fit: that would leave the window at two
+            // sstables, which is precisely NOT frozen.
+            assertFalse("a freeze must never reduce its scope",
+                        freeze.reduceScopeForLimitedSpace(new HashSet<>(freeze.transaction.originals()), Long.MAX_VALUE));
+
+            // ...and it must still let the pre-flight run, which is what the old flag suppressed.
+            freeze.transaction.abort();
+            final boolean[] preflightRan = { false };
+            LifecycleTransaction txn = cfs.getTracker().tryModify(cfs.getLiveSSTables(), OperationType.COMPACTION);
+            assertNotNull(txn);
+            FreezeCompactionTask instrumented = new FreezeCompactionTask(cfs, txn, nowInSeconds(), base)
+            {
+                @Override
+                protected boolean buildCompactionCandidatesForAvailableDiskSpace(Set<SSTableReader> nonExpired,
+                                                                                 boolean containsExpired,
+                                                                                 org.apache.cassandra.utils.TimeUUID taskId)
+                {
+                    preflightRan[0] = true;
+                    return super.buildCompactionCandidatesForAvailableDiskSpace(nonExpired, containsExpired, taskId);
+                }
+            };
+            instrumented.execute(ActiveCompactionsTracker.NOOP);
+            assertTrue("the disk-space pre-flight must actually run for a freeze", preflightRan[0]);
+        }
+        finally
+        {
+            WindowFrozenListeners.unsafeClearListeners();
         }
     }
 
@@ -357,14 +557,29 @@ public class TimeSeriesCompactionStrategyE2ETest extends SchemaLoader
         cfs.disableAutoCompaction();
         java.nio.ByteBuffer value = java.nio.ByteBuffer.wrap(new byte[16]);
 
+        // setCompactionParameters is a LOCAL override that outlives the test that set it, and JUnit's
+        // method order is not source order - so pin the pre-TSCS strategy explicitly here rather than
+        // assuming no earlier test in this class has already switched this table to TSCS. Without this
+        // the flush below would already be window-split and there would be no legacy spanning sstable
+        // left to test.
+        cfs.setCompactionParameters(ImmutableMap.of("class", "SizeTieredCompactionStrategy"));
+
         // Recreate a LEGACY spanning sstable: flush rows from two windows in one memtable while the
         // schema strategy is still the default (non-TSCS) - TSCS's own flush writer would split it.
+        //
+        // Deliberately NOT one-cell-per-row: the "c-straddle" row below has two cells written in
+        // different windows, which is exactly the shape this test used to lack and which is why it
+        // missed C1. Splitting must break that row up per cell, not send it whole to one window.
         long now = System.currentTimeMillis();
         DecoratedKey key = Util.dk("span");
         new RowUpdateBuilder(cfs.metadata(), now - TimeUnit.HOURS.toMillis(1), key.getKey())
             .clustering("c-old").add("val", value).build().applyUnsafe();
         new RowUpdateBuilder(cfs.metadata(), now - TimeUnit.MINUTES.toMillis(10), key.getKey())
             .clustering("c-new").add("val", value).build().applyUnsafe();
+        new RowUpdateBuilder(cfs.metadata(), now - TimeUnit.HOURS.toMillis(1), key.getKey())
+            .clustering("c-straddle").add("val", value).build().applyUnsafe();
+        new RowUpdateBuilder(cfs.metadata(), now - TimeUnit.MINUTES.toMillis(10), key.getKey())
+            .clustering("c-straddle").add("val0", "x").build().applyUnsafe();
         Util.flush(cfs);
         assertEquals(1, cfs.getLiveSSTables().size());
         SSTableReader spanning = cfs.getLiveSSTables().iterator().next();
@@ -387,7 +602,7 @@ public class TimeSeriesCompactionStrategyE2ETest extends SchemaLoader
         assertEquals(2, cfs.getLiveSSTables().size());
         for (SSTableReader s : cfs.getLiveSSTables())
             assertEquals(s.toString(), windowOfMinute(s.getMinTimestamp()), windowOfMinute(s.getMaxTimestamp()));
-        assertEquals(2, Util.getOnlyPartition(Util.cmd(cfs, key).build()).rowCount());
+        assertEquals(3, Util.getOnlyPartition(Util.cmd(cfs, key).build()).rowCount());
         assertTrue(tscs.getNextBackgroundTasksAt(System.currentTimeMillis(), nowInSeconds()).isEmpty());
     }
 

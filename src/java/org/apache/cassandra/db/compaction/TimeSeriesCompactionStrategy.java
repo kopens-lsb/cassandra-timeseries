@@ -20,6 +20,7 @@ package org.apache.cassandra.db.compaction;
 
 import java.util.ArrayList;
 import java.util.Collection;
+import java.util.HashMap;
 import java.util.HashSet;
 import java.util.List;
 import java.util.Map;
@@ -58,9 +59,16 @@ import org.apache.cassandra.utils.TimeUUID;
  * (see {@link TimeSeriesCompactionStrategyOptions#isExpiredWindow}). Closed windows are frozen to a
  * single sstable per window (per strategy-instance slice) by
  * {@link FreezeCompactionTask}, which fires {@link org.apache.cassandra.db.compaction.timeseries.WindowFrozenListener}
- * post-commit and, by running a real compaction controller, also reclaims TTL/tombstone data in closed
- * windows without requiring {@code retention}. Late-data isolation (flush/streaming window splitting)
- * arrives in T3 (design spec section 10).
+ * post-commit. Late-data isolation (flush/streaming window splitting) landed in T3: see
+ * {@link org.apache.cassandra.db.compaction.timeseries.TimeWindowSplittingMultiWriter} and
+ * {@link SplitRefreezeCompactionTask} (design spec sections 4 and 10).
+ * <p>
+ * <b>TTL reclaim, precisely.</b> Because the freeze runs a real {@link CompactionController} with the
+ * caller's gcBefore, data that is already expired <em>at the moment the window freezes</em> is purged
+ * there, with no {@code retention} configured. That is the whole of the guarantee: once a window is
+ * down to one sstable it is never a freeze candidate again ({@link #nextFreezeCandidate} skips windows
+ * with fewer than two sstables), so data that expires <em>after</em> the freeze is not reclaimed by
+ * this strategy. Configure {@code retention} to bound how long such data survives.
  * <p>
  * Instances only ever see the sstable slice the CompactionStrategyManager assigns them (per
  * repair status and per disk), so all window state is derived per call and never assumed complete.
@@ -83,6 +91,34 @@ public class TimeSeriesCompactionStrategy extends AbstractCompactionStrategy
     // previousCandidate guard (:100-106) - warn when the same candidate is stuck two rounds running,
     // but keep retrying (unlike TWCS's intra-call loop, skipping here would never retry at all).
     private volatile Set<SSTableReader> previousFreezeCandidate = Set.of();
+    // sstables excluded from every automatic path because their window is far in the future; refreshed
+    // each round by syncDelegate so operators can see the accumulation, not just a throttled WARN.
+    private volatile Set<SSTableReader> farFutureSSTables = Set.of();
+    // Per-window no-progress bookkeeping for the guard below; guarded by this.
+    private final Map<Long, WindowProgress> windowProgress = new HashMap<>();
+
+    /**
+     * How many times a rewrite may be <em>re-dispatched</em> for one window at an unchanged shape before
+     * the window is parked; the window is therefore rewritten at most {@code NO_PROGRESS_STRIKES + 1}
+     * times in total. Two allows a couple of retries - enough to absorb a rewrite that lost a race with
+     * concurrent work - while keeping a genuinely stuck window's cost bounded instead of unbounded.
+     */
+    @VisibleForTesting
+    static final int NO_PROGRESS_STRIKES = 2;
+
+    /** What the guard remembers about a window it has handed out a freeze or split task for. */
+    private static final class WindowProgress
+    {
+        /** The window's shape when the last task was handed out; see {@link #windowSignature}. */
+        private final long signature;
+        private int strikes;
+        private boolean parked;
+
+        private WindowProgress(long signature)
+        {
+            this.signature = signature;
+        }
+    }
 
     public TimeSeriesCompactionStrategy(ColumnFamilyStore cfs, Map<String, String> options)
     {
@@ -116,13 +152,26 @@ public class TimeSeriesCompactionStrategy extends AbstractCompactionStrategy
         return getNextBackgroundTasksAt(Clock.Global.currentTimeMillis(), gcBefore);
     }
 
+    // synchronized: freezeBacklog/splitBacklog/previousFreezeCandidate and the no-progress bookkeeping
+    // are all read-modify-written across this method, and several background threads can select work for
+    // the same strategy instance concurrently (T2-M10). The body only picks work - the compaction itself
+    // runs outside this lock - so serialising selection costs nothing measurable.
     @VisibleForTesting
-    Collection<AbstractCompactionTask> getNextBackgroundTasksAt(long nowMillis, long gcBefore)
+    synchronized Collection<AbstractCompactionTask> getNextBackgroundTasksAt(long nowMillis, long gcBefore)
     {
         syncDelegate(nowMillis);
 
         Set<SSTableReader> expired = expiredSSTables(nowMillis);
         lastExpiredSelection = expired;
+
+        // Both candidates are computed every round, before any early return: their side effect is to
+        // refresh freezeBacklog/splitBacklog, which feed getEstimatedRemainingTasks() and hence how the
+        // CompactionStrategyManager ranks this table against every other one. Computing them only on
+        // rounds that reach them left the backlogs stale on every retention-drop round (T2-M8).
+        Map.Entry<Long, Set<SSTableReader>> freeze = nextFreezeCandidate(nowMillis);
+        Map.Entry<Long, Set<SSTableReader>> split = nextSplitRefreezeCandidate(nowMillis);
+        pruneWindowProgress();
+
         if (!expired.isEmpty())
         {
             // Mirror UCS's zombie-sstable filter (UnifiedCompactionStrategy#getSSTables, CASSANDRA-18342):
@@ -139,6 +188,9 @@ public class TimeSeriesCompactionStrategy extends AbstractCompactionStrategy
                     long cutoff = nowMillis - tsOptions.retentionMillis;
                     logger.info("Dropping {} expired-window sstables from {} (retention cutoff {})",
                                 toDrop.size(), cfs.getTableName(), cutoff);
+                    // A drop round attempts no freeze, so it breaks the consecutive-failure chain the
+                    // repeat-WARN below relies on (T2-M8).
+                    previousFreezeCandidate = Set.of();
                     return List.of(new TimeSeriesCompactionTask(cfs, txn, gcBefore, cutoff, tsOptions.timestampResolution));
                 }
                 logger.debug("Unable to mark {} expired-window sstables for compaction in {}; probably a background " +
@@ -147,7 +199,6 @@ public class TimeSeriesCompactionStrategy extends AbstractCompactionStrategy
             }
         }
 
-        Map.Entry<Long, Set<SSTableReader>> freeze = nextFreezeCandidate(nowMillis);
         boolean freezeAttempted = false;
         if (freeze != null)
         {
@@ -161,6 +212,7 @@ public class TimeSeriesCompactionStrategy extends AbstractCompactionStrategy
                 if (txn != null)
                 {
                     previousFreezeCandidate = Set.of();
+                    recordRewriteDispatch(freeze.getKey(), freeze.getValue(), "freeze");
                     logger.debug("Freezing window {} of {}: {} sstables -> 1", freeze.getKey(), cfs.getTableName(), toFreeze.size());
                     return List.of(new FreezeCompactionTask(cfs, txn, gcBefore, freeze.getKey()));
                 }
@@ -180,7 +232,6 @@ public class TimeSeriesCompactionStrategy extends AbstractCompactionStrategy
         {
             // Legacy SPANNING sstables (single sstable failing containment in a closed window) are
             // split-rewritten into per-window sstables - lower priority than regular freezes (plan D7).
-            Map.Entry<Long, Set<SSTableReader>> split = nextSplitRefreezeCandidate(nowMillis);
             if (split != null)
             {
                 Set<SSTableReader> toSplit = new HashSet<>(AbstractCompactionStrategy.filterSuspectSSTables(split.getValue()));
@@ -192,6 +243,7 @@ public class TimeSeriesCompactionStrategy extends AbstractCompactionStrategy
                     if (txn != null)
                     {
                         previousFreezeCandidate = Set.of();
+                        recordRewriteDispatch(split.getKey(), split.getValue(), "split-refreeze");
                         logger.debug("Split-refreezing spanning sstable in window {} of {}", split.getKey(), cfs.getTableName());
                         return List.of(new SplitRefreezeCompactionTask(cfs, txn, gcBefore,
                                                                        tsOptions::windowStartFor, tsOptions.timestampResolution));
@@ -233,28 +285,33 @@ public class TimeSeriesCompactionStrategy extends AbstractCompactionStrategy
     private synchronized void syncDelegate(long nowMillis)
     {
         Set<SSTableReader> active = new HashSet<>();
+        Set<SSTableReader> farFuture = new HashSet<>();
         for (SSTableReader sstable : sstables)
         {
             long windowStart = tsOptions.windowStartFor(maxTimestampMillis(sstable));
             if (tsOptions.isFarFutureWindow(windowStart, nowMillis))
             {
+                farFuture.add(sstable);
                 // Garbage/misconfigured-writer timestamps: keep them out of both the UCS delegate and the
                 // freeze machinery, and complain (throttled, keyed per table so one table's warn does not
                 // suppress another's) so the operator investigates (design spec section 8).
                 NoSpamLogger.log(logger, NoSpamLogger.Level.WARN,
                                  cfs.getKeyspaceName() + '.' + cfs.getTableName() + ":far-future-window",
                                  1, TimeUnit.MINUTES,
-                                 "{}.{} has sstable(s) with max timestamp beyond now + {}ms (e.g. {} in window {}); " +
-                                 "excluded from background/delegate compaction and freeze selection (maximal and " +
-                                 "user-defined compactions still include them) - check writer clocks or " +
-                                 "USING TIMESTAMP inputs",
-                                 cfs.getKeyspaceName(), cfs.getTableName(), tsOptions.maxFutureWindowMillis,
-                                 sstable, windowStart);
+                                 "{}.{} now holds {} sstable(s) with max timestamp beyond now + {}ms (e.g. {} in " +
+                                 "window {}). They are excluded from delegate compaction, from freeze, from split " +
+                                 "and from retention, so they accumulate permanently - one per flush while the bad " +
+                                 "clock persists. Remedy: fix the writer clock or USING TIMESTAMP input, then " +
+                                 "rewrite them with a user-defined or maximal compaction (both still include them). " +
+                                 "The current set is available programmatically via getFarFutureSSTables().",
+                                 cfs.getKeyspaceName(), cfs.getTableName(), farFuture.size(),
+                                 tsOptions.maxFutureWindowMillis, sstable, windowStart);
                 continue;
             }
             if (tsOptions.isActiveWindow(windowStart, nowMillis))
                 active.add(sstable);
         }
+        farFutureSSTables = farFuture;
 
         Set<SSTableReader> inDelegate = new HashSet<>(delegate.getSSTables());
         Set<SSTableReader> toRemove = new HashSet<>(inDelegate);
@@ -288,8 +345,8 @@ public class TimeSeriesCompactionStrategy extends AbstractCompactionStrategy
      * FROZEN demands a single sstable <b>fully contained</b> in the window ({@code windowStartFor(min) ==
      * windowStartFor(max)}). A single sstable spanning window boundaries classifies FREEZING - it is not
      * frozen - but freeze selection ({@link #nextFreezeCandidate}) will not pick a single-sstable window:
-     * rewriting one spanning sstable cannot fix containment before T3's flush-split lands, and trying would
-     * recompact it forever.
+     * merging one sstable into one sstable cannot restore containment. Splitting it can, which is what
+     * {@link #nextSplitRefreezeCandidate} selects it for.
      * <p>
      * Scope: the CompactionStrategyManager splits strategy instances per repair status and per disk, so this
      * judgment (and the frozen event) is per instance slice, never per table.
@@ -325,9 +382,10 @@ public class TimeSeriesCompactionStrategy extends AbstractCompactionStrategy
     }
 
     /**
-     * The oldest FREEZING window with at least two sstables, or null. Single-sstable FREEZING windows
-     * (a spanning sstable failing containment) are not candidates: rewriting one sstable cannot fix
-     * containment before T3's flush-split, and selecting it would recompact it every round forever.
+     * The oldest FREEZING window with at least two sstables that the no-progress guard has not parked,
+     * or null. Single-sstable FREEZING windows (a spanning sstable failing containment) are not
+     * candidates: merging one sstable into one sstable cannot restore containment, and selecting it
+     * would recompact it every round forever - {@link #nextSplitRefreezeCandidate} owns those.
      * Side effect: refreshes {@link #freezeBacklog} with the number of eligible windows.
      */
     @VisibleForTesting
@@ -348,6 +406,8 @@ public class TimeSeriesCompactionStrategy extends AbstractCompactionStrategy
                 continue;
             if (classify(window.getKey(), window.getValue(), nowMillis) != WindowState.FREEZING)
                 continue;
+            if (isParked(window.getKey(), window.getValue()))
+                continue;                                 // freezing it again provably changes nothing; see allowRewrite
             backlog++;
             if (oldest == null)
                 oldest = window;
@@ -357,11 +417,12 @@ public class TimeSeriesCompactionStrategy extends AbstractCompactionStrategy
     }
 
     /**
-     * The oldest closed window whose single sstable fails containment (a legacy SPANNING sstable -
-     * pre-T3 data or a strategy switch; TSCS's own flush/streaming writer no longer produces them).
-     * These classify FREEZING but cannot be fixed by freezing (rewriting one sstable into one
-     * sstable never restores containment) - they need {@link SplitRefreezeCompactionTask}.
-     * Side effect: refreshes {@link #splitBacklog}.
+     * The oldest closed window whose single sstable fails containment and that the no-progress guard
+     * has not parked. Such an sstable is either legacy (pre-T3 data or a strategy switch) or one TSCS
+     * wrote unsplit on purpose - a partition too large to window-route, or a window folded onto another
+     * writer at the writer cap. These classify FREEZING but cannot be fixed by freezing (merging one
+     * sstable into one sstable never restores containment) - they need
+     * {@link SplitRefreezeCompactionTask}. Side effect: refreshes {@link #splitBacklog}.
      */
     @VisibleForTesting
     synchronized Map.Entry<Long, Set<SSTableReader>> nextSplitRefreezeCandidate(long nowMillis)
@@ -376,12 +437,131 @@ public class TimeSeriesCompactionStrategy extends AbstractCompactionStrategy
                 continue;
             if (classify(window.getKey(), window.getValue(), nowMillis) != WindowState.FREEZING)
                 continue;                                 // FROZEN (contained) or still active/expired
+            if (isParked(window.getKey(), window.getValue()))
+                continue;                                 // splitting it again provably changes nothing; see allowRewrite
             backlog++;
             if (oldest == null)
                 oldest = window;
         }
         splitBacklog = backlog;
         return oldest;
+    }
+
+    /**
+     * The no-progress guard, in one place for both rewrite paths.
+     * <p>
+     * Freeze and split-refreeze share a failure shape: the task's postcondition is not what
+     * {@link #classify} tests, so the classifier re-selects the very same window on every background
+     * round and the rewrite runs forever. Two real instances:
+     * <ul>
+     *   <li>a split whose output still spans window boundaries (a row whose timestamps straddle a
+     *       boundary, before element-granularity routing; or a partition too large to route, which is
+     *       written unsplit on purpose);</li>
+     *   <li>a freeze that emits more than one sstable because {@code CompactionAwareWriter} switched
+     *       location at a JBOD disk boundary, leaving the window at two sstables (T2-I3).</li>
+     * </ul>
+     * Candidate equality cannot detect either: every rewrite produces a fresh generation, so the
+     * candidate set differs each round while the window's <em>shape</em> is unchanged. The guard
+     * therefore compares the shape - {@link #windowSignature} - across rewrites of the same window,
+     * and parks a window whose shape has survived {@link #NO_PROGRESS_STRIKES} completed rewrites.
+     * <p>
+     * Parking is deliberately self-healing: the record is keyed on the signature, so any change to the
+     * window (a late flush, an operator's {@code nodetool relocatesstables} or major compaction)
+     * silently un-parks it. Parking is a safety net, not a fix - a parked window never freezes, so
+     * {@link org.apache.cassandra.db.compaction.timeseries.WindowFrozenListener} never fires for it and
+     * downstream consumers never see it. That is why it warns.
+     *
+     * Called immediately after a rewrite task has been successfully dispatched for this window - never
+     * on a round where {@code tryModify} refused. That distinction matters: a window whose sstables are
+     * briefly locked by another compaction must not accumulate strikes for rounds in which nothing ran,
+     * or contention alone would park a perfectly healthy window.
+     */
+    private synchronized void recordRewriteDispatch(long windowStartMillis, Set<SSTableReader> windowSSTables, String what)
+    {
+        long signature = windowSignature(windowSSTables);
+        WindowProgress progress = windowProgress.get(windowStartMillis);
+        if (progress == null || progress.signature != signature)
+        {
+            // First dispatch at this shape - and, if the shape changed, proof the last one made progress.
+            windowProgress.put(windowStartMillis, new WindowProgress(signature));
+            return;
+        }
+        if (++progress.strikes < NO_PROGRESS_STRIKES)
+            return;
+
+        progress.parked = true;
+        logger.warn("Parking window {} of {}.{}: {} ran {} more time(s) without changing the window " +
+                    "({} sstable(s), spanning windows {}). Not re-selecting it until the window changes - " +
+                    "it will not freeze, so downstream consumers of the frozen-window event will not see it. " +
+                    "Investigate: for a still-spanning single sstable check for partitions too large to " +
+                    "window-route; for a window stuck at several sstables on JBOD, run nodetool relocatesstables.",
+                    windowStartMillis, cfs.getKeyspaceName(), cfs.getTableName(), what, progress.strikes,
+                    windowSSTables.size(), describeSpans(windowSSTables));
+    }
+
+    /** True if the guard has parked this window at its current shape. */
+    @VisibleForTesting
+    synchronized boolean isParked(long windowStartMillis, Set<SSTableReader> windowSSTables)
+    {
+        WindowProgress progress = windowProgress.get(windowStartMillis);
+        return progress != null && progress.parked && progress.signature == windowSignature(windowSSTables);
+    }
+
+    /**
+     * A window's "shape": how many sstables it holds, and how many windows those sstables span in
+     * total. A freeze that works shrinks the count; a split that works shrinks the span (usually to the
+     * point where the window holds one contained sstable and is not a candidate at all). Anything a
+     * rewrite can legitimately achieve moves one of the two, so an unchanged pair means the rewrite
+     * achieved nothing.
+     */
+    private long windowSignature(Set<SSTableReader> windowSSTables)
+    {
+        long spanTotal = 0;
+        for (SSTableReader sstable : windowSSTables)
+            spanTotal += windowsSpanned(sstable);
+        return ((long) windowSSTables.size() << 32) | Math.min(spanTotal, 0xFFFFFFFFL);
+    }
+
+    /** How many windows this sstable's min..max write-timestamp range covers; 1 when contained. */
+    private long windowsSpanned(SSTableReader sstable)
+    {
+        long first = tsOptions.windowStartFor(minTimestampMillis(sstable));
+        long last = tsOptions.windowStartFor(maxTimestampMillis(sstable));
+        long width = last - first;
+        if (width <= 0)                                   // contained, inverted, or overflowed on garbage timestamps
+            return 1;
+        return Math.min(width / tsOptions.windowSizeMillis + 1, 1 << 20);
+    }
+
+    private String describeSpans(Set<SSTableReader> windowSSTables)
+    {
+        StringBuilder sb = new StringBuilder();
+        for (SSTableReader sstable : windowSSTables)
+            sb.append(sb.length() == 0 ? "" : ", ")
+              .append(sstable)
+              .append('[').append(tsOptions.windowStartFor(minTimestampMillis(sstable)))
+              .append("..").append(tsOptions.windowStartFor(maxTimestampMillis(sstable))).append(']');
+        return sb.toString();
+    }
+
+    /** Drops guard bookkeeping for windows this instance no longer holds, so the map cannot grow unbounded. */
+    private synchronized void pruneWindowProgress()
+    {
+        if (!windowProgress.isEmpty())
+            windowProgress.keySet().retainAll(windows().keySet());
+    }
+
+    /**
+     * SSTables excluded from every automatic path (UCS delegate, freeze, split, and retention - an
+     * expired window can never be a future one) because their window lies beyond {@code
+     * max_future_window}. They accumulate permanently until an operator intervenes, so this is exposed
+     * rather than only warned about; the remedy is a user-defined or maximal compaction over them
+     * (both still include far-future sstables) once the writer clock or {@code USING TIMESTAMP} input
+     * that produced them is fixed.
+     */
+    public Set<SSTableReader> getFarFutureSSTables()
+    {
+        return farFutureSSTables;
     }
 
     @VisibleForTesting
@@ -491,6 +671,7 @@ public class TimeSeriesCompactionStrategy extends AbstractCompactionStrategy
                                                   pendingRepair,
                                                   isTransient,
                                                   commitLogPositions,
+                                                  sstableLevel,
                                                   header,
                                                   indexGroups,
                                                   txn,

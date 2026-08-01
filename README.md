@@ -44,7 +44,7 @@ FROM ts.metrics WHERE series='cpu' GROUP BY series, time_bucket_gapfill(1h, ts, 
 | **시계열 CQL 함수 21종** | `time_bucket`, `first`/`last`, `delta`/`rate`/`derivative`, 리셋 보정 `counter_delta`/`counter_rate`, `percentile`, `time_weighted_average`, `integral`, `variance`/`stddev`, `histogram`, `approx_count_distinct`, 이변량 `corr`/`covar_*`/`regr_*` | [사용법 §2~9](#시계열-cql-사용법) |
 | **Gap-fill** | `GROUP BY time_bucket_gapfill(width, ts, start, finish)` — 빈 버킷 실체화 + `locf()`/`interpolate()` 채움 정책 | [사용법 §3](#3-빈-구간-채우기--time_bucket_gapfill) |
 | **풀텍스트 검색** | SAI `LIKE` + `index_analyzer`(ngram/standard/cjk/keyword + JSON) — 단어 중간 조각·공백 걸침·한글까지 진짜 부분문자열 매치, ALLOW FILTERING 불필요 | [fulltext-search.md](doc/timeseries/fulltext-search.md) |
-| **시계열 컴팩션 (TSCS)** | `TimeSeriesCompactionStrategy` — 창 정렬 + 창 내부 UCS 위임 + retention 창 통삭제 + 닫힌 창 동결(창당 1 SSTable, `WindowFrozenListener` 이벤트 훅, far-future 가드 `max_future_window`, 닫힌 창 TTL 회수에 retention 불필요) + 지각 격리(flush/스트리밍 창 경계 스플릿 — 백필이 과거 창에 국소 편입, 레거시 걸침 SSTable 자동 분할) | [설계 스펙](docs/superpowers/specs/2026-07-31-timeseries-compaction-design.md) |
+| **시계열 컴팩션 (TSCS)** | `TimeSeriesCompactionStrategy` — 창 정렬 + 창 내부 UCS 위임 + retention 창 통삭제 + 닫힌 창 동결(창당 1 SSTable, `WindowFrozenListener` 이벤트 훅, far-future 가드 `max_future_window`, **동결 시점에** 이미 만료된 TTL 데이터는 retention 없이 회수 — 동결 이후 만료되는 데이터는 `retention` 필요) + 지각 격리(flush/스트리밍 창 경계 스플릿 — 백필이 과거 창에 국소 편입, 레거시 걸침 SSTable 자동 분할) | [설계 스펙](docs/superpowers/specs/2026-07-31-timeseries-compaction-design.md) |
 | **컬럼 지향 청크 코덱** *(계층형 저장 1단계)* | 창 1개 = 공유 타임스탬프 축(델타-오브-델타) + 일반 컬럼별 독립 섹션의 무손실 압축. `double`은 Chimp128 값 스트림(양자화 워크/주기 신호에서 1.4~2.5 B/샘플), `boolean`은 비트팩, 정수·시각 계열은 zigzag varint 델타, `text`는 사전, 그 외 타입은 불투명 바이트 폴백. 값이 일정한 컬럼은 CONSTANT, 전부 null인 컬럼은 ALL_NULL로 O(1) 처리 | [bake-off 결과](doc/timeseries/codec-bakeoff.md) · [설계 스펙](docs/superpowers/specs/2026-07-31-industrial-tiered-storage-design.md) |
 | **계층형 저장 (청크 스토어)** *(계층형 저장 2단계)* | 테이블 확장 `timeseries_tiering` 정책 — 백그라운드 재인코더가 hot_window를 지난 창을 청크로 압축해 `<테이블>__chunks`로 이동(지각 데이터 병합, cold_window 만료, CL 쿼럼 하한). `nodetool retier`/`tieringstatus`, `system_views.timeseries_tiering`. **투명 읽기(SP3)**: 베이스 테이블 SELECT가 핫 로우+청크를 자동 병합 — 시간범위·포인트·집계·gap-fill·LIMIT/DESC가 핫·콜드에 걸쳐 동작 | [tiered-storage.md](doc/timeseries/tiered-storage.md) |
 | **테스트 인프라** | 도커 통합 테스트 52건(릴리스 게이트), 1억 건 스케일 하네스, 3노드 jvm-dtest, GC 비교(ZGC vs G1) | [보고서들](doc/timeseries/) |
@@ -138,7 +138,7 @@ INSERT INTO metrics (series, ts, value) VALUES ('cpu', '2024-01-01 10:45:00+0000
 | `retention` | 선택 — 창 상한이 `now - retention`을 지나면 SSTable 통째 삭제 (`window_size + freeze_after` 이상) |
 | `max_future_window` | 미래 타임스탬프 가드(기본 `1d`) — 오입력이 창을 오염시키지 않게 격리 |
 
-동결(창당 1 SSTable) 덕에 닫힌 창의 TTL 데이터는 `retention` 없이도 회수되고, 파티션+시간범위 조회의 읽기 증폭이 최소화됩니다. 지각(백필) 데이터는 flush 시 창 경계에서 분리되어 자기 창에 국소 편입됩니다. 상세: [§11 시계열 컴팩션 설정](#11-시계열-컴팩션tscs-설정)
+동결(창당 1 SSTable) 시점에 이미 만료된 TTL 데이터는 `retention` 없이도 회수되고, 파티션+시간범위 조회의 읽기 증폭이 최소화됩니다. 다만 창이 SSTable 1개로 줄면 다시는 동결 후보가 되지 않으므로, **동결 이후에 만료되는 데이터는 `retention`을 설정해야 회수됩니다.** 지각(백필) 데이터는 flush 시 창 경계에서 분리되어 자기 창에 국소 편입됩니다. 상세: [§11 시계열 컴팩션 설정](#11-시계열-컴팩션tscs-설정)
 
 ## 2. 버킷팅 · 다운샘플링 — `time_bucket`
 
@@ -437,7 +437,7 @@ CREATE TABLE ts.sensor (
 };
 ```
 
-- 닫힌 창은 자동으로 **창당 1 SSTable**로 동결되어 읽기 증폭이 최소화되고, TTL 데이터도 retention 없이 회수됩니다.
+- 닫힌 창은 자동으로 **창당 1 SSTable**로 동결되어 읽기 증폭이 최소화되고, 동결 시점에 이미 만료된 TTL 데이터는 retention 없이 회수됩니다. 동결 이후에 만료되는 데이터의 회수는 `retention`이 담당합니다.
 - 지각(백필) 데이터는 flush/스트리밍 시 창 경계에서 분리되어 **자기 창에 국소 편입**됩니다 — 현재 창 컴팩션을 오염시키지 않습니다.
 - 상세: [설계 스펙](docs/superpowers/specs/2026-07-31-timeseries-compaction-design.md)
 
