@@ -538,6 +538,48 @@ public class TieredStorageServiceTest extends CQLTester
 
         assertEquals(1, stats.windowsEncoded); // only "good"'s window succeeded
         assertEquals(1, execute(chunkSelectQuery(), "good", new Date(0L)).size());
+        // ...and the cycle SAYS it skipped one. Without this the run returns all-clear stats while
+        // having silently under-encoded the table, which is an availability failure reported as
+        // success -- the same defect class as swallowing a chunk-read timeout on the read path.
+        assertEquals(1, stats.tagsSkipped);
+    }
+
+    @Test
+    public void retierFailsWhenTheCycleSkippedTags() throws Throwable
+    {
+        // nodetool retier is a one-shot operator instruction, not a background tick: a cycle that
+        // could not finish some tags did not do what it was asked, so it must exit non-zero rather
+        // than print nothing and return 0.
+        createTable("CREATE TABLE %s (tag text, ts timestamp, value double, PRIMARY KEY (tag, ts))");
+        setPolicy("{\"hot_window\":\"2h\",\"chunk_window\":\"1h\"}");
+
+        TableMetadata base = getCurrentColumnFamilyStore().metadata();
+        ChunkTables.ensureChunkTable(base);
+
+        // retier() drives the cycle off real wall-clock time, so use a window that is unambiguously
+        // closed whenever the test runs.
+        long windowStart = (System.currentTimeMillis() / HOUR - 3) * HOUR;
+        insertRow("bad", windowStart, 1.0, 10);
+        execute(chunkInsertQuery(), "bad", new Date(windowStart), 1, 5L,
+                ByteBufferUtil.bytes("not a valid chunk payload"), 6L);
+
+        String table = currentTable();
+        try
+        {
+            TieredStorageService.instance.retier(KEYSPACE, table);
+            fail("expected retier to fail after skipping a tag");
+        }
+        catch (IllegalStateException e)
+        {
+            throw e;                                      // gate contention, not what this asserts
+        }
+        catch (RuntimeException expected)
+        {
+            assertTrue(expected.getMessage(), expected.getMessage().contains("tag(s) skipped"));
+        }
+
+        // The stats are still recorded, so the virtual table / tieringstatus can show the skip.
+        assertEquals(1, TieredStorageService.instance.lastStats(KEYSPACE, table).tagsSkipped);
     }
 
     @Test
@@ -655,6 +697,7 @@ public class TieredStorageServiceTest extends CQLTester
         assertEquals(1, row.getLong("rows_encoded"));
         assertEquals(0, row.getLong("late_merges"));
         assertEquals(0, row.getLong("chunks_expired"));
+        assertEquals(0, row.getLong("tags_skipped"));
         assertTrue("last_run_at should be a real timestamp once retier has run", row.getLong("last_run_at") > 0);
     }
 

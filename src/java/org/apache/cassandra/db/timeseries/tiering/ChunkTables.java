@@ -39,6 +39,7 @@ import org.apache.cassandra.db.marshal.BytesType;
 import org.apache.cassandra.db.marshal.Int32Type;
 import org.apache.cassandra.db.marshal.LongType;
 import org.apache.cassandra.db.marshal.TimestampType;
+import org.apache.cassandra.db.marshal.UTF8Type;
 import org.apache.cassandra.gms.Gossiper;
 import org.apache.cassandra.schema.ColumnMetadata;
 import org.apache.cassandra.schema.CompactionParams;
@@ -106,6 +107,67 @@ public final class ChunkTables
     public static String chunkTableName(String baseTable)
     {
         return baseTable + "__chunks";
+    }
+
+    /**
+     * @return the coverage-ledger table name for {@code baseTable}, e.g.
+     * {@code "metrics__chunk_coverage"} -- see {@link ChunkCoverage} for what it holds and why the
+     * read path cannot do without it.
+     */
+    public static String coverageTableName(String baseTable)
+    {
+        return baseTable + "__chunk_coverage";
+    }
+
+    /**
+     * Builds the (not-yet-registered) {@link TableMetadata} for {@code base}'s chunk coverage ledger:
+     * {@code PRIMARY KEY (scope, node)}, one row per node that has ever encoded a chunk of this table.
+     * <p>
+     * One partition, clustered by node, rather than one row: the ledger's values are monotonic claims
+     * ("chunks reach at least this far"), and a single shared row would let a node with a stale view
+     * last-write-wins its way to a <em>narrower</em> claim than another node had already made --
+     * silently re-opening the fast path over data that is only in the chunk table. Reading the whole
+     * partition and taking min/max across it cannot regress.
+     * <p>
+     * Deliberately not a system table: the ledger has to be replicated exactly like the chunk table it
+     * describes, which means the base table's own keyspace and replication.
+     */
+    public static TableMetadata coverageTableMetadata(TableMetadata base)
+    {
+        return TableMetadata.builder(base.keyspace, coverageTableName(base.name))
+                            .addPartitionKeyColumn(ChunkCoverage.SCOPE_COLUMN, UTF8Type.instance)
+                            .addClusteringColumn(ChunkCoverage.NODE_COLUMN, UTF8Type.instance)
+                            .addRegularColumn(ChunkCoverage.MIN_WINDOW_START, TimestampType.instance)
+                            .addRegularColumn(ChunkCoverage.MAX_WINDOW_START, TimestampType.instance)
+                            .addRegularColumn(ChunkCoverage.MAX_CHUNK_WINDOW, LongType.instance)
+                            .build();
+    }
+
+    /** Renders {@link #coverageTableMetadata} as the {@code CREATE TABLE IF NOT EXISTS} DDL. */
+    public static String createCoverageTableStatement(TableMetadata base)
+    {
+        TableMetadata coverage = coverageTableMetadata(base);
+
+        CqlBuilder builder = new CqlBuilder(256);
+        builder.append("CREATE TABLE IF NOT EXISTS ")
+               .appendQuotingIfNeeded(coverage.keyspace)
+               .append('.')
+               .appendQuotingIfNeeded(coverage.name)
+               .append(" (");
+
+        for (ColumnMetadata column : coverage.partitionKeyColumns())
+            appendColumnDefinition(builder, column);
+        for (ColumnMetadata column : coverage.clusteringColumns())
+            appendColumnDefinition(builder, column);
+        for (ColumnMetadata column : coverage.regularColumns())
+            appendColumnDefinition(builder, column);
+
+        builder.append("PRIMARY KEY (")
+               .append(coverage.partitionKeyColumns().get(0).name)
+               .append(", ")
+               .append(coverage.clusteringColumns().get(0).name)
+               .append("))");
+        return builder.toString();
     }
 
     /**
@@ -239,6 +301,10 @@ public final class ChunkTables
     public static void ensureChunkTable(TableMetadata base)
     {
         QueryProcessor.process(createChunkTableStatement(base), ConsistencyLevel.ONE);
+        // The coverage ledger is created in the same breath and awaited by the same agreement check:
+        // the very first thing the cycle does after this is claim coverage into it, and a replica that
+        // has not seen it yet answers that write with INCOMPATIBLE_SCHEMA.
+        QueryProcessor.process(createCoverageTableStatement(base), ConsistencyLevel.ONE);
         awaitClusterWideVisibility(base.keyspace, chunkTableName(base.name));
     }
 

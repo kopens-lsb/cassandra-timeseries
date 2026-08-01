@@ -32,6 +32,7 @@ import org.apache.cassandra.db.Clustering;
 import org.apache.cassandra.db.DecoratedKey;
 import org.apache.cassandra.db.DeletionTime;
 import org.apache.cassandra.db.marshal.DoubleType;
+import org.apache.cassandra.db.marshal.ReversedType;
 import org.apache.cassandra.db.marshal.TimestampType;
 import org.apache.cassandra.db.marshal.UTF8Type;
 import org.apache.cassandra.db.partitions.UnfilteredPartitionIterator;
@@ -51,7 +52,9 @@ import org.apache.cassandra.utils.ByteBufferUtil;
 
 import static org.junit.Assert.assertEquals;
 import static org.junit.Assert.assertFalse;
+import static org.junit.Assert.assertSame;
 import static org.junit.Assert.assertTrue;
+import static org.junit.Assert.fail;
 
 /**
  * SP3 Task 2 / SP4: merge of hot partitions with synthetic chunk rows on the UNFILTERED stream --
@@ -65,6 +68,8 @@ public class ChunkMergeIteratorTest
     private static final long CHUNK_WT = 1_000_000L;                 // chunk max_row_writetime < hot
 
     private static TableMetadata metadata;
+    /** The same table declared {@code WITH CLUSTERING ORDER BY (timestamp DESC)} -- the comparator is reversed. */
+    private static TableMetadata descMetadata;
     private static ColumnMetadata valueColumn;
 
     @BeforeClass
@@ -78,6 +83,12 @@ public class ChunkMergeIteratorTest
                                 .addRegularColumn("value", DoubleType.instance)
                                 .build();
         valueColumn = metadata.getColumn(ByteBufferUtil.bytes("value"));
+        descMetadata = TableMetadata.builder("sp3ks", "sp3merge_desc")
+                                    .partitioner(Murmur3Partitioner.instance)
+                                    .addPartitionKeyColumn("tag_id", UTF8Type.instance)
+                                    .addClusteringColumn("timestamp", ReversedType.getInstance(TimestampType.instance))
+                                    .addRegularColumn("value", DoubleType.instance)
+                                    .build();
     }
 
     private static DecoratedKey key(String tag)
@@ -87,15 +98,26 @@ public class ChunkMergeIteratorTest
 
     private static Row row(long tsMs, double value, long writetime)
     {
+        return row(metadata, tsMs, value, writetime);
+    }
+
+    private static Row row(TableMetadata md, long tsMs, double value, long writetime)
+    {
         return BTreeRow.singleCellRow(Clustering.make(TimestampType.instance.decompose(new Date(tsMs))),
-                                      BufferCell.live(valueColumn, writetime, DoubleType.instance.decompose(value)));
+                                      BufferCell.live(md.getColumn(ByteBufferUtil.bytes("value")),
+                                                      writetime, DoubleType.instance.decompose(value)));
     }
 
     private static UnfilteredRowIterator partition(DecoratedKey key, boolean reversed, List<Row> rows)
     {
+        return partition(metadata, key, reversed, rows);
+    }
+
+    private static UnfilteredRowIterator partition(TableMetadata md, DecoratedKey key, boolean reversed, List<Row> rows)
+    {
         Iterator<Row> it = rows.iterator();
-        return new org.apache.cassandra.db.rows.AbstractUnfilteredRowIterator(metadata, key, DeletionTime.LIVE,
-                                                                             metadata.regularAndStaticColumns(),
+        return new org.apache.cassandra.db.rows.AbstractUnfilteredRowIterator(md, key, DeletionTime.LIVE,
+                                                                             md.regularAndStaticColumns(),
                                                                              Rows.EMPTY_STATIC_ROW, reversed,
                                                                              EncodingStats.NO_STATS)
         {
@@ -130,10 +152,15 @@ public class ChunkMergeIteratorTest
 
     private static UnfilteredPartitionIterator partitions(List<UnfilteredRowIterator> parts)
     {
+        return partitions(metadata, parts);
+    }
+
+    private static UnfilteredPartitionIterator partitions(TableMetadata md, List<UnfilteredRowIterator> parts)
+    {
         Iterator<UnfilteredRowIterator> it = parts.iterator();
         return new UnfilteredPartitionIterator()
         {
-            public TableMetadata metadata() { return metadata; }
+            public TableMetadata metadata() { return md; }
             public boolean hasNext() { return it.hasNext(); }
             public UnfilteredRowIterator next() { return it.next(); }
             public void close() {}
@@ -143,6 +170,12 @@ public class ChunkMergeIteratorTest
     /** Drains the merged iterator into tag → list of (tsMs, value) for easy assertions. */
     private static List<String> drain(UnfilteredPartitionIterator merged)
     {
+        return drain(metadata, merged);
+    }
+
+    private static List<String> drain(TableMetadata md, UnfilteredPartitionIterator merged)
+    {
+        ColumnMetadata column = md.getColumn(ByteBufferUtil.bytes("value"));
         List<String> result = new ArrayList<>();
         while (merged.hasNext())
         {
@@ -161,7 +194,7 @@ public class ChunkMergeIteratorTest
                     }
                     Row r = (Row) u;
                     long ts = TimestampType.instance.compose(r.clustering().bufferAt(0)).getTime() - BASE;
-                    Cell<?> cell = r.getCell(valueColumn);
+                    Cell<?> cell = r.getCell(column);
                     sb.append(' ').append(ts).append(':').append(cell == null ? "-" : DoubleType.instance.compose(cell.buffer()));
                 }
                 result.add(sb.toString());
@@ -173,11 +206,103 @@ public class ChunkMergeIteratorTest
     @Test
     public void hotOnlyPassthrough()
     {
+        // With no chunk rows for the key there is nothing to merge, and the requirement is stronger
+        // than "the right rows come out": the hot partition must be handed straight back, unwrapped.
+        // Asserting only on the drained rows passes even if the merge machinery runs over an empty
+        // second source, which is what this test used to do -- it exercised nothing.
         DecoratedKey k = key("t1");
+        UnfilteredRowIterator hotPartition = partition(k, false, List.of(row(BASE + 1, 1.0, HOT_WT)));
         UnfilteredPartitionIterator merged = ChunkMergeUnfilteredIterator.wrap(
-            partitions(List.of(partition(k, false, List.of(row(BASE + 1, 1.0, HOT_WT))))),
-            List.of(k), dk -> List.of(), metadata, false);
-        assertEquals(List.of("t1 1:1.0"), drain(merged));
+            partitions(List.of(hotPartition)), List.of(k), dk -> List.of(), metadata, false);
+
+        assertTrue(merged.hasNext());
+        assertSame("a partition with no chunk rows must not be wrapped in a merge", hotPartition, merged.next());
+        assertFalse(merged.hasNext());
+    }
+
+    /**
+     * The ASC/DESC x reversed matrix. {@code CLUSTERING ORDER BY (ts DESC)} wraps the clustering type
+     * in {@link ReversedType}, so comparator order is already newest-first and the read's
+     * {@code reversed} flag flips it again -- four combinations, and the synthetic chunk iterator has
+     * to report the same {@code isReverseOrder()} as the hot one in every single one of them or the
+     * merge compares clusterings the wrong way round. The previous coverage was one quadrant
+     * (ASC x reversed).
+     */
+    @Test
+    public void ascComparatorForwardRead()
+    {
+        assertQuadrant(metadata, false, List.of(2L, 4L), List.of(1L, 3L), "t1 1:10.0 2:20.0 3:30.0 4:40.0");
+    }
+
+    @Test
+    public void ascComparatorReversedRead()
+    {
+        assertQuadrant(metadata, true, List.of(4L, 2L), List.of(3L, 1L), "t1 4:40.0 3:30.0 2:20.0 1:10.0");
+    }
+
+    @Test
+    public void descComparatorForwardRead()
+    {
+        // Comparator order on a DESC table is already newest-first, so an unreversed read emits 4,3,2,1.
+        assertQuadrant(descMetadata, false, List.of(4L, 2L), List.of(3L, 1L), "t1 4:40.0 3:30.0 2:20.0 1:10.0");
+    }
+
+    @Test
+    public void descComparatorReversedRead()
+    {
+        assertQuadrant(descMetadata, true, List.of(2L, 4L), List.of(1L, 3L), "t1 1:10.0 2:20.0 3:30.0 4:40.0");
+    }
+
+    /**
+     * Builds a hot partition from {@code hotOffsets} and chunk rows from {@code chunkOffsets} (each
+     * already in the iteration order that quadrant implies), merges them and asserts the emitted
+     * order. Values are the offset x 10 so every row is identifiable.
+     */
+    private static void assertQuadrant(TableMetadata md, boolean reversed,
+                                       List<Long> hotOffsets, List<Long> chunkOffsets, String expected)
+    {
+        DecoratedKey k = key("t1");
+        List<Row> hotRows = new ArrayList<>();
+        for (long offset : hotOffsets)
+            hotRows.add(row(md, BASE + offset, offset * 10.0, HOT_WT));
+        List<Row> chunkRows = new ArrayList<>();
+        for (long offset : chunkOffsets)
+            chunkRows.add(row(md, BASE + offset, offset * 10.0, CHUNK_WT));
+
+        UnfilteredPartitionIterator merged = ChunkMergeUnfilteredIterator.wrap(
+            partitions(md, List.of(partition(md, k, reversed, hotRows))),
+            List.of(k), dk -> chunkRows, md, reversed);
+        assertEquals(List.of(expected), drain(md, merged));
+    }
+
+    /**
+     * The chunk-key list and the hot iterator must agree on partition order. They do for every path
+     * wired today, but {@code SinglePartitionReadQuery.Group#executeLocally} sorts by token while
+     * {@code queries} is sorted by partition-key value, so this is one wiring change away -- and the
+     * old "synthesize and carry on" handling answered a divergence by emitting a partition TWICE
+     * (once chunk-only, once merged). Duplicated partitions are a wrong answer nothing downstream
+     * rejects, so the invariant fails loudly instead.
+     */
+    @Test
+    public void hotPartitionOutOfExpectedKeyOrderFailsLoudly()
+    {
+        DecoratedKey k1 = key("t1");
+        DecoratedKey k2 = key("t2");
+        UnfilteredPartitionIterator merged = ChunkMergeUnfilteredIterator.wrap(
+            partitions(List.of(partition(k2, false, List.of(row(BASE + 2, 2.0, HOT_WT))),
+                               partition(k1, false, List.of(row(BASE + 1, 1.0, HOT_WT))))),
+            List.of(k1, k2),                                 // ...but the expected order is t1, t2
+            dk -> List.of(row(BASE, 0.0, CHUNK_WT)), metadata, false);
+
+        try
+        {
+            drain(merged);
+            fail("expected the key-order violation to fail the read rather than duplicate a partition");
+        }
+        catch (IllegalStateException expected)
+        {
+            assertTrue(expected.getMessage(), expected.getMessage().contains("out of the order"));
+        }
     }
 
     @Test
@@ -229,16 +354,8 @@ public class ChunkMergeIteratorTest
         assertEquals(List.of("t1 1:1.0", "t2 5:50.0", "t3 3:3.0"), drain(merged));
     }
 
-    @Test
-    public void reversedMerge()
-    {
-        DecoratedKey k = key("t1");
-        List<Row> chunk = new ArrayList<>(List.of(row(BASE + 3, 30.0, CHUNK_WT), row(BASE + 1, 10.0, CHUNK_WT)));
-        UnfilteredPartitionIterator merged = ChunkMergeUnfilteredIterator.wrap(
-            partitions(List.of(partition(k, true, List.of(row(BASE + 4, 40.0, HOT_WT), row(BASE + 2, 20.0, HOT_WT))))),
-            List.of(k), dk -> chunk, metadata, true);
-        assertEquals(List.of("t1 4:40.0 3:30.0 2:20.0 1:10.0"), drain(merged));
-    }
+    // (reversedMerge used to live here; it is exactly the ASC x reversed quadrant of the matrix above,
+    // which now also covers the two DESC-comparator quadrants it never reached.)
 
     @Test
     public void rangeTombstoneMarkersFromTheHotSideSurviveTheMerge()

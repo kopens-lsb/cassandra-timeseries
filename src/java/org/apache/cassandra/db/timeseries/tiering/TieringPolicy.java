@@ -117,7 +117,12 @@ public final class TieringPolicy
      * this option when a window exceeds it.
      */
     private static final String MAX_CHUNK_WINDOW = "31d";
-    private static final long MAX_CHUNK_WINDOW_MILLIS = TimeUnit.DAYS.toMillis(31);
+    /**
+     * Package-visible because it is also the read path's fallback look-back: with no coverage ledger
+     * to consult, this is still a true upper bound on the width of any chunk any accepted policy
+     * could ever have written (see {@link ChunkCoverage.Coverage#lookbackMillis()}).
+     */
+    static final long MAX_CHUNK_WINDOW_MILLIS = TimeUnit.DAYS.toMillis(31);
 
     public final long hotWindowMillis;
     public final long chunkWindowMillis;

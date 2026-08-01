@@ -144,6 +144,15 @@ public class TieredStorageService implements TieredStorageServiceMBean
         public long lateMerges;
         public long chunksExpired;
         public long bytesWritten;
+        /**
+         * Tags this cycle could not finish -- a read/write timeout, an unavailable replica, an
+         * unreadable existing chunk, an over-dense window. Their windows were neither encoded nor
+         * deleted, so nothing is lost, but the cycle <b>under-encoded</b>: it is not the "everything
+         * is tiered up to the cutoff" outcome a completed cycle reports. A one-shot
+         * {@code nodetool retier} that skipped tags fails rather than reporting success (see
+         * {@link #retier}); the scheduled sweep logs and retries them next tick.
+         */
+        public long tagsSkipped;
     }
 
     private final AtomicBoolean setupDone = new AtomicBoolean(false);
@@ -259,32 +268,41 @@ public class TieredStorageService implements TieredStorageServiceMBean
 
     /**
      * Runs one re-encode cycle for {@code keyspace.table} under that table's per-table overlap gate,
-     * recording the result for {@link #statusRows} / the virtual table. If a run for this table is
-     * already in flight: silently skipped when {@code throwIfBusy} is {@code false} (the sweep's own
-     * calls -- the next tick will simply try again), or fails with {@link IllegalStateException} when
-     * {@code true} ({@link #retier}, which is a direct operator request and should say so rather than
-     * silently doing nothing).
+     * recording the result for {@link #statusRows} / the virtual table.
+     * <p>
+     * {@code operatorRequested} distinguishes {@link #retier} -- a direct, one-shot instruction whose
+     * outcome someone is waiting on -- from the scheduled sweep, which gets another chance every tick.
+     * It makes two things fail loudly rather than quietly:
+     * <ul>
+     *     <li>a run already in flight ({@link IllegalStateException}, rather than silently doing
+     *     nothing);</li>
+     *     <li>a cycle that finished having skipped tags ({@link TierRunStats#tagsSkipped}). Those tags
+     *     were not encoded, so the command did not do what it was asked to do; reporting success would
+     *     leave an operator believing the table is tiered up to the cutoff when it is not.</li>
+     * </ul>
+     * The sweep does neither: it logs (see {@link #runOnceInner}) and retries next tick.
      */
-    private void runGuarded(String keyspace, String table, boolean throwIfBusy)
+    private void runGuarded(String keyspace, String table, boolean operatorRequested)
     {
         String key = key(keyspace, table);
         AtomicBoolean gate = runningGates.computeIfAbsent(key, ignored -> new AtomicBoolean(false));
         if (!gate.compareAndSet(false, true))
         {
-            if (throwIfBusy)
+            if (operatorRequested)
                 throw new IllegalStateException(format("Tiered storage run already in flight for %s.%s", keyspace, table));
 
             logger.debug("Tiered storage sweep: {}.{} is already running -- skipping this tick", keyspace, table);
             return;
         }
 
+        TierRunStats stats;
         try
         {
             BiConsumer<String, String> hook = preRunHookForTesting;
             if (hook != null)
                 hook.accept(keyspace, table);
 
-            TierRunStats stats = runOnce(keyspace, table, Clock.Global.currentTimeMillis());
+            stats = runOnce(keyspace, table, Clock.Global.currentTimeMillis());
             lastRunAtMillisByTable.put(key, Clock.Global.currentTimeMillis());
             lastStatsByTable.put(key, stats);
         }
@@ -292,6 +310,13 @@ public class TieredStorageService implements TieredStorageServiceMBean
         {
             gate.set(false);
         }
+
+        if (operatorRequested && stats.tagsSkipped > 0)
+            throw new RuntimeException(
+                format("Tiered storage run for %s.%s completed with %d tag(s) skipped: those tags were NOT encoded " +
+                       "(their source rows are untouched, so nothing is lost, but the table is not tiered up to the " +
+                       "cutoff). See this node's log for the per-tag cause, fix it, and run retier again.",
+                       keyspace, table, stats.tagsSkipped));
     }
 
     @Override
@@ -323,13 +348,14 @@ public class TieredStorageService implements TieredStorageServiceMBean
                 String key = key(keyspace.name, table.name);
                 Long lastRun = lastRunAtMillisByTable.get(key);
                 TierRunStats stats = lastStatsByTable.get(key);
-                rows.add(format("%s\t%s\t%d\t%d\t%d\t%d\t%d\t%d",
+                rows.add(format("%s\t%s\t%d\t%d\t%d\t%d\t%d\t%d\t%d",
                                 keyspace.name, table.name, policy.intervalMillis,
                                 lastRun == null ? -1L : lastRun,
                                 stats == null ? 0L : stats.windowsEncoded,
                                 stats == null ? 0L : stats.rowsEncoded,
                                 stats == null ? 0L : stats.lateMerges,
-                                stats == null ? 0L : stats.chunksExpired));
+                                stats == null ? 0L : stats.chunksExpired,
+                                stats == null ? 0L : stats.tagsSkipped));
             }
         }
         return rows;
@@ -451,6 +477,10 @@ public class TieredStorageService implements TieredStorageServiceMBean
         }
 
         ChunkTables.ensureChunkTable(base);
+        // Re-read the coverage ledger at the top of every cycle. This is also what warms it after a
+        // restart -- the global sweep runs a cycle for every policy-bearing table -- so the read path
+        // is never left guessing how far cold data reaches just because this process is new.
+        ChunkCoverage.refresh(base, policy.consistency);
         String chunkRef = quotedRef(keyspace, ChunkTables.chunkTableName(table));
 
         List<ColumnMetadata> tagColumns = base.partitionKeyColumns();
@@ -570,6 +600,7 @@ public class TieredStorageService implements TieredStorageServiceMBean
                                      "table's timeseries_tiering chunk_window so one window holds at most {} samples; " +
                                      "skipping this tag until then", keyspace, table, describeTag(tagColumns, tag),
                                      windowStart, readEnd, maxSamples, maxSamples, maxSamples);
+                        stats.tagsSkipped++;
                         break;
                     }
 
@@ -674,6 +705,7 @@ public class TieredStorageService implements TieredStorageServiceMBean
                                      "table's timeseries_tiering chunk_window so one window holds at most {} samples; " +
                                      "skipping this tag until then", keyspace, table, describeTag(tagColumns, tag),
                                      windowStart, readEnd, count, maxSamples, maxSamples);
+                        stats.tagsSkipped++;
                         break;
                     }
                     if (tsBuf.length < count)
@@ -697,6 +729,15 @@ public class TieredStorageService implements TieredStorageServiceMBean
                     for (int c = 0; c < valueCount; c++)
                         columns.put(valueRawNames[c],
                                     new ColumnarChunkCodec.ColumnInput(valueTypeCodes[c], columnValues[c]));
+
+                    // BEFORE the chunk is written and the source rows are deleted: the read path's
+                    // fast path is driven by this ledger, so it has to be at least as wide as the
+                    // chunk table at every instant. Widening it first means a crash in between only
+                    // over-states coverage (an unnecessary chunk read); the reverse order would leave
+                    // a chunk whose base rows are gone and which the fast path does not know to look
+                    // for. Claimed on every window, not only on windows that write a chunk, so a lost
+                    // or truncated ledger is rebuilt by the next cycle over already-encoded data.
+                    ChunkCoverage.claim(base, cl, windowStart, cutoff, policy.chunkWindowMillis);
 
                     ByteBuffer payload = ColumnarChunkCodec.encode(tsBuf, count, columns);
                     // Read the version byte back out of the payload rather than naming a codec
@@ -762,6 +803,7 @@ public class TieredStorageService implements TieredStorageServiceMBean
                 // generic failure below, this never fixes itself -- and the tag is now permanently
                 // stuck, so say what has to happen instead of implying a retry will help. Skipping is
                 // still the safe response: no rows are deleted, so nothing further is lost.
+                stats.tagsSkipped++;
                 logger.error("Tiered storage runOnce: {}.{} cannot re-encode tag {}: its existing chunk was written " +
                              "by an older build and is unreadable ({}). Retrying will not fix this -- drop {} and " +
                              "let tiering re-run; that data is not recoverable. Source rows are left untouched.",
@@ -770,6 +812,13 @@ public class TieredStorageService implements TieredStorageServiceMBean
             }
             catch (RuntimeException e)
             {
+                // Counted, not just logged. This catch turns any transient distributed failure -- an
+                // unavailable replica, a read timeout, a schema that has not propagated yet -- into a
+                // tag that this cycle simply did not do; without the counter the cycle returns
+                // all-clear stats and a one-shot `nodetool retier` reports success having under-
+                // encoded an arbitrary subset of the table. An availability failure must not be
+                // reported as success.
+                stats.tagsSkipped++;
                 logger.error("Tiered storage runOnce: {}.{} failed while re-encoding tag {} -- skipping to the " +
                              "next tag; this tag will be retried next cycle", keyspace, table,
                              describeTag(tagColumns, tag), e);
@@ -807,12 +856,21 @@ public class TieredStorageService implements TieredStorageServiceMBean
                     }
                     catch (RuntimeException e)
                     {
+                        stats.tagsSkipped++;
                         logger.error("Tiered storage runOnce: {}.{} failed while expiring cold chunks of tag {} -- " +
                                      "skipping to the next tag; retried next cycle", keyspace, table,
                                      describeTag(tagColumns, tag), e);
                     }
                 }
             }
+        }
+
+        if (stats.tagsSkipped > 0)
+        {
+            logger.warn("Tiered storage runOnce: {}.{} finished with {} tag(s) skipped -- this cycle did NOT do " +
+                        "everything it was asked to. Their source rows are untouched (nothing is lost) and the " +
+                        "scheduled sweep will retry them; the per-tag causes are logged above.",
+                        keyspace, table, stats.tagsSkipped);
         }
 
         return stats;

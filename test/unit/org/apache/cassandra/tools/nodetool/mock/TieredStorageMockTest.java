@@ -85,9 +85,20 @@ public class TieredStorageMockTest extends AbstractNodetoolMock
     }
 
     @Test
+    public void testRetierSkippedTagsSurfaceAsFailure()
+    {
+        // A cycle that skipped tags did not do what retier was asked to do. The MBean fails, and the
+        // command must exit non-zero rather than print nothing and report success.
+        doThrow(new RuntimeException("Tiered storage run for ks1.metrics completed with 2 tag(s) skipped"))
+                .when(mock).retier("ks1", "metrics");
+        ToolRunner.ToolResult result = invokeNodetool("retier", "ks1", "metrics");
+        result.asserts().failure().errorContains("2 tag(s) skipped");
+    }
+
+    @Test
     public void testTieringStatusRendersStatusRows()
     {
-        when(mock.statusRows()).thenReturn(List.of("ks1\tmetrics\t300000\t1700000000000\t7\t42\t1\t3"));
+        when(mock.statusRows()).thenReturn(List.of("ks1\tmetrics\t300000\t1700000000000\t7\t42\t1\t3\t2"));
         ToolRunner.ToolResult result = invokeNodetool("tieringstatus");
         result.assertOnCleanExit();
         Mockito.verify(mock).statusRows();
@@ -96,6 +107,7 @@ public class TieredStorageMockTest extends AbstractNodetoolMock
         // Header plus every tab-separated field of the row, laid out by TableBuilder.
         assertTrue(stdout.contains("Keyspace"));
         assertTrue(stdout.contains("Windows Encoded"));
+        assertTrue(stdout.contains("Tags Skipped"));
         assertTrue(stdout.contains("ks1"));
         assertTrue(stdout.contains("metrics"));
         assertTrue(stdout.contains("300000"));

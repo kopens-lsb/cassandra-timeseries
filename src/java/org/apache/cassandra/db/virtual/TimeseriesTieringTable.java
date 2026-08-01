@@ -45,6 +45,7 @@ final class TimeseriesTieringTable extends AbstractVirtualTable
     private static final String ROWS_ENCODED = "rows_encoded";
     private static final String LATE_MERGES = "late_merges";
     private static final String CHUNKS_EXPIRED = "chunks_expired";
+    private static final String TAGS_SKIPPED = "tags_skipped";
 
     TimeseriesTieringTable(String keyspace)
     {
@@ -63,6 +64,7 @@ final class TimeseriesTieringTable extends AbstractVirtualTable
                            .addRegularColumn(ROWS_ENCODED, LongType.instance)
                            .addRegularColumn(LATE_MERGES, LongType.instance)
                            .addRegularColumn(CHUNKS_EXPIRED, LongType.instance)
+                           .addRegularColumn(TAGS_SKIPPED, LongType.instance)
                            .build());
     }
 
@@ -101,7 +103,11 @@ final class TimeseriesTieringTable extends AbstractVirtualTable
                       .column(WINDOWS_ENCODED, stats == null ? 0L : stats.windowsEncoded)
                       .column(ROWS_ENCODED, stats == null ? 0L : stats.rowsEncoded)
                       .column(LATE_MERGES, stats == null ? 0L : stats.lateMerges)
-                      .column(CHUNKS_EXPIRED, stats == null ? 0L : stats.chunksExpired);
+                      .column(CHUNKS_EXPIRED, stats == null ? 0L : stats.chunksExpired)
+                      // Non-zero means the last completed cycle did NOT encode everything below the
+                      // cutoff: those tags failed and were skipped, so the table is not tiered as far
+                      // as the other counters suggest.
+                      .column(TAGS_SKIPPED, stats == null ? 0L : stats.tagsSkipped);
             }
         }
 

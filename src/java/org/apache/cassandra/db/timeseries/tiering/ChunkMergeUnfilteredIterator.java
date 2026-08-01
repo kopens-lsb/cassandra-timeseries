@@ -19,9 +19,11 @@
 package org.apache.cassandra.db.timeseries.tiering;
 
 import java.util.ArrayList;
+import java.util.HashSet;
 import java.util.Iterator;
 import java.util.List;
 import java.util.NoSuchElementException;
+import java.util.Set;
 import java.util.function.Function;
 
 import org.apache.cassandra.db.DecoratedKey;
@@ -58,11 +60,21 @@ import org.apache.cassandra.utils.Throwables;
  * Partitions the hot iterator does not contain at all (fully chunked tags) are synthesized in the
  * position given by {@code expectedKeys}, which must list the query's partition keys in the same
  * order the hot iterator yields them (the read command/group order).
+ * <p>
+ * <b>That ordering is an enforced invariant, not an assumption.</b> If the hot iterator ever yields a
+ * key {@code expectedKeys} has already passed -- which is one wiring change away, since
+ * {@code SinglePartitionReadQuery.Group#executeLocally} sorts by <em>token</em> while {@code queries}
+ * is sorted by partition-key <em>value</em> -- the old "synthesize and carry on" handling emitted that
+ * partition <b>twice</b>: once chunk-only, once merged. Two partitions with the same key in one result
+ * is silent duplication that no downstream stage rejects, so a divergence fails the query instead (see
+ * {@link #outOfOrder}).
  */
 public final class ChunkMergeUnfilteredIterator implements UnfilteredPartitionIterator
 {
     private final UnfilteredPartitionIterator hot;
     private final Iterator<DecoratedKey> expectedKeys;
+    /** The expected keys not yet consumed, for the order check -- see {@link #outOfOrder}. */
+    private final Set<DecoratedKey> pendingKeys;
     private final Function<DecoratedKey, List<Row>> chunkRows;
     private final TableMetadata metadata;
     private final boolean reversed;
@@ -78,6 +90,7 @@ public final class ChunkMergeUnfilteredIterator implements UnfilteredPartitionIt
     {
         this.hot = hot;
         this.expectedKeys = expectedKeys.iterator();
+        this.pendingKeys = new HashSet<>(expectedKeys);
         this.chunkRows = chunkRows;
         this.metadata = metadata;
         this.reversed = reversed;
@@ -116,16 +129,16 @@ public final class ChunkMergeUnfilteredIterator implements UnfilteredPartitionIt
 
             if (!expectedKeys.hasNext())
             {
-                // Defensive: hot partitions beyond the expected keys still merge (should not happen --
-                // hot results are a subset of the requested keys).
                 if (peekedHot == null)
                     return false;
-                next = merge(peekedHot, chunkRows.apply(peekedHot.partitionKey()));
-                peekedHot = null;
-                break;
+                // A hot partition left over after every expected key has been consumed: either its key
+                // was never requested, or it arrived after the position expectedKeys gave it. Merging
+                // it here would emit a partition this iterator has already emitted chunk-only.
+                throw outOfOrder(peekedHot.partitionKey());
             }
 
             DecoratedKey expected = expectedKeys.next();
+            pendingKeys.remove(expected);
             if (peekedHot != null && peekedHot.partitionKey().equals(expected))
             {
                 next = merge(peekedHot, chunkRows.apply(expected));
@@ -133,6 +146,12 @@ public final class ChunkMergeUnfilteredIterator implements UnfilteredPartitionIt
             }
             else
             {
+                // Skipping `expected` is only legitimate if the peeked hot partition is still ahead of
+                // us in expectedKeys, i.e. the hot side simply has nothing for `expected` (a fully
+                // chunked tag). A peeked key that is NOT still pending means the two orders diverged.
+                if (peekedHot != null && !pendingKeys.contains(peekedHot.partitionKey()))
+                    throw outOfOrder(peekedHot.partitionKey());
+
                 List<Row> synthetic = chunkRows.apply(expected);
                 if (!synthetic.isEmpty())
                     next = synthetic(metadata, expected, reversed, synthetic);
@@ -167,6 +186,22 @@ public final class ChunkMergeUnfilteredIterator implements UnfilteredPartitionIt
         next = null;
         failure = closeQuietly(hot, failure);
         Throwables.maybeFail(failure);
+    }
+
+    /**
+     * The hot iterator and {@code expectedKeys} disagree about partition order. Reported rather than
+     * worked around: the only ways to "continue" are to emit the partition twice or to drop one of the
+     * two copies, and a duplicated or dropped partition is a wrong answer that nothing downstream can
+     * detect. Every path wired today (the local group read and the coordinator's per-command resolve)
+     * satisfies the invariant, so this firing means a caller changed.
+     */
+    private IllegalStateException outOfOrder(DecoratedKey key)
+    {
+        return new IllegalStateException(
+            String.format("Tiered read of %s.%s: the hot partition iterator yielded %s out of the order the read's " +
+                          "partition keys were given in. The chunk merge cannot place it without emitting some " +
+                          "partition twice, so the query is failed instead of returning duplicated rows.",
+                          metadata.keyspace, metadata.name, key));
     }
 
     private static Throwable closeQuietly(AutoCloseable closeable, Throwable failure)

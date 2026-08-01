@@ -39,7 +39,7 @@ public class TieringStatus extends AbstractCommand
 
         TableBuilder table = new TableBuilder();
         table.add("Keyspace", "Table", "Interval (ms)", "Last Run At", "Windows Encoded", "Rows Encoded",
-                  "Late Merges", "Chunks Expired");
+                  "Late Merges", "Chunks Expired", "Tags Skipped");
         for (String row : probe.tieringStatusRows())
             table.add(row.split("\t", -1));
         table.printTo(out);

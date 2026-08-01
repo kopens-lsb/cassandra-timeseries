@@ -29,16 +29,23 @@ public interface TieredStorageServiceMBean
     /**
      * Runs one re-encode cycle for {@code keyspace.table} synchronously, right now, bypassing the
      * scheduled sweep's interval check.
+     * <p>
+     * Returns normally only if the cycle did everything it was asked to. A cycle that skipped tags --
+     * a read/write timeout, an unavailable replica, an unreadable existing chunk -- <b>fails</b>,
+     * because those tags were not encoded: this is a one-shot operator instruction, not a best-effort
+     * background tick, and an availability failure reported as success would leave the operator
+     * believing the table is tiered up to the cutoff when an arbitrary subset of it is not.
      *
      * @throws IllegalStateException if a run for this table -- sweep- or {@code retier}-triggered --
      * is already in flight
+     * @throws RuntimeException if the cycle completed with one or more tags skipped
      */
     void retier(String keyspace, String table);
 
     /**
      * @return one tab-delimited status line per table that has a {@code timeseries_tiering} policy:
      * {@code keyspace, table, interval_ms, last_run_at (epoch millis, or -1 if it has never run),
-     * windows_encoded, rows_encoded, late_merges, chunks_expired}.
+     * windows_encoded, rows_encoded, late_merges, chunks_expired, tags_skipped}.
      */
     List<String> statusRows();
 }
