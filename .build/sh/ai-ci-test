@@ -1,0 +1,65 @@
+#!/usr/bin/env bash
+# Licensed to the Apache Software Foundation (ASF) under one
+# or more contributor license agreements.  See the NOTICE file
+# distributed with this work for additional information
+# regarding copyright ownership.  The ASF licenses this file
+# to you under the Apache License, Version 2.0 (the
+# "License"); you may not use this file except in compliance
+# with the License.  You may obtain a copy of the License at
+#
+#     http://www.apache.org/licenses/LICENSE-2.0
+#
+# Unless required by applicable law or agreed to in writing, software
+# distributed under the License is distributed on an "AS IS" BASIS,
+# WITHOUT WARRANTIES OR CONDITIONS OF ANY KIND, either express or implied.
+# See the License for the specific language governing permissions and
+# limitations under the License.
+
+#set -o xtrace
+set -o errexit
+set -o pipefail
+set -o nounset
+
+bin="$(cd "$(dirname "$0")" > /dev/null; pwd)"
+home="$(cd "$bin/../.." > /dev/null; pwd)" # this script lives in .build/sh
+
+# Switch to the project root so all commands work properly
+cd "$home"
+
+# Guard: a mistyped FQCN resolves to an empty class list downstream and "passes" having run
+# zero tests. Fail fast here instead: every dotted non-flag argument must exist under test/*/.
+classes=0
+reuse=false
+for arg in "$@"; do
+  case "$arg" in
+    --reuse) reuse=true ;;
+    -*) ;;
+    *.*)
+      if ! compgen -G "test/*/$(echo "$arg" | tr '.' '/').java" > /dev/null; then
+        echo "ERROR: test class not found under test/*/: $arg (typo in the FQCN?)" >&2
+        exit 2
+      fi
+      classes=$((classes + 1))
+      ;;
+  esac
+done
+
+# Guard: ci-test takes exactly ONE class. A second one is consumed as an unknown option, which
+# prints usage and stops -- but the surrounding output still reads like a completed run, so the
+# caller records a pass for tests that never executed. Reject it here, in the caller's own terms.
+if [ "$classes" -gt 1 ]; then
+  echo "ERROR: ci-test runs one test class at a time; got $classes. Invoke it once per class." >&2
+  exit 2
+fi
+
+# Guard: --reuse tells ci-test to skip realclean, and it skips the whole compile step with it, so
+# tests run against whatever classes happen to be on disk. Edit a source file, re-run with --reuse,
+# and the result describes the PREVIOUS build -- a green run that proves nothing about the change
+# under test. Compile incrementally first; it is a no-op when nothing changed, and stale-class
+# false evidence costs far more than the seconds it takes.
+if [ "$reuse" = true ]; then
+  ant build-test -Dno-checkstyle=true -Dant.gen-doc.skip=true -Drat.skip=true 2>&1 \
+    | "$bin"/ant-log-summary.py -
+fi
+
+"$bin"/ci-test "$@" 2>&1 | "$bin"/ant-log-summary.py -

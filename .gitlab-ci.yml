@@ -1,0 +1,260 @@
+# CI for cassandra-timeseries: Apache Cassandra 6.0.0 + time-series functions.
+# Builds apache-cassandra-6.0.0.jar with Ant, runs the time-series unit tests, then boots the
+# Docker image and runs the time-series CQL integration test before anything is released.
+#
+# Release path (tag push) is fully automatic and gated:
+#   build-jar -> timeseries-tests -> docker-image -> docker-integration-test -> docker-image-publish + release
+# On the default branch the docker chain is manual (a full image build is expensive); play
+# docker-image to run it.
+
+stages:
+  - build
+  - test
+  - image
+  - integration
+  - release
+
+workflow:
+  rules:
+    - if: $CI_PIPELINE_SOURCE == "merge_request_event"
+    - if: $CI_COMMIT_TAG
+    - if: $CI_COMMIT_BRANCH
+
+variables:
+  # modules/accord is a git submodule and is required by the build.
+  GIT_SUBMODULE_STRATEGY: recursive
+  GIT_SUBMODULE_DEPTH: 1
+  ANT_OPTS: "-Xmx4g"
+
+default:
+  image: eclipse-temurin:21-jdk
+  before_script:
+    - apt-get update -qq && apt-get install -y -qq --no-install-recommends ant ant-optional python3 > /dev/null
+
+build-jar:
+  stage: build
+  timeout: 90m
+  script:
+    - ant clean jar checkstyle checkstyle-test
+    - ls -l build/apache-cassandra-6.0.0.jar
+    # Release artifacts carry the fork's name and the tag's version (build.xml stays at
+    # base.version 6.0.0 per the versioning rule - only the published copies are renamed).
+    - cp build/apache-cassandra-6.0.0.jar "build/apache-cassandra-timeseries-${CI_COMMIT_TAG:-dev}.jar"
+    # Full binary distribution (bin/, conf/, lib/, tools/ ...) as a tar.gz with a versioned top dir.
+    - ant _artifacts-init -Dant.gen-doc.skip=true -Drat.skip=true
+    - cp -al build/dist "build/apache-cassandra-timeseries-${CI_COMMIT_TAG:-dev}"
+    - tar -C build -czf "build/apache-cassandra-timeseries-${CI_COMMIT_TAG:-dev}-bin.tar.gz" "apache-cassandra-timeseries-${CI_COMMIT_TAG:-dev}"
+    - ls -l build/apache-cassandra-timeseries-*
+  artifacts:
+    name: "apache-cassandra-timeseries"
+    paths:
+      - build/apache-cassandra-6.0.0.jar
+      - build/apache-cassandra-timeseries-*.jar
+      - build/apache-cassandra-timeseries-*-bin.tar.gz
+    expire_in: 1 month
+
+# Targeted tests only — the full Cassandra suite takes hours (see AGENTS.md).
+timeseries-tests:
+  stage: test
+  timeout: 90m
+  # One line per class. Full per-class output goes to build/ci-logs/ and is kept as an
+  # artifact -- jvm-dtests log at DEBUG and a single one can fill GitLab's 4 MiB trace
+  # limit, which in the 6.0.0 release run happened during the SECOND class. The script
+  # also reads failures/errors out of the JUnit XML instead of trusting ant's exit code,
+  # because `ant testsome` reports BUILD SUCCESSFUL when a class name does not resolve.
+  script:
+    - .build/sh/ci-timeseries-tests.sh
+  artifacts:
+    name: "timeseries-test-logs"
+    when: always
+    paths:
+      - build/ci-logs/
+      - build/test/output/
+    expire_in: 1 month
+
+# Build the Testcontainers-compatible Docker image (see docker/) and publish it as a loadable tarball to
+# the GitLab GENERIC PACKAGE registry — this instance has no container registry configured (no
+# registry_external_url, /jwt/auth 404), so $CI_REGISTRY_IMAGE is empty and a kaniko push cannot work.
+# Switch --no-push/--tar-path back to --destination "$CI_REGISTRY_IMAGE:6.0.0" if a container registry
+# is configured later.
+#
+# Consumption (e.g. before the plantpulse-jdbc-cassandra-driver integration tests):
+#   curl -sH "PRIVATE-TOKEN: <token>" \
+#     "$CI_API_V4_URL/projects/<id>/packages/generic/cassandra-timeseries-docker/<version>/cassandra-timeseries-6.0.0-docker.tar" \
+#     | podman load   # or: docker load
+#   ./gradlew integrationTest -Pcassandra.image=cassandra-timeseries:6.0.0
+docker-image:
+  stage: image
+  timeout: 90m
+  needs: []
+  image:
+    name: gcr.io/kaniko-project/executor:v1.23.2-debug
+    entrypoint: [""]
+  # The kaniko image is busybox-based: the global before_script (apt-get) must not run here.
+  before_script: []
+  rules:
+    - if: $CI_COMMIT_TAG
+    - if: $CI_COMMIT_BRANCH == $CI_DEFAULT_BRANCH
+      when: manual
+      allow_failure: true
+  script:
+    - /kaniko/executor
+      --context "$CI_PROJECT_DIR"
+      --dockerfile "$CI_PROJECT_DIR/docker/Dockerfile"
+      --no-push
+      --tar-path "$CI_PROJECT_DIR/cassandra-timeseries-6.0.0-docker.tar"
+      --destination "cassandra-timeseries:6.0.0"
+  artifacts:
+    name: "cassandra-timeseries-6.0.0-docker"
+    paths:
+      - cassandra-timeseries-6.0.0-docker.tar
+    expire_in: 3 days
+
+# Release gate: boot the image that is about to be published and run the time-series CQL
+# integration test against it (docker/integration-test.sh). Nothing is published or released
+# unless this passes.
+#
+# Needs a Docker daemon, and uses the HOST's via the socket the runner already mounts
+# (/var/run/docker.sock) rather than a docker:dind service. dind requires the runner to be
+# configured `privileged = true`, which this runner is not — and making a shared runner privileged
+# to serve one job is a bad trade. The socket works here because integration-test.sh never talks to
+# the Cassandra container over the network: it starts the container and drives every command through
+# `docker exec`, so the container being a sibling of this job rather than a child changes nothing.
+docker-integration-test:
+  stage: integration
+  timeout: 60m
+  needs:
+    - job: docker-image
+      artifacts: true
+  image: docker:27-cli
+  variables:
+    DOCKER_HOST: unix:///var/run/docker.sock
+  # Overrides the default before_script (apt-get, for the temurin image) — but it cannot be empty:
+  # docker:27-cli is Alpine and ships no bash, and integration-test.sh is a #!/bin/bash script using
+  # a dozen bash-only constructs. Without this the job dies with "not found" / exit 127 on a script
+  # that is present and executable, which is the shebang interpreter missing, not the script.
+  # coreutils comes along for GNU date: busybox date silently ignores the %3N in `date +%s%3N`, so
+  # every elapsed time in the report would be 0 ms.
+  before_script:
+    - apk add --no-cache bash coreutils
+  # Mirrors docker-image's rules — see the comment on docker-image-publish.
+  rules:
+    - if: $CI_COMMIT_TAG
+    - if: $CI_COMMIT_BRANCH == $CI_DEFAULT_BRANCH
+      when: manual
+      allow_failure: true
+  script:
+    - docker load -i cassandra-timeseries-6.0.0-docker.tar
+    - ./docker/integration-test.sh cassandra-timeseries:6.0.0
+  artifacts:
+    name: "timeseries-integration-test-report"
+    when: always
+    paths:
+      - build/timeseries-it-report.html
+    expire_in: 1 month
+
+# Three real containers on a docker network, RF=3 (docker/cluster-test.sh). Everything it asserts is
+# also asserted in-JVM by the timeseries dtest classes, which run on every pipeline; what this adds
+# is three separate JVMs, three separate data directories and a repair stream between operating
+# system processes.
+#
+# MANUAL on every ref, including tags — deliberately NOT a release gate. Three JVMs at 2G plus this
+# job is more than a shared runner is guaranteed to have, and a release gate that fails on runner
+# capacity rather than on the product is worse than no gate. Play it by hand when the cluster path
+# has changed (compaction, streaming, tiering) or before a release worth the extra confidence.
+docker-cluster-test:
+  stage: integration
+  timeout: 60m
+  needs:
+    - job: docker-image
+      artifacts: true
+  image: docker:27-cli
+  variables:
+    DOCKER_HOST: unix:///var/run/docker.sock
+  # Alpine ships no bash and cluster-test.sh is #!/bin/bash — see docker-integration-test.
+  before_script:
+    - apk add --no-cache bash coreutils
+  rules:
+    - when: manual
+      allow_failure: true
+  script:
+    - docker load -i cassandra-timeseries-6.0.0-docker.tar
+    - ./docker/cluster-test.sh cassandra-timeseries:6.0.0
+  after_script:
+    - docker rm -f cassandra-ts-cluster-1 cassandra-ts-cluster-2 cassandra-ts-cluster-3 || true
+  artifacts:
+    name: "timeseries-cluster-test-report"
+    when: always
+    paths:
+      - build/timeseries-cluster-report.html
+      - build/timeseries-cluster-report.md
+    expire_in: 1 month
+
+# Upload the image tarball to the generic package registry so it has a stable, tokened download URL
+# (job artifacts expire; packages do not).
+docker-image-publish:
+  stage: release
+  timeout: 30m
+  needs:
+    - job: docker-image
+      artifacts: true
+    - job: docker-integration-test
+      artifacts: false
+  image:
+    name: curlimages/curl:8.10.1
+    entrypoint: [""]
+  before_script: []
+  # Must mirror docker-image's rules: it needs docker-image's artifact, and a job that needs an
+  # optional manual job is created as "skipped" if that manual job has not run — so with plain
+  # on_success rules here this job could never run on the default branch, only on tags.
+  rules:
+    - if: $CI_COMMIT_TAG
+    - if: $CI_COMMIT_BRANCH == $CI_DEFAULT_BRANCH
+      when: manual
+      allow_failure: true
+  script:
+    # Folded block scalar: a plain scalar cannot contain ": " (the JOB-TOKEN header), which broke the pipeline.
+    - >-
+      curl --fail --silent --show-error -H "JOB-TOKEN: $CI_JOB_TOKEN"
+      --upload-file cassandra-timeseries-6.0.0-docker.tar
+      "$CI_API_V4_URL/projects/$CI_PROJECT_ID/packages/generic/cassandra-timeseries-docker/${CI_COMMIT_TAG:-6.0.0}/cassandra-timeseries-6.0.0-docker.tar"
+
+# On tag pushes (e.g. 6.0.0-r1), publish a GitLab Release pointing at the built jar.
+release:
+  stage: release
+  image: registry.gitlab.com/gitlab-org/release-cli:latest
+  rules:
+    - if: $CI_COMMIT_TAG
+  # Upload the artifacts to the generic package registry before creating the release.
+  # Job artifacts expire (expire_in above), which would leave a published release pointing at
+  # dead links; packages do not. The web artifact routes (/-/jobs/...) additionally authenticate
+  # by browser session only -- they ignore PRIVATE-TOKEN and serve the login page with HTTP 200,
+  # so `curl -o x.jar` writes HTML. The package route accepts a token and a session alike.
+  needs:
+    - job: build-jar
+      artifacts: true
+    - job: docker-integration-test
+      artifacts: false
+  script:
+    - |
+      PKG="$CI_API_V4_URL/projects/$CI_PROJECT_ID/packages/generic/cassandra-timeseries/$CI_COMMIT_TAG"
+      for f in "apache-cassandra-timeseries-${CI_COMMIT_TAG}.jar" "apache-cassandra-timeseries-${CI_COMMIT_TAG}-bin.tar.gz"; do
+        echo "uploading $f"
+        curl --fail --silent --show-error --header "JOB-TOKEN: $CI_JOB_TOKEN" \
+             --upload-file "build/$f" "$PKG/$f"
+      done
+  release:
+    tag_name: "$CI_COMMIT_TAG"
+    description: "Industrial time-series Cassandra (base Apache Cassandra 6.0.0) — $CI_COMMIT_TAG"
+    assets:
+      links:
+        # Generic package registry, not job artifacts. Artifacts expire (see build-jar's
+        # expire_in), which would leave a published release pointing at dead links; packages do
+        # not. The web artifact routes (/-/jobs/...) are worse still: they authenticate by browser
+        # session only, ignore PRIVATE-TOKEN, and serve the login page with HTTP 200 -- so
+        # `curl -o release.jar` writes an 11 KB HTML file named .jar and nothing fails until it is
+        # in lib/ and the node will not start. The package route accepts a token and a session alike.
+        - name: "apache-cassandra-timeseries-${CI_COMMIT_TAG}-bin.tar.gz"
+          url: "$CI_API_V4_URL/projects/$CI_PROJECT_ID/packages/generic/cassandra-timeseries/$CI_COMMIT_TAG/apache-cassandra-timeseries-${CI_COMMIT_TAG}-bin.tar.gz"
+        - name: "apache-cassandra-timeseries-${CI_COMMIT_TAG}.jar"
+          url: "$CI_API_V4_URL/projects/$CI_PROJECT_ID/packages/generic/cassandra-timeseries/$CI_COMMIT_TAG/apache-cassandra-timeseries-${CI_COMMIT_TAG}.jar"
