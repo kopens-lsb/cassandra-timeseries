@@ -127,7 +127,7 @@ grep "Parking window" system.log | grep -oE '\[[0-9]+\.\.[0-9]+\]'
 500 MB 파티션 × 동시 컴팩터 16개는 16 GB 힙에서 살아남지 못합니다. 실패 방식이 "느려짐"이 아니라
 "노드 사망"입니다.
 
-자세한 진단 기록: [prod-window-size-plan.md](prod-window-size-plan.md)
+자세한 진단 기록: [prod-tscs-settings.md](prod-tscs-settings.md)
 
 확인 경로는 **JMX 하나뿐입니다** (`nodetool` 서브커맨드는 없습니다). 테이블 MBean
 `org.apache.cassandra.db:type=Tables,keyspace=<ks>,table=<table>`:
