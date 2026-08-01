@@ -1179,16 +1179,26 @@ public class TieredStorageColumnsTest extends CQLTester
      * <ul>
      *   <li>{@code quality} constantly 192, {@code error_code} constantly 0,
      *       {@code attribute} constantly {@code {}} -- the CONSTANT path;</li>
-     *   <li>{@code value_numeric} never written at all -- the all-null path (as is
-     *       {@code value_boolean}: a numeric tag point never carries one);</li>
+     *   <li>{@code value_numeric} never written at all -- the all-null path;</li>
      *   <li>{@code latency} high-entropy (a deterministic uniform draw over 1..999);</li>
      *   <li>{@code value} a short numeric-looking text, produced by a deterministic random walk
      *       rounded to one decimal -- a slowly-varying sensor reading, not white noise.</li>
      * </ul>
+     * {@code value_boolean} is controlled by {@code withValueBoolean}: either omitted (the all-null
+     * path, modelling a tag that never carries a state bit) or written on every row as a bit that
+     * flips every 300 samples (a slowly-toggling state flag). Nothing else differs between the two --
+     * the bit is derived from the row index, never from {@code random} -- so both variants draw the
+     * identical latency and value streams and any size difference is attributable to that one column.
+     * <p>
      * The generator is deliberately seeded and spelled out here because the encoded size this
-     * produces is the number Task 6 compares against production.
+     * produces is the bytes-per-row figure doc/timeseries/columnar-chunks.md quotes.
      */
     private void loadRealShapeWindow() throws Throwable
+    {
+        loadRealShapeWindow(false);
+    }
+
+    private void loadRealShapeWindow(boolean withValueBoolean) throws Throwable
     {
         execute("INSERT INTO %s (tag_id, area_id, asset_id, line_id, opc_id, site_id, tag_name, type) " +
                 "VALUES ('t1', 'a', 'as', 'l', 'o', 's', 'tn', 'ty') USING TIMESTAMP 100");
@@ -1199,10 +1209,16 @@ public class TieredStorageColumnsTest extends CQLTester
         for (int i = 0; i < REAL_SHAPE_ROWS; i++)
         {
             reading += (random.nextDouble() - 0.5) * 0.4;
-            execute("INSERT INTO %s (tag_id, timestamp, attribute, error_code, latency, quality, value) " +
-                    "VALUES ('t1', ?, ?, 0, ?, 192, ?) USING TIMESTAMP ?",
-                    new Date(i * REAL_SHAPE_STEP_MS), attribute, 1 + random.nextInt(999),
-                    String.format("%.1f", reading), 1000L + i);
+            if (withValueBoolean)
+                execute("INSERT INTO %s (tag_id, timestamp, attribute, error_code, latency, quality, value, " +
+                        "value_boolean) VALUES ('t1', ?, ?, 0, ?, 192, ?, ?) USING TIMESTAMP ?",
+                        new Date(i * REAL_SHAPE_STEP_MS), attribute, 1 + random.nextInt(999),
+                        String.format("%.1f", reading), (i / 300) % 2 == 0, 1000L + i);
+            else
+                execute("INSERT INTO %s (tag_id, timestamp, attribute, error_code, latency, quality, value) " +
+                        "VALUES ('t1', ?, ?, 0, ?, 192, ?) USING TIMESTAMP ?",
+                        new Date(i * REAL_SHAPE_STEP_MS), attribute, 1 + random.nextInt(999),
+                        String.format("%.1f", reading), 1000L + i);
         }
         // One hot row, so the window boundary is exercised exactly as in the other tests.
         execute("INSERT INTO %s (tag_id, timestamp, latency) VALUES ('t1', ?, 1) USING TIMESTAMP 200",
@@ -1249,15 +1265,58 @@ public class TieredStorageColumnsTest extends CQLTester
         assertFalse("latency varies per row and must not be CONSTANT", latency.constant());
         assertTrue("latency must occupy a real data section, got " + latency.sectionLen, latency.sectionLen > 1000);
 
-        // Bytes per row -- the number Task 6 compares against pp's ~9 B/row on disk (already
-        // Zstd-compressed) and the plan's ~2.9 B/row expectation. Measured 3.26 B/row on this
-        // generator at the time of writing; the assertion is against the production baseline rather
-        // than that exact figure, so it stays a real gate without breaking on codec tuning.
+        // Bytes per row for THIS variant only -- value_boolean unwritten, so two of the eight regular
+        // columns cost nothing. That flatters the format, which is why it is not the figure the docs
+        // quote; realShapeBytesPerRowIsMeasuredWithValueBooleanPopulated below owns that. Logged here
+        // because this test is where the all-null path is proven, and the gate is the production
+        // baseline rather than an exact figure so codec tuning does not break it.
         double bytesPerRow = payload.remaining() / (double) REAL_SHAPE_ROWS;
-        logger.info("SP4 real-shape chunk: {} rows, {} payload bytes, {} bytes/row",
+        logger.info("SP4 real-shape chunk (value_boolean absent): {} rows, {} payload bytes, {} bytes/row",
                     REAL_SHAPE_ROWS, payload.remaining(), bytesPerRow);
         assertTrue("real-shape chunk must beat pp's ~9 B/row on-disk baseline, measured " + bytesPerRow,
                    bytesPerRow < 9.0);
+    }
+
+    /**
+     * The bytes-per-row figure doc/timeseries/columnar-chunks.md quotes, and the control that shows
+     * what the earlier figure left out.
+     * <p>
+     * Two windows of the identical tm_tag_point shape and identical generator, differing only in
+     * whether {@code value_boolean} is written. Modelling it as never written -- which the first
+     * measurement did -- lets it take ALL_NULL and cost nothing, so the resulting number describes a
+     * table with one fewer column than the schema declares. Populating it is the honest measurement,
+     * and both are logged so the delta is attributable to exactly that column.
+     */
+    @Test
+    public void realShapeBytesPerRowIsMeasuredWithValueBooleanPopulated() throws Throwable
+    {
+        createProductionShapedTable();
+        loadRealShapeWindow(false);
+        assertEquals(1, new TieredStorageService().runOnce(KEYSPACE, currentTable(), 5 * HOUR).windowsEncoded);
+        int absentBytes = execute(chunkSelectQuery(), "t1", new Date(0L)).one().getBytes("payload").remaining();
+
+        createProductionShapedTable();
+        loadRealShapeWindow(true);
+        assertEquals(1, new TieredStorageService().runOnce(KEYSPACE, currentTable(), 5 * HOUR).windowsEncoded);
+        ByteBuffer payload = execute(chunkSelectQuery(), "t1", new Date(0L)).one().getBytes("payload");
+
+        // The column has to be carrying real data or this measures the same optimistic thing twice:
+        // not ALL_NULL, not folded to CONSTANT, and a section of exactly one packed bit per row.
+        DirectoryEntry flag = readDirectory(payload).get("value_boolean");
+        assertNotNull("no directory entry for value_boolean", flag);
+        assertFalse("value_boolean is written on every row here and must not be ALL_NULL", flag.allNull());
+        assertFalse("value_boolean flips and must not fold to CONSTANT", flag.constant());
+        assertEquals("a boolean section is one packed bit per row", (REAL_SHAPE_ROWS + 7) / 8, flag.sectionLen);
+
+        double absent = absentBytes / (double) REAL_SHAPE_ROWS;
+        double populated = payload.remaining() / (double) REAL_SHAPE_ROWS;
+        logger.info("SP4 real-shape bytes/row over {} rows: value_boolean absent = {} B -> {} B/row; " +
+                    "value_boolean populated = {} B -> {} B/row",
+                    REAL_SHAPE_ROWS, absentBytes, absent, payload.remaining(), populated);
+        assertTrue("writing a column cannot make the chunk smaller: " + absentBytes + " -> " + payload.remaining(),
+                   payload.remaining() > absentBytes);
+        assertTrue("real-shape chunk must beat pp's ~9 B/row on-disk baseline, measured " + populated,
+                   populated < 9.0);
     }
 
     @Test
