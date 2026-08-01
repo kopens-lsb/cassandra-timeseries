@@ -37,7 +37,9 @@ import org.apache.cassandra.db.marshal.UTF8Type;
 import org.apache.cassandra.db.partitions.UnfilteredPartitionIterator;
 import org.apache.cassandra.db.rows.BTreeRow;
 import org.apache.cassandra.db.rows.BufferCell;
+import org.apache.cassandra.db.rows.Cell;
 import org.apache.cassandra.db.rows.EncodingStats;
+import org.apache.cassandra.db.rows.RangeTombstoneBoundMarker;
 import org.apache.cassandra.db.rows.Row;
 import org.apache.cassandra.db.rows.Rows;
 import org.apache.cassandra.db.rows.Unfiltered;
@@ -49,6 +51,7 @@ import org.apache.cassandra.utils.ByteBufferUtil;
 
 import static org.junit.Assert.assertEquals;
 import static org.junit.Assert.assertFalse;
+import static org.junit.Assert.assertTrue;
 
 /**
  * SP3 Task 2 / SP4: merge of hot partitions with synthetic chunk rows on the UNFILTERED stream --
@@ -100,6 +103,31 @@ public class ChunkMergeIteratorTest
         };
     }
 
+    /** Wraps a partition so a test can assert it was closed. */
+    private static final class CloseTracking implements org.apache.cassandra.db.rows.WrappingUnfilteredRowIterator
+    {
+        private final UnfilteredRowIterator wrapped;
+        boolean closed;
+
+        CloseTracking(UnfilteredRowIterator wrapped)
+        {
+            this.wrapped = wrapped;
+        }
+
+        @Override
+        public UnfilteredRowIterator wrapped()
+        {
+            return wrapped;
+        }
+
+        @Override
+        public void close()
+        {
+            closed = true;
+            wrapped.close();
+        }
+    }
+
     private static UnfilteredPartitionIterator partitions(List<UnfilteredRowIterator> parts)
     {
         Iterator<UnfilteredRowIterator> it = parts.iterator();
@@ -123,10 +151,18 @@ public class ChunkMergeIteratorTest
                 StringBuilder sb = new StringBuilder(UTF8Type.instance.compose(p.partitionKey().getKey()));
                 while (p.hasNext())
                 {
-                    Row r = (Row) p.next();
+                    Unfiltered u = p.next();
+                    if (!u.isRow())
+                    {
+                        // Range tombstone markers are Unfiltered too; rendering them keeps drain()
+                        // total (it used to ClassCastException on one) and lets a test assert on them.
+                        sb.append(" |marker|");
+                        continue;
+                    }
+                    Row r = (Row) u;
                     long ts = TimestampType.instance.compose(r.clustering().bufferAt(0)).getTime() - BASE;
-                    double v = DoubleType.instance.compose(r.getCell(valueColumn).buffer());
-                    sb.append(' ').append(ts).append(':').append(v);
+                    Cell<?> cell = r.getCell(valueColumn);
+                    sb.append(' ').append(ts).append(':').append(cell == null ? "-" : DoubleType.instance.compose(cell.buffer()));
                 }
                 result.add(sb.toString());
             }
@@ -202,6 +238,72 @@ public class ChunkMergeIteratorTest
             partitions(List.of(partition(k, true, List.of(row(BASE + 4, 40.0, HOT_WT), row(BASE + 2, 20.0, HOT_WT))))),
             List.of(k), dk -> chunk, metadata, true);
         assertEquals(List.of("t1 4:40.0 3:30.0 2:20.0 1:10.0"), drain(merged));
+    }
+
+    @Test
+    public void rangeTombstoneMarkersFromTheHotSideSurviveTheMerge()
+    {
+        // The whole reason the merge moved onto the unfiltered stream: deletion information must
+        // still be in the output for Filter/reconciliation downstream to act on. A marker from the
+        // hot side must pass through the merge, not be dropped or crash it.
+        DecoratedKey k = key("t1");
+        DeletionTime deletion = DeletionTime.build(HOT_WT, 1);
+        Clustering<?> from = Clustering.make(TimestampType.instance.decompose(new Date(BASE + 2)));
+        Clustering<?> to = Clustering.make(TimestampType.instance.decompose(new Date(BASE + 3)));
+        RangeTombstoneBoundMarker open = RangeTombstoneBoundMarker.inclusiveOpen(false, from, deletion);
+        RangeTombstoneBoundMarker close = RangeTombstoneBoundMarker.inclusiveClose(false, to, deletion);
+
+        List<Unfiltered> hotUnfiltered = new ArrayList<>();
+        hotUnfiltered.add(row(BASE + 1, 1.0, HOT_WT));
+        hotUnfiltered.add(open);
+        hotUnfiltered.add(close);
+        Iterator<Unfiltered> hotContents = hotUnfiltered.iterator();
+        UnfilteredRowIterator hotPartition =
+            new org.apache.cassandra.db.rows.AbstractUnfilteredRowIterator(metadata, k, DeletionTime.LIVE,
+                                                                           metadata.regularAndStaticColumns(),
+                                                                           Rows.EMPTY_STATIC_ROW, false,
+                                                                           EncodingStats.NO_STATS)
+            {
+                protected Unfiltered computeNext() { return hotContents.hasNext() ? hotContents.next() : endOfData(); }
+            };
+
+        // Two chunk rows: one at +2, inside the tombstoned range and older than it, and one at +4,
+        // outside it.
+        List<Row> chunk = List.of(row(BASE + 2, 99.0, CHUNK_WT), row(BASE + 4, 44.0, CHUNK_WT));
+        UnfilteredPartitionIterator merged = ChunkMergeUnfilteredIterator.wrap(
+            partitions(List.of(hotPartition)), List.of(k), dk -> chunk, metadata, false);
+
+        String out = drain(merged).get(0);
+        // The markers pass through, so the deletion information reaches Filter/reconciliation...
+        assertTrue(out, out.contains("|marker|"));
+        // ...and the reconciliation the merge performs has already eliminated the chunk row the
+        // range tombstone covers -- which is the entire reason the merge moved onto the unfiltered
+        // stream. Post-filter, the tombstone would have been purged and 99.0 would have come back.
+        assertFalse(out, out.contains("2:99.0"));
+        // A chunk row outside the tombstoned range is untouched, as is the hot row.
+        assertTrue(out, out.contains("4:44.0"));
+        assertTrue(out, out.contains("1:1.0"));
+    }
+
+    @Test
+    public void closeReleasesEveryPartitionItStillHolds()
+    {
+        // A limit can stop the read after one partition while the next hot partition is already
+        // peeked. Dropping it leaks the SSTable/memtable iterator's ref-count and file descriptor.
+        DecoratedKey k1 = key("t1");                     // fully chunked: no hot partition
+        DecoratedKey k2 = key("t2");                     // hot partition, peeked but never consumed
+        CloseTracking k2Hot = new CloseTracking(partition(k2, false, List.of(row(BASE + 5, 5.0, HOT_WT))));
+
+        UnfilteredPartitionIterator merged = ChunkMergeUnfilteredIterator.wrap(
+            partitions(List.of(k2Hot)), List.of(k1, k2),
+            dk -> dk.equals(k1) ? List.of(row(BASE + 1, 1.0, CHUNK_WT)) : List.of(), metadata, false);
+
+        assertTrue(merged.hasNext());
+        merged.next().close();                           // take k1's synthetic partition and stop
+        assertFalse("k2's hot partition must still be held at this point", k2Hot.closed);
+
+        merged.close();
+        assertTrue("close() must release the partition it was still holding", k2Hot.closed);
     }
 
     @Test

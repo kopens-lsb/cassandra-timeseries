@@ -35,6 +35,7 @@ import org.apache.cassandra.db.rows.Unfiltered;
 import org.apache.cassandra.db.rows.UnfilteredRowIterator;
 import org.apache.cassandra.db.rows.UnfilteredRowIterators;
 import org.apache.cassandra.schema.TableMetadata;
+import org.apache.cassandra.utils.Throwables;
 
 /**
  * Merges rows decoded from the {@code __chunks} shadow table into a read's <b>unfiltered</b>
@@ -154,7 +155,33 @@ public final class ChunkMergeUnfilteredIterator implements UnfilteredPartitionIt
     @Override
     public void close()
     {
-        hot.close();
+        // Everything held must be closed, not just `hot`. A limit (or an exception out of chunkRows,
+        // including the deliberate UnsupportedChunkFormatException rethrow) can stop the read while a
+        // peeked hot partition or an already-built merged partition is still open, and those wrap
+        // live SSTable/memtable iterators -- dropping them leaks the ref-count and the file
+        // descriptor ("LEAK DETECTED"). Cassandra's own BaseIterator.close() closes its held `next`
+        // for exactly this reason. `hot` is closed last and unconditionally.
+        Throwable failure = closeQuietly(peekedHot, null);
+        failure = closeQuietly(next, failure);
+        peekedHot = null;
+        next = null;
+        failure = closeQuietly(hot, failure);
+        Throwables.maybeFail(failure);
+    }
+
+    private static Throwable closeQuietly(AutoCloseable closeable, Throwable failure)
+    {
+        if (closeable == null)
+            return failure;
+        try
+        {
+            closeable.close();
+        }
+        catch (Throwable t)
+        {
+            return Throwables.merge(failure, t);
+        }
+        return failure;
     }
 
     private UnfilteredRowIterator merge(UnfilteredRowIterator hotPartition, List<Row> synthetic)

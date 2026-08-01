@@ -876,10 +876,21 @@ public abstract class ModificationStatement implements CQLStatement.SingleKeyspa
 
         SinglePartitionReadQuery readCommand = request.readCommand(nowInSeconds);
         FilteredPartition current;
+        // Tiered storage: a CAS precondition read must see the RAW base rows, never the hot+chunk
+        // merge. A condition is a compare-and-set on a base row, and Paxos can only linearize what it
+        // owns -- a chunk is a blob in another table that no ballot orders, so "IF col = x" evaluated
+        // against reconstructed cold data would be a guarantee nothing can honour. Chunked data is
+        // therefore invisible to LWT conditions (documented); writing to it is separately governed by
+        // TieredWrites, which still runs on the update this request builds.
+        org.apache.cassandra.db.timeseries.tiering.TransparentReads.enterInternalBypass();
         try (ReadExecutionController executionController = readCommand.executionController();
              PartitionIterator iter = readCommand.executeInternal(executionController))
         {
             current = FilteredPartition.create(PartitionIterators.getOnlyElement(iter, readCommand));
+        }
+        finally
+        {
+            org.apache.cassandra.db.timeseries.tiering.TransparentReads.exitInternalBypass();
         }
 
         if (!request.appliesTo(current))
@@ -917,8 +928,7 @@ public abstract class ModificationStatement implements CQLStatement.SingleKeyspa
             SingleTableSinglePartitionUpdatesCollector collector = new SingleTableSinglePartitionUpdatesCollector(metadata, updatedColumns);
             addUpdates(collector, keys, state, options, local, timestamp, nowInSeconds, requestTime);
             // local means this is test or internal things that are bypassing distributed system modification/checks
-            return guardTieredColdWrites(collector.toMutations(state, local ? PotentialTxnConflicts.ALLOW : PotentialTxnConflicts.DISALLOW),
-                                         nowInSeconds);
+            return guardTieredColdWrites(collector.toMutations(state, local ? PotentialTxnConflicts.ALLOW : PotentialTxnConflicts.DISALLOW));
         }
         else
         {
@@ -926,8 +936,7 @@ public abstract class ModificationStatement implements CQLStatement.SingleKeyspa
             SingleTableUpdatesCollector collector = new SingleTableUpdatesCollector(metadata, updatedColumns, perPartitionKeyCounts);
             addUpdates(collector, keys, state, options, local, timestamp, nowInSeconds, requestTime);
             // local means this is test or internal things that are bypassing distributed system modification/checks
-            return guardTieredColdWrites(collector.toMutations(state, local ? PotentialTxnConflicts.ALLOW : PotentialTxnConflicts.DISALLOW),
-                                         nowInSeconds);
+            return guardTieredColdWrites(collector.toMutations(state, local ? PotentialTxnConflicts.ALLOW : PotentialTxnConflicts.DISALLOW));
         }
     }
 
@@ -939,11 +948,14 @@ public abstract class ModificationStatement implements CQLStatement.SingleKeyspa
      * all caught by the same test -- what matters is whether a tombstone lands on cold clusterings.
      * No-op for every table without a timeseries_tiering policy.
      *
+     * Conditional (LWT) statements do not come through here at all -- see
+     * {@code TieredWrites.guardColdUpdate}, called from {@code CQL3CasRequest.makeUpdates}.
+     *
      * @return {@code mutations}, for chaining
      */
-    private static <T extends IMutation> List<T> guardTieredColdWrites(List<T> mutations, long nowInSeconds)
+    private static <T extends IMutation> List<T> guardTieredColdWrites(List<T> mutations)
     {
-        org.apache.cassandra.db.timeseries.tiering.TieredWrites.guardColdMutations(mutations, nowInSeconds);
+        org.apache.cassandra.db.timeseries.tiering.TieredWrites.guardColdMutations(mutations);
         return mutations;
     }
 

@@ -64,7 +64,7 @@ public final class TieredWrites
      * @throws InvalidRequestException if any of {@code mutations} tombstones data at or below the
      * hot boundary of a tiering-enabled table
      */
-    public static void guardColdMutations(List<? extends IMutation> mutations, long nowInSec)
+    public static void guardColdMutations(List<? extends IMutation> mutations)
     {
         // The re-encoder's own range delete is exactly the write this guard exists to reject -- it is
         // also the one write that is allowed to do it, because it deletes rows it has just copied
@@ -74,10 +74,23 @@ public final class TieredWrites
 
         for (IMutation mutation : mutations)
             for (PartitionUpdate update : mutation.getPartitionUpdates())
-                guard(update, nowInSec);
+                guard(update);
     }
 
-    private static void guard(PartitionUpdate update, long nowInSec)
+    /**
+     * As {@link #guardColdMutations}, for the one update a conditional (LWT/CAS) write builds --
+     * {@code CQL3CasRequest.makeUpdates} never goes through {@code getMutations}, so without this
+     * {@code DELETE ... IF EXISTS} would walk straight past the rule. Covers conditional BATCH too:
+     * that path builds its update through the same request object.
+     */
+    public static void guardColdUpdate(PartitionUpdate update)
+    {
+        if (TransparentReads.inInternalBypass())
+            return;
+        guard(update);
+    }
+
+    private static void guard(PartitionUpdate update)
     {
         TableMetadata metadata = update.metadata();
         TieringPolicy policy;

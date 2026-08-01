@@ -308,6 +308,11 @@ public class CQL3CasRequest implements CASRequest
 
         PartitionUpdate partitionUpdate = updateBuilder.build();
         IndexRegistry.obtain(metadata).validate(partitionUpdate, clientState);
+        // Tiered storage: cold data is immutable once chunked. Conditional writes never build their
+        // update through ModificationStatement.getMutations, so this is where the rule has to be
+        // enforced for `DELETE ... IF EXISTS` and friends -- and for conditional BATCH, which shares
+        // this request object.
+        org.apache.cassandra.db.timeseries.tiering.TieredWrites.guardColdUpdate(partitionUpdate);
 
         return partitionUpdate;
     }

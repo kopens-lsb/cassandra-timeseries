@@ -135,9 +135,14 @@ public final class TransparentReads
         {
             // Range scans cannot merge chunks (no partition context) and would otherwise silently
             // see hot rows only - warn instead of returning a quietly incomplete answer (v1 scope;
-            // spec section 3.3).
-            ClientWarn.instance.warn("tiered table " + metadata.keyspace + '.' + metadata.name +
-                                     ": range scans read hot rows only; query by partition key for merged hot+cold reads");
+            // spec section 3.3). The hook now fires from several places per query, so de-duplicate
+            // against the warnings already accumulated for THIS request rather than sending the
+            // client the same sentence three times.
+            String warning = "tiered table " + metadata.keyspace + '.' + metadata.name +
+                             ": range scans read hot rows only; query by partition key for merged hot+cold reads";
+            List<String> existing = ClientWarn.instance.getWarnings();
+            if (existing == null || !existing.contains(warning))
+                ClientWarn.instance.warn(warning);
             return hot;
         }
 

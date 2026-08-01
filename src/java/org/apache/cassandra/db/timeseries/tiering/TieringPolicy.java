@@ -21,6 +21,7 @@ import java.nio.ByteBuffer;
 import java.nio.charset.CharacterCodingException;
 import java.util.Map;
 import java.util.Set;
+import java.util.concurrent.ConcurrentHashMap;
 import java.util.concurrent.TimeUnit;
 import java.util.regex.Matcher;
 import java.util.regex.Pattern;
@@ -143,11 +144,26 @@ public final class TieringPolicy
      * @throws ConfigurationException if the extension value is present but invalid (malformed JSON,
      * unknown keys, or a rule violation).
      */
+    /**
+     * Parsed policies, keyed by the raw extension bytes. {@link #fromTable} is on the hot path of
+     * every read (up to three times per read command via the tiered-read hooks, and twice more under
+     * replica filtering protection) and of every write, so re-parsing the JSON each time is pure
+     * waste. The key is the immutable extension value itself, so a policy edit is a different key and
+     * cannot be served stale; the number of distinct policy documents in a cluster is tiny, and the
+     * map is cleared wholesale rather than grown without bound if that ever stops being true.
+     */
+    private static final ConcurrentHashMap<ByteBuffer, TieringPolicy> PARSED = new ConcurrentHashMap<>();
+    private static final int MAX_CACHED_POLICIES = 1024;
+
     public static TieringPolicy fromTable(TableMetadata metadata)
     {
         ByteBuffer value = metadata.params.extensions.get(EXTENSION_KEY);
         if (value == null)
             return null;
+
+        TieringPolicy cached = PARSED.get(value);
+        if (cached != null)
+            return cached;
 
         String json;
         try
@@ -159,7 +175,13 @@ public final class TieringPolicy
             throw new ConfigurationException(format("%s extension value is not valid UTF-8: %s", EXTENSION_KEY, e.getMessage()));
         }
 
-        return parse(json);
+        // Deliberately NOT computeIfAbsent: parse() throws on an invalid policy, and an invalid
+        // policy must keep throwing every time it is read rather than be cached as anything.
+        TieringPolicy policy = parse(json);
+        if (PARSED.size() >= MAX_CACHED_POLICIES)
+            PARSED.clear();
+        PARSED.put(value, policy);
+        return policy;
     }
 
     /**
@@ -261,6 +283,8 @@ public final class TieringPolicy
      *     (view maintenance reads the deleted base rows and issues the matching view deletions), but
      *     transparent reads only reconstruct rows for the <em>base</em> table, so the view would
      *     permanently lose everything older than {@code hot_window} with no error anywhere.</li>
+     *     <li>the table being a <b>materialized view</b> itself (as opposed to having one) -- the
+     *     policy belongs on the base table; a view's rows are derived and nothing would chunk them.</li>
      *     <li>a partition key column named like one of the chunk table's own columns
      *     ({@link ChunkTables#RESERVED_COLUMN_NAMES}) -- the mirrored chunk table would declare that
      *     name twice.</li>
@@ -271,6 +295,14 @@ public final class TieringPolicy
      */
     public static String unsupportedSchemaError(TableMetadata metadata)
     {
+        // A policy on the VIEW itself, rather than on its base table. Nothing would ever chunk it --
+        // the re-encoder's writes go through the normal write path, which a view rejects -- and its
+        // rows are derived, so the honest answer is that a view is not a tiering target at all.
+        if (metadata.isView())
+            return format("'%s' is a materialized view: put the timeseries_tiering policy on the base " +
+                           "table instead. A view's rows are derived from its base table, so there is nothing " +
+                           "for the re-encoder to own", metadata.name);
+
         if (metadata.clusteringColumns().size() != 1)
             return format("expected exactly 1 clustering column, found %d: a chunk encodes one time axis, " +
                            "so the table must be clustered by time alone",

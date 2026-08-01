@@ -638,7 +638,12 @@ public final class ColumnarChunkCodec
 
         if (constant)
         {
-            ByteBuffer constValue = ByteBuffer.wrap(meta.constBytes).asReadOnlyBuffer();
+            // NOT asReadOnlyBuffer(): a read-only HEAP buffer reports hasArray() == false and
+            // isDirect() == false, so Cassandra's FastByteOperations takes its direct-buffer branch
+            // and dereferences the (zero) `address` field -- a JVM-level SIGSEGV the moment anything
+            // compares a decoded value, which ordinary cell reconciliation does. The backing arrays
+            // are private to this decoder and no caller mutates them.
+            ByteBuffer constValue = ByteBuffer.wrap(meta.constBytes);
             for (int r = 0; r < rowCount; r++)
                 if (allPresent || meta.presence[r])
                     rowValues[r] = constValue.duplicate();
@@ -711,7 +716,7 @@ public final class ColumnarChunkCodec
                 int p = 0;
                 for (int r = 0; r < rowCount; r++)
                     if (allPresent || meta.presence[r])
-                        rowValues[r] = ByteBuffer.wrap(values[p++]).asReadOnlyBuffer();
+                        rowValues[r] = ByteBuffer.wrap(values[p++]);   // writable: see the constant path above
                 break;
             }
             default:

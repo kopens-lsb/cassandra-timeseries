@@ -430,6 +430,194 @@ public class TieredStorageColumnsTest extends CQLTester
     }
 
     @Test
+    public void conditionalDeleteOfChunkedDataIsRejected() throws Throwable
+    {
+        // LWT/CAS builds its update in CQL3CasRequest.makeUpdates and never goes through
+        // ModificationStatement.getMutations, so without a guard there `IF` was a way straight past
+        // the immutability rule. The condition must be one that PASSES against a non-existent base
+        // row (chunked data is invisible to LWT conditions -- see below), or the statement no-ops
+        // before it ever builds an update.
+        chunkOneRow();
+        assertRejectedAsColdWrite("DELETE FROM %s WHERE tag = 't' AND ts = ? IF value = null", new Date(0L));
+        assertRejectedAsColdWrite("DELETE value FROM %s WHERE tag = 't' AND ts = ? IF quality = null", new Date(0L));
+    }
+
+    @Test
+    public void conditionalUpdateToNullOfChunkedDataIsRejected() throws Throwable
+    {
+        chunkOneRow();
+        assertRejectedAsColdWrite("UPDATE %s SET value = null WHERE tag = 't' AND ts = ? IF quality = null",
+                                  new Date(0L));
+    }
+
+    @Test
+    public void aConditionalBatchCannotSmuggleAColdDeleteThrough() throws Throwable
+    {
+        chunkOneRow();
+        assertRejectedAsColdWrite("BEGIN BATCH " +
+                                  "DELETE value FROM %s WHERE tag = 't' AND ts = ? IF quality = null " +
+                                  "APPLY BATCH", new Date(0L));
+    }
+
+    @Test
+    public void aConditionalWriteOfARealValueToAColdClusteringStillSucceeds() throws Throwable
+    {
+        // The rule is about UN-writing cold data; a conditional late correction is still legal.
+        chunkOneRow();
+        execute("UPDATE %s SET quality = 7 WHERE tag = 't' AND ts = ? IF value = null", new Date(0L));
+        UntypedResultSet rows = execute("SELECT value, quality FROM %s WHERE tag = 't' AND ts = ?", new Date(0L));
+        assertEquals(7, rows.one().getInt("quality"));
+        assertEquals("the columns the UPDATE did not name still come from the chunk",
+                     1.5, rows.one().getDouble("value"), 0.0);
+    }
+
+    @Test
+    public void lwtConditionsDoNotSeeChunkedData() throws Throwable
+    {
+        // Documented limitation, and the reason the conditions above are written against null: a CAS
+        // precondition read deliberately bypasses the hot+chunk merge, because Paxos can only
+        // linearize data it owns and a chunk is a blob in another table that no ballot orders. So a
+        // chunked row reads as ABSENT to `IF`, and `IF EXISTS` simply does not apply -- it writes
+        // nothing, which is safe, rather than deleting cold data.
+        chunkOneRow();
+        UntypedResultSet applied = execute("DELETE FROM %s WHERE tag = 't' AND ts = ? IF EXISTS", new Date(0L));
+        assertFalse("IF EXISTS must not apply against a chunked row", applied.one().getBoolean("[applied]"));
+        // ...and the row is untouched.
+        assertEquals(1.5, execute("SELECT value FROM %s WHERE tag = 't' AND ts = ?", new Date(0L))
+                          .one().getDouble("value"), 0.0);
+    }
+
+    // ---- end-to-end: a tombstone written while the row was hot must survive re-encoding ----
+
+    /**
+     * Real-world sequence, and the only one the immutability rule leaves legal: delete something,
+     * it ages out, tiering runs over its window. The delete must hold both before and after the
+     * chunk is written, and the chunk must not contain the deleted data.
+     */
+    private String loadRecentWindowForDeletion() throws Throwable
+    {
+        String table = createTable("CREATE TABLE %s (tag text, ts timestamp, value double, quality int, " +
+                                   "PRIMARY KEY (tag, ts))");
+        setPolicy("{\"hot_window\":\"2h\",\"chunk_window\":\"1h\"}");
+        return table;
+    }
+
+    /** Hour-aligned start of the CURRENT window, so the rows below are unambiguously hot right now. */
+    private static long currentWindowStart()
+    {
+        return (System.currentTimeMillis() / HOUR) * HOUR;
+    }
+
+    @Test
+    public void aCellDeletedWhileHotStaysDeletedAfterReEncoding() throws Throwable
+    {
+        loadRecentWindowForDeletion();
+        long base = currentWindowStart();
+        for (int i = 0; i < 3; i++)
+            execute("INSERT INTO %s (tag, ts, value, quality) VALUES ('t', ?, ?, 192)",
+                    new Date(base + i * 60_000L), i + 1.0);
+
+        // Legal: still inside hot_window.
+        execute("DELETE value FROM %s WHERE tag = 't' AND ts = ?", new Date(base + 60_000L));
+        assertFalse(execute("SELECT value FROM %s WHERE tag = 't' AND ts = ?", new Date(base + 60_000L))
+                    .one().has("value"));
+
+        // Now let the window age out and re-encode it.
+        assertEquals(1, new TieredStorageService().runOnce(KEYSPACE, currentTable(), base + 5 * HOUR).windowsEncoded);
+
+        UntypedResultSet rows = execute("SELECT ts, value, quality FROM %s WHERE tag = 't'");
+        assertEquals(3, rows.size());
+        UntypedResultSet.Row[] all = rows.stream().toArray(UntypedResultSet.Row[]::new);
+        assertEquals(1.0, all[0].getDouble("value"), 0.0);
+        assertFalse("the cell deleted while hot must not come back from the chunk", all[1].has("value"));
+        assertEquals(192, all[1].getInt("quality"));
+        assertEquals(3.0, all[2].getDouble("value"), 0.0);
+
+        // ...and the chunk itself never held it.
+        ColumnarCursor cursor = ColumnarChunkCodec.cursor(execute(chunkSelectQuery(), "t", new Date(base))
+                                                          .one().getBytes("payload"), null);
+        assertTrue(cursor.advance());
+        assertTrue(cursor.advance());
+        assertEquals(base + 60_000L, cursor.timestamp());
+        assertTrue("the chunk must not carry the deleted cell", cursor.isNull("value"));
+    }
+
+    @Test
+    public void aRowDeletedWhileHotStaysDeletedAfterReEncoding() throws Throwable
+    {
+        loadRecentWindowForDeletion();
+        long base = currentWindowStart();
+        for (int i = 0; i < 3; i++)
+            execute("INSERT INTO %s (tag, ts, value) VALUES ('t', ?, ?)", new Date(base + i * 60_000L), i + 1.0);
+
+        execute("DELETE FROM %s WHERE tag = 't' AND ts = ?", new Date(base + 60_000L));
+        assertEquals(2, execute("SELECT ts FROM %s WHERE tag = 't'").size());
+
+        assertEquals(1, new TieredStorageService().runOnce(KEYSPACE, currentTable(), base + 5 * HOUR).windowsEncoded);
+
+        UntypedResultSet rows = execute("SELECT ts, value FROM %s WHERE tag = 't'");
+        assertEquals("the row deleted while hot must not come back from the chunk", 2, rows.size());
+        UntypedResultSet.Row[] all = rows.stream().toArray(UntypedResultSet.Row[]::new);
+        assertEquals(new Date(base), all[0].getTimestamp("ts"));
+        assertEquals(new Date(base + 120_000L), all[1].getTimestamp("ts"));
+        assertEquals(2, execute(chunkSelectQuery(), "t", new Date(base)).one().getInt("samples"));
+    }
+
+    @Test
+    public void aRangeDeletedWhileHotStaysDeletedAfterReEncoding() throws Throwable
+    {
+        loadRecentWindowForDeletion();
+        long base = currentWindowStart();
+        for (int i = 0; i < 4; i++)
+            execute("INSERT INTO %s (tag, ts, value) VALUES ('t', ?, ?)", new Date(base + i * 60_000L), i + 1.0);
+
+        // Range delete over the first two, while all four are hot. The range tombstone's own
+        // timestamp is newer than every row's, so the re-encoder's delete does NOT remove it: it is
+        // still in the base partition when the merged read runs against the chunk.
+        execute("DELETE FROM %s WHERE tag = 't' AND ts >= ? AND ts < ?",
+                new Date(base), new Date(base + 120_000L));
+        assertEquals(2, execute("SELECT ts FROM %s WHERE tag = 't'").size());
+
+        assertEquals(1, new TieredStorageService().runOnce(KEYSPACE, currentTable(), base + 5 * HOUR).windowsEncoded);
+
+        UntypedResultSet rows = execute("SELECT ts, value FROM %s WHERE tag = 't'");
+        assertEquals("the range deleted while hot must not come back from the chunk", 2, rows.size());
+        UntypedResultSet.Row[] all = rows.stream().toArray(UntypedResultSet.Row[]::new);
+        assertEquals(3.0, all[0].getDouble("value"), 0.0);
+        assertEquals(4.0, all[1].getDouble("value"), 0.0);
+    }
+
+    // ---- the documented tie at exactly max_row_writetime + 1 ----
+
+    @Test
+    public void aLateRowAtExactlyMaxWritetimePlusOneTiesWithTheChunk() throws Throwable
+    {
+        // Chunk rows are reconstructed at max_row_writetime + 1 (ChunkReadSupport), so a late row
+        // written at exactly that microsecond TIES with the reconstruction, and Cassandra breaks cell
+        // ties by comparing the serialized values (larger wins). This test pins that documented
+        // hazard in both directions -- it is the price of (A), not a desirable behaviour.
+        createTable("CREATE TABLE %s (tag text, ts timestamp, value double, PRIMARY KEY (tag, ts))");
+        setPolicy("{\"hot_window\":\"2h\",\"chunk_window\":\"1h\"}");
+        execute("INSERT INTO %s (tag, ts, value) VALUES ('bigger', ?, 1.0) USING TIMESTAMP 100", new Date(0L));
+        execute("INSERT INTO %s (tag, ts, value) VALUES ('smaller', ?, 1.0) USING TIMESTAMP 100", new Date(0L));
+        execute("INSERT INTO %s (tag, ts, value) VALUES ('bigger', ?, 9.0) USING TIMESTAMP 150", new Date(4 * HOUR));
+        execute("INSERT INTO %s (tag, ts, value) VALUES ('smaller', ?, 9.0) USING TIMESTAMP 150", new Date(4 * HOUR));
+        assertEquals(2, new TieredStorageService().runOnce(KEYSPACE, currentTable(), 5 * HOUR).windowsEncoded);
+
+        // maxWt is 100, so the reconstruction sits at 101; write both late rows at exactly 101.
+        execute("INSERT INTO %s (tag, ts, value) VALUES ('bigger', ?, 2.0) USING TIMESTAMP 101", new Date(0L));
+        execute("INSERT INTO %s (tag, ts, value) VALUES ('smaller', ?, 0.5) USING TIMESTAMP 101", new Date(0L));
+
+        // 2.0 sorts above 1.0 as big-endian IEEE-754 bytes, so the late row wins...
+        assertEquals(2.0, execute("SELECT value FROM %s WHERE tag = 'bigger' AND ts = ?", new Date(0L))
+                          .one().getDouble("value"), 0.0);
+        // ...and 0.5 sorts below 1.0, so the STALE CHUNK VALUE wins. This is the documented hazard:
+        // a late correction to a smaller value, written at exactly maxWt + 1, is lost.
+        assertEquals(1.0, execute("SELECT value FROM %s WHERE tag = 'smaller' AND ts = ?", new Date(0L))
+                          .one().getDouble("value"), 0.0);
+    }
+
+    @Test
     public void writingRealValuesToColdClusteringsIsStillAllowed() throws Throwable
     {
         // Only UN-writing cold data is refused. A late correction is a supported operation: the
