@@ -27,6 +27,11 @@ import java.util.TreeMap;
 import java.util.concurrent.TimeUnit;
 import java.util.function.LongUnaryOperator;
 
+import com.google.common.annotations.VisibleForTesting;
+
+import org.slf4j.Logger;
+import org.slf4j.LoggerFactory;
+
 import org.apache.cassandra.db.ColumnFamilyStore;
 import org.apache.cassandra.db.SerializationHeader;
 import org.apache.cassandra.db.commitlog.CommitLogPosition;
@@ -40,6 +45,7 @@ import org.apache.cassandra.io.sstable.format.SSTableReader;
 import org.apache.cassandra.io.sstable.format.SSTableWriter;
 import org.apache.cassandra.io.sstable.metadata.MetadataCollector;
 import org.apache.cassandra.schema.TableId;
+import org.apache.cassandra.utils.NoSpamLogger;
 import org.apache.cassandra.utils.TimeUUID;
 
 /**
@@ -48,14 +54,33 @@ import org.apache.cassandra.utils.TimeUUID;
  * section 4). Used for both memtable flush and streaming, which share the
  * {@code ColumnFamilyStore.createSSTableMultiWriter} hook.
  *
- * Per-window writers are created lazily in the flush directory; the partition-level deletion and
- * static row are replicated into every window output containing the partition (plan D3), so a
- * whole-window drop can never lose deletion metadata covering other windows. Unlike
+ * Per-window writers are created lazily in the flush directory. The partition-level deletion and the
+ * static row are NOT replicated into every window: each is routed exactly once, to the window its own
+ * write timestamp names (static cells individually) — see {@link WindowRoutingIterator} for why, and
+ * for why that is safe against whole-window retention drops. Unlike
  * {@link org.apache.cassandra.db.compaction.unified.ShardedMultiWriter} this splits WITHIN
- * partitions (routing every row/marker), not just between them.
+ * partitions (routing every timestamped element), not just between them.
  */
 public class TimeWindowSplittingMultiWriter implements SSTableMultiWriter
 {
+    private static final Logger logger = LoggerFactory.getLogger(TimeWindowSplittingMultiWriter.class);
+
+    /**
+     * Cap on concurrently-open per-window writers. Each writer holds data, index, filter and CRC file
+     * descriptors plus write buffers, so an unbounded fan-out (a backfill flush or a legacy spanning
+     * stream covering a year at {@code window_size=1h} wants ~8,760) exhausts file descriptors or heap.
+     *
+     * <p>Beyond the cap, further windows are <em>snapped</em> onto an already-open writer instead of
+     * failing: routing is asked for the snapped window key, so each partition still yields at most one
+     * slice per writer and nothing has to be merged. The resulting sstable spans windows and classifies
+     * FREEZING, and {@code SplitRefreezeCompactionTask} re-splits it later from a smaller input — each
+     * pass peels off up to {@code maxWindowWriters} windows, so the process converges rather than
+     * looping. Failing the write instead was rejected: this writer is on the memtable-flush and
+     * bootstrap-stream paths, where an exception blocks writes or aborts a bootstrap.
+     */
+    @VisibleForTesting
+    static volatile int maxWindowWriters = 1000;
+
     private final ColumnFamilyStore cfs;
     private final Descriptor descriptor;
     private final long keyCount;
@@ -63,6 +88,7 @@ public class TimeWindowSplittingMultiWriter implements SSTableMultiWriter
     private final TimeUUID pendingRepair;
     private final boolean isTransient;
     private final IntervalSet<CommitLogPosition> commitLogPositions;
+    private final int sstableLevel;
     private final SerializationHeader header;
     private final Collection<Index.Group> indexGroups;
     private final ILifecycleTransaction txn;
@@ -77,6 +103,7 @@ public class TimeWindowSplittingMultiWriter implements SSTableMultiWriter
                                           TimeUUID pendingRepair,
                                           boolean isTransient,
                                           IntervalSet<CommitLogPosition> commitLogPositions,
+                                          int sstableLevel,
                                           SerializationHeader header,
                                           Collection<Index.Group> indexGroups,
                                           ILifecycleTransaction txn,
@@ -90,6 +117,7 @@ public class TimeWindowSplittingMultiWriter implements SSTableMultiWriter
         this.pendingRepair = pendingRepair;
         this.isTransient = isTransient;
         this.commitLogPositions = commitLogPositions;
+        this.sstableLevel = sstableLevel;
         this.header = header;
         this.indexGroups = indexGroups;
         this.txn = txn;
@@ -103,10 +131,37 @@ public class TimeWindowSplittingMultiWriter implements SSTableMultiWriter
         if (partition.isReverseOrder())
             throw new IllegalStateException("Window-splitting writer only supports forward iteration");
 
-        // Header placement (deletion/static once, in its own window) is WindowRoutingIterator's
-        // contract - see slices() for the rationale (plan D3, revised).
-        for (Map.Entry<Long, UnfilteredRowIterator> entry : WindowRoutingIterator.slices(partition, windowStartOfMillis, tableResolution).entrySet())
+        // Header placement (deletion and static cells routed by their own timestamps) is
+        // WindowRoutingIterator's contract - see slices() for the rationale.
+        for (Map.Entry<Long, UnfilteredRowIterator> entry : WindowRoutingIterator.slices(partition, routingFunction(), tableResolution).entrySet())
             writerFor(entry.getKey()).append(entry.getValue());
+    }
+
+    /**
+     * The window function routing is asked to use. Below the writer cap this is the strategy's own
+     * window arithmetic; at the cap it additionally snaps unknown windows onto an open writer, so a
+     * partition can never produce two slices targeting one writer (which would append the same
+     * partition key twice).
+     */
+    private LongUnaryOperator routingFunction()
+    {
+        if (writers.size() < maxWindowWriters)
+            return windowStartOfMillis;
+
+        NoSpamLogger.log(logger, NoSpamLogger.Level.WARN, "window-writer-cap", 1, TimeUnit.MINUTES,
+                         "{}.{} reached the cap of {} concurrent window writers while writing {}; further " +
+                         "windows are folded onto open writers, producing window-spanning sstables that a " +
+                         "later split-refreeze has to break up. window_size is very likely far too small for " +
+                         "the write-timestamp spread of this data.",
+                         cfs.getKeyspaceName(), cfs.getTableName(), maxWindowWriters, descriptor);
+
+        return millis -> {
+            long window = windowStartOfMillis.applyAsLong(millis);
+            if (writers.containsKey(window))
+                return window;
+            Map.Entry<Long, SSTableWriter> floor = writers.floorEntry(window);
+            return floor != null ? floor.getKey() : writers.firstKey();
+        };
     }
 
     private SSTableWriter writerFor(long windowStart)
@@ -115,18 +170,29 @@ public class TimeWindowSplittingMultiWriter implements SSTableMultiWriter
         if (writer == null)
         {
             Descriptor desc = writers.isEmpty() ? descriptor : cfs.newSSTableDescriptor(descriptor.directory);
-            writer = createWriter(desc);
+            writer = createWriter(desc, writers.size() + 1);
             writers.put(windowStart, writer);
         }
         return writer;
     }
 
-    private SSTableWriter createWriter(Descriptor desc)
+    /**
+     * @param writerOrdinal 1-based index of the writer being created, used to taper the per-writer key
+     *        estimate. Unlike {@link org.apache.cassandra.db.compaction.unified.ShardedMultiWriter},
+     *        whose shards partition the key space so that {@code keyCount / shards} is exact, windows
+     *        do <em>not</em>: the same partition key can legitimately appear in every window, so
+     *        dividing by the final writer count would under-size every bloom filter. Tapering as
+     *        {@code keyCount / ordinal} keeps the first (overwhelmingly the largest, in steady state)
+     *        writer at the full estimate while bounding the aggregate at {@code keyCount * ln(N)}
+     *        instead of {@code keyCount * N}.
+     */
+    private SSTableWriter createWriter(Descriptor desc, int writerOrdinal)
     {
         MetadataCollector metadataCollector = new MetadataCollector(cfs.metadata().comparator)
+                                              .sstableLevel(sstableLevel)
                                               .commitLogIntervals(commitLogPositions != null ? commitLogPositions : IntervalSet.empty());
         return desc.getFormat().getWriterFactory().builder(desc)
-                   .setKeyCount(keyCount)
+                   .setKeyCount(Math.max(1, keyCount / writerOrdinal))
                    .setRepairedAt(repairedAt)
                    .setPendingRepair(pendingRepair)
                    .setTransientSSTable(isTransient)
@@ -218,7 +284,14 @@ public class TimeWindowSplittingMultiWriter implements SSTableMultiWriter
     {
         Throwable t = accumulate;
         for (SSTableWriter writer : writers.values())
+        {
+            // Untrack before aborting, exactly as SimpleSSTableMultiWriter and ShardedMultiWriter do:
+            // RangeAwareSSTableWriter can abort a zero-byte per-directory writer while its siblings
+            // commit on the same transaction, and a deleted file that keeps its ADD record in the
+            // LogFile turns into leftover-verification noise (or a failure) on the next restart.
+            txn.untrackNew(writer);
             t = writer.abort(t);
+        }
         return t;
     }
 

@@ -18,12 +18,15 @@
 
 package org.apache.cassandra.db.compaction;
 
+import java.util.HashMap;
 import java.util.List;
 import java.util.Map;
 import java.util.Set;
 import java.util.TreeMap;
 import java.util.concurrent.TimeUnit;
 import java.util.function.LongUnaryOperator;
+
+import com.google.common.util.concurrent.RateLimiter;
 
 import org.slf4j.Logger;
 import org.slf4j.LoggerFactory;
@@ -41,6 +44,7 @@ import org.apache.cassandra.io.sstable.SSTableRewriter;
 import org.apache.cassandra.io.sstable.format.SSTableReader;
 import org.apache.cassandra.io.sstable.format.SSTableWriter;
 import org.apache.cassandra.io.sstable.metadata.MetadataCollector;
+import org.apache.cassandra.io.util.File;
 import org.apache.cassandra.utils.FBUtilities;
 import org.apache.cassandra.utils.Throwables;
 import org.apache.cassandra.utils.TimeUUID;
@@ -55,9 +59,13 @@ import org.apache.cassandra.utils.TimeUUID;
  *
  * Write choreography follows anticompaction (CompactionManager.antiCompactGroup): several
  * {@link SSTableRewriter}s over one shared {@link LifecycleTransaction}, committed together after
- * the originals are obsoleted. Spanning sstables cannot be produced by TSCS itself any more (the
- * flush/streaming writer splits at boundaries); they exist only from pre-T3 data or a strategy
- * switch, so this path is a one-shot migration per sstable.
+ * the originals are obsoleted.
+ * <p>
+ * Most spanning sstables are legacy - pre-T3 data or a strategy switch - so this is normally a
+ * one-shot migration per sstable. TSCS can also produce one deliberately, when a partition is too
+ * large to window-route on heap or when a flush hits the per-writer cap; those converge over
+ * successive splits, and anything that does not converge is parked by the strategy's no-progress
+ * guard instead of being rewritten forever.
  */
 public class SplitRefreezeCompactionTask extends AbstractCompactionTask
 {
@@ -92,13 +100,24 @@ public class SplitRefreezeCompactionTask extends AbstractCompactionTask
     protected void runMayThrow()
     {
         Set<SSTableReader> originals = transaction.originals();
+        // Checked before dereferencing, not after: asserts are disabled in production, so an assert
+        // placed below the iterator().next() would never guard anything (M7).
+        if (originals.size() != 1)
+            throw new IllegalStateException("split-refreeze rewrites exactly one spanning sstable, got " + originals);
         SSTableReader spanning = originals.iterator().next();
-        assert originals.size() == 1 : "split-refreeze rewrites exactly one spanning sstable, got " + originals;
+
+        checkDiskSpace(originals);
 
         long nowInSec = FBUtilities.nowInSeconds();
         long maxDataAge = CompactionTask.getMaxDataAge(originals);
         Map<Long, SSTableRewriter> rewriters = new TreeMap<>();
         Throwable err = null;
+
+        RateLimiter limiter = CompactionManager.instance.getRateLimiter();
+        double compressionRatio = spanning.getCompressionRatio();
+        if (compressionRatio == MetadataCollector.NO_COMPRESSION_RATIO)
+            compressionRatio = 1.0;
+        long lastBytesScanned = 0;
 
         try (SharedTxn shared = new SharedTxn(transaction);
              ISSTableScanner scanner = spanning.getScanner();
@@ -116,6 +135,11 @@ public class SplitRefreezeCompactionTask extends AbstractCompactionTask
                         for (Map.Entry<Long, UnfilteredRowIterator> entry : WindowRoutingIterator.slices(partition, windowStartOfMillis, tableResolution).entrySet())
                             rewriterFor(rewriters, entry.getKey(), shared, maxDataAge, originals).append(entry.getValue());
                     }
+                    // Obey compaction_throughput like every other compaction does (M6): this rewrites a
+                    // whole sstable and would otherwise run at unthrottled disk speed.
+                    long bytesScanned = scanner.getBytesScanned();
+                    CompactionManager.instance.compactionRateLimiterAcquire(limiter, bytesScanned, lastBytesScanned, compressionRatio);
+                    lastBytesScanned = bytesScanned;
                 }
 
                 for (SSTableRewriter rewriter : rewriters.values())
@@ -147,6 +171,35 @@ public class SplitRefreezeCompactionTask extends AbstractCompactionTask
             err = Throwables.close(err, rewriters.values());
             if (err != null)
                 Throwables.maybeFail(err);
+        }
+    }
+
+    /**
+     * The disk-space pre-flight an ordinary {@link CompactionTask} runs before writing a byte (M6).
+     * A split rewrites the whole input, so it needs roughly the input's size free. Deliberately a plain
+     * {@link RuntimeException} and not an {@code FSWriteError}: the latter is what
+     * {@code disk_failure_policy: stop} reacts to by taking the node out of the ring, and running out of
+     * room for an optional maintenance rewrite is not a disk failure. The window simply stays FREEZING
+     * and the split is retried on a later round.
+     */
+    private void checkDiskSpace(Set<SSTableReader> originals)
+    {
+        if (!cfs.isCompactionDiskSpaceCheckEnabled())
+            return;
+
+        long writeSize = cfs.getExpectedCompactedFileSize(originals, OperationType.COMPACTION);
+        List<File> directories = cfs.getDirectoriesForFiles(originals);
+        Map<File, Long> expectedNewWriteSize = new HashMap<>();
+        long perDirectory = writeSize / Math.max(directories.size(), 1);
+        for (File directory : directories)
+            expectedNewWriteSize.put(directory, perDirectory);
+
+        if (!cfs.getDirectories().hasDiskSpaceForCompactionsAndStreams(expectedNewWriteSize,
+                                                                       CompactionManager.instance.active.estimatedRemainingWriteToDiskBytes()))
+        {
+            CompactionManager.instance.incrementAborted();
+            throw new RuntimeException(String.format("Not enough space for split-refreeze (%s) of %s.%s, expected write size = %d",
+                                                     transaction.opIdString(), cfs.getKeyspaceName(), cfs.name, writeSize));
         }
     }
 

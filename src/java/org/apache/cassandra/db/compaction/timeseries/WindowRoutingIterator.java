@@ -19,19 +19,27 @@
 package org.apache.cassandra.db.compaction.timeseries;
 
 import java.util.ArrayList;
+import java.util.Collections;
 import java.util.Iterator;
 import java.util.List;
 import java.util.Map;
 import java.util.NavigableMap;
 import java.util.TreeMap;
+import java.util.TreeSet;
 import java.util.concurrent.TimeUnit;
 import java.util.function.LongUnaryOperator;
 
 import com.google.common.annotations.VisibleForTesting;
+import com.google.common.collect.Iterators;
 
+import org.slf4j.Logger;
+import org.slf4j.LoggerFactory;
+
+import org.apache.cassandra.db.Clustering;
 import org.apache.cassandra.db.DeletionTime;
 import org.apache.cassandra.db.LivenessInfo;
 import org.apache.cassandra.db.rows.AbstractUnfilteredRowIterator;
+import org.apache.cassandra.db.rows.BTreeRow;
 import org.apache.cassandra.db.rows.Cell;
 import org.apache.cassandra.db.rows.ColumnData;
 import org.apache.cassandra.db.rows.ComplexColumnData;
@@ -41,36 +49,97 @@ import org.apache.cassandra.db.rows.Row;
 import org.apache.cassandra.db.rows.Rows;
 import org.apache.cassandra.db.rows.Unfiltered;
 import org.apache.cassandra.db.rows.UnfilteredRowIterator;
+import org.apache.cassandra.utils.NoSpamLogger;
 
 /**
- * Routes the {@link Unfiltered}s of one partition into per-time-window buckets, keyed by window
- * start in milliseconds. This is the core primitive behind TSCS T3's window-boundary splits
- * (design spec section 4): every output bucket, written to its own sstable, is fully contained in
- * one time window on the <em>write-timestamp</em> axis — the same axis T1/T2 classify sstables by.
+ * Routes the contents of one partition into per-time-window buckets, keyed by window start in
+ * milliseconds. This is the core primitive behind TSCS T3's window-boundary splits (design spec
+ * section 4): every output bucket, written to its own sstable, is fully contained in one time window
+ * on the <em>write-timestamp</em> axis — the same axis T1/T2 classify sstables by.
  *
- * Routing rules (plan D2):
+ * <h2>Routing granularity: individually-timestamped elements, not whole rows</h2>
+ *
+ * A row is atomic; its timestamps are not. Routing a whole {@link Row} by the maximum of its
+ * timestamps cannot uphold the containment invariant, because sstable min-timestamp metadata is the
+ * <em>minimum</em> over every cell/liveness/deletion it contains ({@code MetadataCollector.update}),
+ * while the freeze classifier demands {@code windowStartFor(min) == windowStartFor(max)}. An
+ * ordinary {@code INSERT} at T_old followed by an {@code UPDATE} of a different column at T_new
+ * merges into one row whose timestamps straddle a window boundary; whichever single window such a
+ * row is sent to, the output sstable still straddles, classifies FREEZING forever and is re-selected
+ * for a split rewrite on every background round.
+ *
+ * So every element that carries its own write timestamp is routed on its own:
  * <ul>
- *   <li>a {@link Row} routes by the maximum of its primary-key liveness timestamp, row-deletion
- *       timestamp and all cell/complex-deletion timestamps;</li>
- *   <li>a {@link RangeTombstoneBoundMarker} routes by its deletion timestamp — an open/close pair
- *       shares one deletion time and therefore travels together;</li>
+ *   <li>the primary-key liveness info, by its timestamp;</li>
+ *   <li>the row deletion, by its {@code markedForDeleteAt};</li>
+ *   <li>every simple cell, by its timestamp;</li>
+ *   <li>every complex (collection) deletion, by its {@code markedForDeleteAt}, and every cell
+ *       inside a complex column by its own timestamp;</li>
+ *   <li>the partition-level deletion, by its {@code markedForDeleteAt};</li>
+ *   <li>every static cell, by its own timestamp (the static row is split exactly like a regular one);</li>
+ *   <li>a {@link RangeTombstoneBoundMarker} by its deletion timestamp — an open/close pair shares one
+ *       deletion time and therefore travels together;</li>
  *   <li>a {@link RangeTombstoneBoundaryMarker} whose close- and open-deletions fall in different
  *       windows is decomposed into its corresponding close and open bound markers, each routed
  *       separately.</li>
  * </ul>
  *
- * Each bucket preserves the original clustering order (it is a subsequence of a sorted stream).
- * The partition-level deletion and static row are NOT routed — callers replicate them into every
- * output containing this partition (plan D3), so window-level whole-sstable drops cannot lose a
- * partition deletion covering other windows.
+ * An output sstable therefore only ever contains timestamps from inside its own window, so its min
+ * and max are both contained and the window classifies FROZEN.
+ *
+ * <p>This is semantically sound and is not a new idea: Cassandra already stores one row's cells
+ * across many sstables and reconciles them at read time, so a per-window cell subset is an ordinary
+ * sstable. Two consequences are deliberate:
+ * <ul>
+ *   <li>a row emitted into window B may have <b>no</b> primary-key liveness, because the liveness
+ *       went to window A. That is exactly what an {@code UPDATE}-created row looks like, and no
+ *       liveness is synthesised to "fix" it — doing so would change delete semantics;</li>
+ *   <li>a row with nothing at all in a given window is not emitted into that window.</li>
+ * </ul>
+ *
+ * <p>Whole-window retention drops stay safe because a deletion always lands in a window at least as
+ * new as everything it shadows, and drops proceed oldest-first: by the time a deletion's window is
+ * dropped, every window it could still shadow is already gone.
+ *
+ * <p>Each bucket preserves the original clustering order (it is a subsequence of a sorted stream).
  */
 public final class WindowRoutingIterator
 {
+    private static final Logger logger = LoggerFactory.getLogger(WindowRoutingIterator.class);
+
+    /** Window key used for "no window" (no partition deletion / no static content). */
+    private static final long NO_WINDOW = Long.MIN_VALUE;
+
+    /**
+     * Per-partition routing budget. Splitting is inherently a buffering operation: an
+     * {@link org.apache.cassandra.io.sstable.format.SSTableWriter} consumes a partition's iterator in
+     * one pass and accepts each partition key exactly once, so the whole partition has to be
+     * distributed before any window's slice can be appended. At flush that is bounded by a memtable
+     * partition, but {@code SplitRefreezeCompactionTask} applies the same routing to arbitrarily large
+     * compaction partitions.
+     *
+     * <p>Rather than materialise a million-row time-series partition on heap, routing gives up on
+     * splitting a partition once it exceeds this budget: the buffered prefix and the unread remainder
+     * are handed back as a single lazy slice (see {@link #slices}), which keeps memory bounded and the
+     * data correct at the cost of one window-spanning sstable. That sstable is visible — it classifies
+     * FREEZING, and the strategy's no-progress guard parks it with a WARN naming the sstable rather
+     * than rewriting it forever.
+     *
+     * <p>Failing instead was rejected: this routing is on the memtable flush path, where an exception
+     * fails the whole flush and blocks writes.
+     */
+    @VisibleForTesting
+    static volatile long maxBufferedBytesPerPartition = 64L * 1024 * 1024;
+
     private WindowRoutingIterator()
     {
     }
 
     /**
+     * Routes one partition's {@link Unfiltered}s into per-window buckets, splitting rows at element
+     * granularity (see the class javadoc). Materialises the whole partition; {@link #slices} is the
+     * bounded entry point used on the flush/compaction paths.
+     *
      * @param partition            the partition's unfiltereds, in clustering order (forward iteration)
      * @param windowStartOfMillis  maps an epoch-millisecond timestamp to its window start
      * @param tableResolution      the table's timestamp resolution (cell timestamps → milliseconds)
@@ -80,34 +149,209 @@ public final class WindowRoutingIterator
                                                              LongUnaryOperator windowStartOfMillis,
                                                              TimeUnit tableResolution)
     {
-        NavigableMap<Long, List<Unfiltered>> buckets = new TreeMap<>();
+        return routeBounded(partition, windowStartOfMillis, tableResolution, Long.MAX_VALUE).buckets;
+    }
+
+    /** The outcome of routing a partition body: per-window buckets, plus whether the budget ran out. */
+    private static final class Routed
+    {
+        final NavigableMap<Long, List<Unfiltered>> buckets = new TreeMap<>();
+        /** Non-null once the budget was exhausted: the unread remainder of the source partition. */
+        Iterator<Unfiltered> remainder;
+        /** The newest window observed before giving up — where the unsplit remainder is parked. */
+        long overflowWindow = NO_WINDOW;
+
+        boolean overflowed()
+        {
+            return remainder != null;
+        }
+    }
+
+    private static Routed routeBounded(UnfilteredRowIterator partition,
+                                       LongUnaryOperator windowStartOfMillis,
+                                       TimeUnit tableResolution,
+                                       long budgetBytes)
+    {
+        Routed routed = new Routed();
+        long buffered = 0;
         while (partition.hasNext())
         {
             Unfiltered unfiltered = partition.next();
+            if (buffered > budgetBytes)
+            {
+                // Give up splitting this partition: hand the caller the buffered prefix plus the
+                // unread tail as one slice. See maxBufferedBytesPerPartition for the rationale.
+                routed.remainder = Iterators.concat(Iterators.singletonIterator(unfiltered), partition);
+                routed.overflowWindow = routed.buckets.isEmpty() ? 0L : routed.buckets.lastKey();
+                return routed;
+            }
+            buffered += sizeOf(unfiltered);
+
             if (unfiltered instanceof RangeTombstoneBoundaryMarker)
             {
                 RangeTombstoneBoundaryMarker boundary = (RangeTombstoneBoundaryMarker) unfiltered;
-                long closeWindow = windowStartOfMillis.applyAsLong(toMillis(boundary.closeDeletionTime(false).markedForDeleteAt(), tableResolution));
-                long openWindow = windowStartOfMillis.applyAsLong(toMillis(boundary.openDeletionTime(false).markedForDeleteAt(), tableResolution));
+                long closeWindow = windowOf(boundary.closeDeletionTime(false).markedForDeleteAt(), windowStartOfMillis, tableResolution);
+                long openWindow = windowOf(boundary.openDeletionTime(false).markedForDeleteAt(), windowStartOfMillis, tableResolution);
                 if (closeWindow == openWindow)
                 {
-                    bucket(buckets, closeWindow).add(boundary);
+                    bucket(routed.buckets, closeWindow).add(boundary);
                 }
                 else
                 {
                     // The closing and opening deletions live in different windows: split the boundary
                     // so each window's sstable carries a self-contained marker.
-                    bucket(buckets, closeWindow).add(boundary.createCorrespondingCloseMarker(false));
-                    bucket(buckets, openWindow).add(boundary.createCorrespondingOpenMarker(false));
+                    bucket(routed.buckets, closeWindow).add(boundary.createCorrespondingCloseMarker(false));
+                    bucket(routed.buckets, openWindow).add(boundary.createCorrespondingOpenMarker(false));
                 }
+            }
+            else if (unfiltered instanceof RangeTombstoneBoundMarker)
+            {
+                RangeTombstoneBoundMarker marker = (RangeTombstoneBoundMarker) unfiltered;
+                bucket(routed.buckets, windowOf(marker.deletionTime().markedForDeleteAt(), windowStartOfMillis, tableResolution)).add(marker);
             }
             else
             {
-                long windowStart = windowStartOfMillis.applyAsLong(routingMillis(unfiltered, tableResolution));
-                bucket(buckets, windowStart).add(unfiltered);
+                for (Map.Entry<Long, Row> piece : splitRow((Row) unfiltered, windowStartOfMillis, tableResolution).entrySet())
+                    bucket(routed.buckets, piece.getKey()).add(piece.getValue());
             }
         }
-        return buckets;
+        return routed;
+    }
+
+    /**
+     * Splits one row into per-window pieces, one per window named by any of the row's own timestamps.
+     * A window with nothing in it gets no piece; no piece is ever an empty row (which the sstable
+     * writers' {@code Rows.collectStats} rightly refuses).
+     *
+     * <p>Pieces are built with a {@link BTreeRow#sortedBuilder()}: iterating a row yields its column
+     * data in comparator order, and complex cells in cell-path order after that column's complex
+     * deletion, so every per-window subset is handed to its builder already sorted — the same
+     * discipline {@code UnfilteredSerializer} uses when reading rows back off disk.
+     */
+    @VisibleForTesting
+    static NavigableMap<Long, Row> splitRow(Row row, LongUnaryOperator windowStartOfMillis, TimeUnit tableResolution)
+    {
+        // Overwhelmingly the common case: every timestamp in the row names the same window, so the row
+        // is already contained and is passed through untouched - no rebuild, no allocation, and callers
+        // keep the original instance.
+        long single = singleWindowOf(row, windowStartOfMillis, tableResolution);
+        if (single != NOT_SINGLE_WINDOW)
+        {
+            NavigableMap<Long, Row> whole = new TreeMap<>();
+            whole.put(single, row);
+            return whole;
+        }
+
+        NavigableMap<Long, Row.Builder> builders = new TreeMap<>();
+        Clustering<?> clustering = row.clustering();
+
+        LivenessInfo liveness = row.primaryKeyLivenessInfo();
+        if (!liveness.isEmpty())
+            builderFor(builders, clustering, windowOf(liveness.timestamp(), windowStartOfMillis, tableResolution))
+                .addPrimaryKeyLivenessInfo(liveness);
+
+        Row.Deletion deletion = row.deletion();
+        if (!deletion.isLive())
+            builderFor(builders, clustering, windowOf(deletion.time().markedForDeleteAt(), windowStartOfMillis, tableResolution))
+                .addRowDeletion(deletion);
+
+        for (ColumnData cd : row)
+        {
+            if (cd.column().isSimple())
+            {
+                Cell<?> cell = (Cell<?>) cd;
+                builderFor(builders, clustering, windowOf(cell.timestamp(), windowStartOfMillis, tableResolution)).addCell(cell);
+            }
+            else
+            {
+                ComplexColumnData complex = (ComplexColumnData) cd;
+                DeletionTime complexDeletion = complex.complexDeletion();
+                if (!complexDeletion.isLive())
+                    builderFor(builders, clustering, windowOf(complexDeletion.markedForDeleteAt(), windowStartOfMillis, tableResolution))
+                        .addComplexDeletion(complex.column(), complexDeletion);
+                for (Cell<?> cell : complex)
+                    builderFor(builders, clustering, windowOf(cell.timestamp(), windowStartOfMillis, tableResolution)).addCell(cell);
+            }
+        }
+
+        NavigableMap<Long, Row> pieces = new TreeMap<>();
+        for (Map.Entry<Long, Row.Builder> entry : builders.entrySet())
+        {
+            Row piece = entry.getValue().build();
+            // A piece can still come out empty if every cell offered to it was shadowed by a row
+            // deletion routed to the same window; such a window simply gets nothing.
+            if (!piece.isEmpty())
+                pieces.put(entry.getKey(), piece);
+        }
+        return pieces;
+    }
+
+    /** Sentinel for {@link #singleWindowOf}: this row's timestamps do not all name one window. */
+    private static final long NOT_SINGLE_WINDOW = Long.MIN_VALUE;
+
+    /**
+     * @return the one window every timestamp in {@code row} belongs to, or {@link #NOT_SINGLE_WINDOW}
+     *         if they differ (or the row carries no timestamp at all, in which case there is nothing to
+     *         route and the split path correctly produces no pieces).
+     */
+    private static long singleWindowOf(Row row, LongUnaryOperator windowStartOfMillis, TimeUnit tableResolution)
+    {
+        long window = NOT_SINGLE_WINDOW;
+
+        LivenessInfo liveness = row.primaryKeyLivenessInfo();
+        if (!liveness.isEmpty())
+            window = windowOf(liveness.timestamp(), windowStartOfMillis, tableResolution);
+
+        Row.Deletion deletion = row.deletion();
+        if (!deletion.isLive())
+        {
+            long w = windowOf(deletion.time().markedForDeleteAt(), windowStartOfMillis, tableResolution);
+            if (window != NOT_SINGLE_WINDOW && w != window)
+                return NOT_SINGLE_WINDOW;
+            window = w;
+        }
+
+        for (ColumnData cd : row)
+        {
+            if (cd.column().isSimple())
+            {
+                long w = windowOf(((Cell<?>) cd).timestamp(), windowStartOfMillis, tableResolution);
+                if (window != NOT_SINGLE_WINDOW && w != window)
+                    return NOT_SINGLE_WINDOW;
+                window = w;
+            }
+            else
+            {
+                ComplexColumnData complex = (ComplexColumnData) cd;
+                if (!complex.complexDeletion().isLive())
+                {
+                    long w = windowOf(complex.complexDeletion().markedForDeleteAt(), windowStartOfMillis, tableResolution);
+                    if (window != NOT_SINGLE_WINDOW && w != window)
+                        return NOT_SINGLE_WINDOW;
+                    window = w;
+                }
+                for (Cell<?> cell : complex)
+                {
+                    long w = windowOf(cell.timestamp(), windowStartOfMillis, tableResolution);
+                    if (window != NOT_SINGLE_WINDOW && w != window)
+                        return NOT_SINGLE_WINDOW;
+                    window = w;
+                }
+            }
+        }
+        return window;
+    }
+
+    private static Row.Builder builderFor(NavigableMap<Long, Row.Builder> builders, Clustering<?> clustering, long windowStart)
+    {
+        Row.Builder builder = builders.get(windowStart);
+        if (builder == null)
+        {
+            builder = BTreeRow.sortedBuilder();
+            builder.newRow(clustering);
+            builders.put(windowStart, builder);
+        }
+        return builder;
     }
 
     private static List<Unfiltered> bucket(NavigableMap<Long, List<Unfiltered>> buckets, long windowStart)
@@ -116,13 +360,14 @@ public final class WindowRoutingIterator
     }
 
     /**
-     * Routes a partition into per-window {@link UnfilteredRowIterator} slices ready to be appended
-     * to per-window writers. The partition header (partition-level deletion, static row) is placed
-     * exactly ONCE, in the window of its own max write timestamp (plan D3, revised): replicating it
-     * would stamp old deletion timestamps into newer windows' sstable metadata, leaving them
-     * permanently "spanning" for the freeze classifier. Read-time partition merge applies the
-     * deletion to all windows anyway, and whole-window retention drops proceed oldest-first, so by
-     * the time the header's window is dropped every window it could still shadow is already gone.
+     * Routes a partition into per-window {@link UnfilteredRowIterator} slices ready to be appended to
+     * per-window writers. The partition-level deletion goes to the window of its own
+     * {@code markedForDeleteAt}, and the static row is split per static cell exactly like a regular
+     * row — so no slice ever carries a timestamp from outside its own window.
+     *
+     * <p>Non-header slices get {@link DeletionTime#LIVE} and {@link Rows#EMPTY_STATIC_ROW}, which
+     * {@code MetadataCollector} ignores; that is what keeps a live partition deletion from polluting
+     * every window's min-timestamp metadata.
      *
      * @return window start (ms) → that window's slice; empty map for a truly empty partition
      */
@@ -132,33 +377,57 @@ public final class WindowRoutingIterator
     {
         DeletionTime partitionDeletion = partition.partitionLevelDeletion();
         Row staticRow = partition.staticRow();
-        NavigableMap<Long, List<Unfiltered>> routed = route(partition, windowStartOfMillis, tableResolution);
 
-        long headerWindow = Long.MIN_VALUE;
-        if (!partitionDeletion.isLive() || !staticRow.isEmpty())
-        {
-            long headerMillis = Long.MIN_VALUE;
-            if (!partitionDeletion.isLive())
-                headerMillis = toMillis(partitionDeletion.markedForDeleteAt(), tableResolution);
-            if (!staticRow.isEmpty())
-                headerMillis = Math.max(headerMillis, routingMillis(staticRow, tableResolution));
-            headerWindow = windowStartOfMillis.applyAsLong(headerMillis);
-            routed.computeIfAbsent(headerWindow, k -> List.of());
-        }
+        long deletionWindow = partitionDeletion.isLive()
+                              ? NO_WINDOW
+                              : windowOf(partitionDeletion.markedForDeleteAt(), windowStartOfMillis, tableResolution);
+        NavigableMap<Long, Row> statics = staticRow.isEmpty()
+                                          ? Collections.emptyNavigableMap()
+                                          : splitRow(staticRow, windowStartOfMillis, tableResolution);
+
+        Routed routed = routeBounded(partition, windowStartOfMillis, tableResolution, maxBufferedBytesPerPartition);
 
         NavigableMap<Long, UnfilteredRowIterator> slices = new TreeMap<>();
-        for (Map.Entry<Long, List<Unfiltered>> entry : routed.entrySet())
+        if (routed.overflowed())
         {
-            boolean carriesHeader = entry.getKey() == headerWindow;
-            slices.put(entry.getKey(), new WindowSlice(partition,
-                                                       carriesHeader ? partitionDeletion : DeletionTime.LIVE,
-                                                       carriesHeader ? staticRow : Rows.EMPTY_STATIC_ROW,
-                                                       entry.getValue().iterator()));
+            // Degraded, memory-bounded path: one slice carrying the whole partition, header included.
+            NoSpamLogger.log(logger, NoSpamLogger.Level.WARN, "window-routing-buffer", 1, TimeUnit.MINUTES,
+                             "Partition {} of {}.{} exceeded the {}-byte window-routing buffer; writing it " +
+                             "unsplit into window {}. The resulting sstable will span windows and will be " +
+                             "parked by the no-progress guard rather than re-split - consider a larger " +
+                             "window_size, or splitting this partition.",
+                             partition.partitionKey(), partition.metadata().keyspace, partition.metadata().name,
+                             maxBufferedBytesPerPartition, routed.overflowWindow);
+
+            List<Unfiltered> prefix = new ArrayList<>();
+            for (List<Unfiltered> bucket : routed.buckets.values())
+                prefix.addAll(bucket);
+            // Buckets are per-window; concatenating them loses clustering order, so re-sort the
+            // buffered prefix before splicing the (still ordered) remainder behind it.
+            prefix.sort(partition.metadata().comparator);
+            Row overflowStatic = staticRow.isEmpty() ? Rows.EMPTY_STATIC_ROW : staticRow;
+            slices.put(routed.overflowWindow,
+                       new WindowSlice(partition, partitionDeletion, overflowStatic,
+                                       Iterators.concat(prefix.iterator(), routed.remainder)));
+            return slices;
+        }
+
+        TreeSet<Long> windows = new TreeSet<>(routed.buckets.keySet());
+        windows.addAll(statics.keySet());
+        if (deletionWindow != NO_WINDOW)
+            windows.add(deletionWindow);
+
+        for (long window : windows)
+        {
+            List<Unfiltered> content = routed.buckets.getOrDefault(window, List.of());
+            Row windowStatic = statics.getOrDefault(window, Rows.EMPTY_STATIC_ROW);
+            DeletionTime windowDeletion = window == deletionWindow ? partitionDeletion : DeletionTime.LIVE;
+            slices.put(window, new WindowSlice(partition, windowDeletion, windowStatic, content.iterator()));
         }
         return slices;
     }
 
-    /** One window's view of a partition: original key/columns/stats + that window's unfiltereds. */
+    /** One window's view of a partition: original key/columns/stats + that window's content. */
     private static final class WindowSlice extends AbstractUnfilteredRowIterator
     {
         private final Iterator<Unfiltered> content;
@@ -182,41 +451,15 @@ public final class WindowRoutingIterator
         }
     }
 
-    /** The write-timestamp (converted to epoch millis) that decides an unfiltered's window. */
-    @VisibleForTesting
-    static long routingMillis(Unfiltered unfiltered, TimeUnit tableResolution)
+    private static int sizeOf(Unfiltered unfiltered)
     {
-        if (unfiltered instanceof RangeTombstoneBoundMarker)
-            return toMillis(((RangeTombstoneBoundMarker) unfiltered).deletionTime().markedForDeleteAt(), tableResolution);
-
-        Row row = (Row) unfiltered;
-        long max = Long.MIN_VALUE;
-        if (!row.primaryKeyLivenessInfo().isEmpty())
-            max = Math.max(max, row.primaryKeyLivenessInfo().timestamp());
-        if (!row.deletion().isLive())
-            max = Math.max(max, row.deletion().time().markedForDeleteAt());
-        for (ColumnData cd : row)
-        {
-            if (cd instanceof ComplexColumnData)
-            {
-                ComplexColumnData complex = (ComplexColumnData) cd;
-                if (!complex.complexDeletion().isLive())
-                    max = Math.max(max, complex.complexDeletion().markedForDeleteAt());
-                for (Cell<?> cell : complex)
-                    max = Math.max(max, cell.timestamp());
-            }
-            else
-            {
-                max = Math.max(max, ((Cell<?>) cd).timestamp());
-            }
-        }
-        if (max == Long.MIN_VALUE || max == LivenessInfo.NO_TIMESTAMP)
-            throw new IllegalStateException("Row with no usable write timestamp cannot be window-routed: " + row);
-        return toMillis(max, tableResolution);
+        // Range tombstone markers carry only a bound and one or two deletion times; a flat estimate is
+        // enough for a buffer budget whose only job is to stop unbounded growth.
+        return unfiltered instanceof Row ? ((Row) unfiltered).dataSize() : 64;
     }
 
-    private static long toMillis(long rawTimestamp, TimeUnit tableResolution)
+    private static long windowOf(long rawTimestamp, LongUnaryOperator windowStartOfMillis, TimeUnit tableResolution)
     {
-        return TimeUnit.MILLISECONDS.convert(rawTimestamp, tableResolution);
+        return windowStartOfMillis.applyAsLong(TimeUnit.MILLISECONDS.convert(rawTimestamp, tableResolution));
     }
 }

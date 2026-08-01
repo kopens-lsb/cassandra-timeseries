@@ -39,6 +39,7 @@ import org.apache.cassandra.db.marshal.TimestampType;
 import org.apache.cassandra.db.marshal.UTF8Type;
 import org.apache.cassandra.db.rows.BTreeRow;
 import org.apache.cassandra.db.rows.BufferCell;
+import org.apache.cassandra.db.rows.Cell;
 import org.apache.cassandra.db.rows.RangeTombstoneBoundMarker;
 import org.apache.cassandra.db.rows.RangeTombstoneBoundaryMarker;
 import org.apache.cassandra.db.rows.Row;
@@ -69,6 +70,8 @@ public class WindowRoutingIteratorTest
     private static TableMetadata metadata;
     private static ColumnMetadata value;
     private static ColumnMetadata value2;
+    private static ColumnMetadata unit;
+    private static ColumnMetadata unit2;
     private static DecoratedKey key;
 
     @BeforeClass
@@ -81,9 +84,13 @@ public class WindowRoutingIteratorTest
                                 .addClusteringColumn("timestamp", TimestampType.instance)
                                 .addRegularColumn("value", DoubleType.instance)
                                 .addRegularColumn("value2", DoubleType.instance)
+                                .addStaticColumn("unit", UTF8Type.instance)
+                                .addStaticColumn("unit2", UTF8Type.instance)
                                 .build();
         value = metadata.getColumn(ByteBufferUtil.bytes("value"));
         value2 = metadata.getColumn(ByteBufferUtil.bytes("value2"));
+        unit = metadata.getColumn(ByteBufferUtil.bytes("unit"));
+        unit2 = metadata.getColumn(ByteBufferUtil.bytes("unit2"));
         key = Murmur3Partitioner.instance.decorateKey(ByteBufferUtil.bytes("tag-1"));
     }
 
@@ -145,13 +152,43 @@ public class WindowRoutingIteratorTest
         assertEquals(List.of(w2), routed.get(BASE + HOUR_MS));
     }
 
+    /**
+     * The C1 defect, at routing granularity: a row whose two cells were written in different windows
+     * used to travel whole to the window of its max timestamp, leaving the older cell's timestamp in a
+     * newer window's sstable - which then had min and max in different windows and could never freeze.
+     * Each cell must now go to the window its own timestamp names.
+     */
     @Test
-    public void multiCellRowRoutesByMaxCellTimestamp()
+    public void multiCellRowSplitsPerCellWindow()
     {
         Row r = twoCellRow(BASE + 1, BASE + 1, BASE + HOUR_MS + 1);
         NavigableMap<Long, List<Unfiltered>> routed = route(List.of(r));
-        assertEquals(1, routed.size());
-        assertEquals(List.of(r), routed.get(BASE + HOUR_MS));
+        assertEquals(2, routed.size());
+
+        Row first = (Row) routed.get(BASE).get(0);
+        assertEquals(1, first.columnCount());
+        assertEquals(micros(BASE + 1), first.getCell(value).timestamp());
+
+        Row second = (Row) routed.get(BASE + HOUR_MS).get(0);
+        assertEquals(1, second.columnCount());
+        assertEquals(micros(BASE + HOUR_MS + 1), second.getCell(value2).timestamp());
+
+        // Both pieces keep the row's clustering, so read-time merge reassembles the original row.
+        assertEquals(r.clustering(), first.clustering());
+        assertEquals(r.clustering(), second.clustering());
+    }
+
+    /** No piece may carry a timestamp from outside its own window - that is the whole containment invariant. */
+    @Test
+    public void everyPieceIsContainedInItsWindow()
+    {
+        Row r = twoCellRow(BASE + 1, BASE + 1, BASE + HOUR_MS + 1);
+        NavigableMap<Long, List<Unfiltered>> routed = route(List.of(r));
+        for (java.util.Map.Entry<Long, List<Unfiltered>> entry : routed.entrySet())
+            for (Unfiltered u : entry.getValue())
+                for (Cell<?> cell : ((Row) u).cells())
+                    assertEquals("cell " + cell + " landed outside its window",
+                                 (long) entry.getKey(), WINDOW.applyAsLong(cell.timestamp() / 1000));
     }
 
     @Test
@@ -235,8 +272,13 @@ public class WindowRoutingIteratorTest
         assertEquals(List.of(r), routed.get(BASE + HOUR_MS));
     }
 
+    /**
+     * Primary-key liveness is just another timestamped element: it goes to its own window, and the older
+     * cell stays in its own. The piece left in the cell's window legitimately has NO liveness - exactly
+     * what an UPDATE-created row looks like - and none is synthesised, which would change delete semantics.
+     */
     @Test
-    public void livenessInfoBeatsOlderCells()
+    public void livenessInfoRoutesSeparatelyFromOlderCells()
     {
         BufferCell old = BufferCell.live(value, micros(BASE + 1), DoubleType.instance.decompose(1.0));
         Row r = BTreeRow.create(ck(BASE + 1),
@@ -244,8 +286,148 @@ public class WindowRoutingIteratorTest
                                 Row.Deletion.LIVE,
                                 BTree.build(List.of(old)));
         NavigableMap<Long, List<Unfiltered>> routed = route(List.of(r));
+        assertEquals(2, routed.size());
+
+        Row cellPiece = (Row) routed.get(BASE).get(0);
+        assertTrue("no liveness must be synthesised into the cell's window", cellPiece.primaryKeyLivenessInfo().isEmpty());
+        assertEquals(micros(BASE + 1), cellPiece.getCell(value).timestamp());
+
+        Row livenessPiece = (Row) routed.get(BASE + HOUR_MS).get(0);
+        assertEquals(micros(BASE + HOUR_MS + 8), livenessPiece.primaryKeyLivenessInfo().timestamp());
+        assertEquals(0, livenessPiece.columnCount());
+    }
+
+    /** A row deletion carries its own timestamp too, and must not drag newer cells into its window. */
+    @Test
+    public void rowDeletionRoutesSeparatelyFromNewerCells()
+    {
+        BufferCell newer = BufferCell.live(value, micros(BASE + HOUR_MS + 10), DoubleType.instance.decompose(1.0));
+        Row r = BTreeRow.create(ck(BASE + 1),
+                                org.apache.cassandra.db.LivenessInfo.EMPTY,
+                                Row.Deletion.regular(DeletionTime.build(micros(BASE + 5), 1000)),
+                                BTree.build(List.of(newer)));
+        NavigableMap<Long, List<Unfiltered>> routed = route(List.of(r));
+        assertEquals(2, routed.size());
+
+        Row deletionPiece = (Row) routed.get(BASE).get(0);
+        assertEquals(micros(BASE + 5), deletionPiece.deletion().time().markedForDeleteAt());
+        assertEquals(0, deletionPiece.columnCount());
+
+        Row cellPiece = (Row) routed.get(BASE + HOUR_MS).get(0);
+        assertTrue(cellPiece.deletion().isLive());
+        assertEquals(micros(BASE + HOUR_MS + 10), cellPiece.getCell(value).timestamp());
+    }
+
+    /** A row with nothing at all in a window must not be emitted into that window. */
+    @Test
+    public void windowsWithNothingGetNoRow()
+    {
+        Row r = row(BASE + 1, BASE + 1);
+        NavigableMap<Long, List<Unfiltered>> routed = route(List.of(r));
         assertEquals(1, routed.size());
-        assertEquals(List.of(r), routed.get(BASE + HOUR_MS));
+        assertTrue(routed.containsKey(BASE));
+    }
+
+    // ---------------------------------------------------------------------------------------------
+    // slices(): the partition header. Until now this method - the whole point of the D3 revision - had
+    // no test at all, and every partition built here used a null static row.
+    // ---------------------------------------------------------------------------------------------
+
+    /** A partition source that can carry a partition-level deletion and a static row. */
+    private static final class Source extends org.apache.cassandra.db.rows.AbstractUnfilteredRowIterator
+    {
+        private final java.util.Iterator<Unfiltered> content;
+
+        Source(DeletionTime partitionDeletion, Row staticRow, List<Unfiltered> content)
+        {
+            // Qualified: AbstractUnfilteredRowIterator has its own protected `metadata` field, which
+            // would otherwise shadow the outer class's static one inside this super() call.
+            super(WindowRoutingIteratorTest.metadata, WindowRoutingIteratorTest.key, partitionDeletion,
+                  WindowRoutingIteratorTest.metadata.regularAndStaticColumns(),
+                  staticRow == null ? org.apache.cassandra.db.rows.Rows.EMPTY_STATIC_ROW : staticRow,
+                  false, org.apache.cassandra.db.rows.EncodingStats.NO_STATS);
+            this.content = content.iterator();
+        }
+
+        @Override
+        protected Unfiltered computeNext()
+        {
+            return content.hasNext() ? content.next() : endOfData();
+        }
+    }
+
+    private static Row staticRow(long unitWriteMs, long unit2WriteMs)
+    {
+        BufferCell a = BufferCell.live(unit, micros(unitWriteMs), UTF8Type.instance.decompose("C"));
+        BufferCell b = BufferCell.live(unit2, micros(unit2WriteMs), UTF8Type.instance.decompose("F"));
+        return BTreeRow.create(Clustering.STATIC_CLUSTERING, org.apache.cassandra.db.LivenessInfo.EMPTY,
+                               Row.Deletion.LIVE, BTree.build(List.of(a, b)));
+    }
+
+    private static NavigableMap<Long, UnfilteredRowIterator> slices(DeletionTime partitionDeletion, Row staticRow, List<Unfiltered> content)
+    {
+        return WindowRoutingIterator.slices(new Source(partitionDeletion, staticRow, content), WINDOW, TimeUnit.MICROSECONDS);
+    }
+
+    /** Static cells are individually timestamped, so they split exactly like regular cells. */
+    @Test
+    public void staticCellsRouteToTheirOwnWindows()
+    {
+        NavigableMap<Long, UnfilteredRowIterator> sliced =
+            slices(DeletionTime.LIVE, staticRow(BASE + 3, BASE + HOUR_MS + 3), List.of());
+        assertEquals(2, sliced.size());
+
+        Row firstStatic = sliced.get(BASE).staticRow();
+        assertEquals(1, firstStatic.columnCount());
+        assertEquals(micros(BASE + 3), firstStatic.getCell(unit).timestamp());
+
+        Row secondStatic = sliced.get(BASE + HOUR_MS).staticRow();
+        assertEquals(1, secondStatic.columnCount());
+        assertEquals(micros(BASE + HOUR_MS + 3), secondStatic.getCell(unit2).timestamp());
+    }
+
+    /**
+     * The partition deletion goes to the window of its OWN timestamp, not to max(deletion, staticRow) -
+     * pairing it with a newer static row used to stamp an old deletion timestamp into a newer window's
+     * sstable metadata, which is the second path into the C1 loop.
+     */
+    @Test
+    public void partitionDeletionRoutesByItsOwnTimestampOnly()
+    {
+        DeletionTime deletion = DeletionTime.build(micros(BASE + 5), 1000);
+        NavigableMap<Long, UnfilteredRowIterator> sliced =
+            slices(deletion, staticRow(BASE + HOUR_MS + 7, BASE + HOUR_MS + 8), List.of());
+        assertEquals(2, sliced.size());
+
+        assertEquals(deletion, sliced.get(BASE).partitionLevelDeletion());
+        assertTrue("the static row's window must not inherit the old deletion timestamp",
+                   sliced.get(BASE + HOUR_MS).partitionLevelDeletion().isLive());
+    }
+
+    /** Exactly one slice carries the header; the rest get LIVE/EMPTY, which MetadataCollector ignores. */
+    @Test
+    public void nonHeaderSlicesCarryNoHeader()
+    {
+        DeletionTime deletion = DeletionTime.build(micros(BASE + 5), 1000);
+        NavigableMap<Long, UnfilteredRowIterator> sliced =
+            slices(deletion, null, List.of(row(BASE + 1, BASE + 1), row(BASE + 2, BASE + HOUR_MS + 2)));
+
+        int carryingDeletion = 0;
+        for (UnfilteredRowIterator slice : sliced.values())
+        {
+            if (!slice.partitionLevelDeletion().isLive())
+                carryingDeletion++;
+            else
+                assertTrue(slice.staticRow().isEmpty());
+        }
+        assertEquals(1, carryingDeletion);
+    }
+
+    /** A partition with nothing in it at all yields no slices. */
+    @Test
+    public void emptyPartitionYieldsNoSlices()
+    {
+        assertTrue(slices(DeletionTime.LIVE, null, List.of()).isEmpty());
     }
 
     @Test
