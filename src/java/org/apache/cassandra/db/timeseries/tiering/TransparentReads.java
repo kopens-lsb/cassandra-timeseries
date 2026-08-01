@@ -32,25 +32,23 @@ import org.slf4j.LoggerFactory;
 import org.apache.cassandra.cql3.QueryProcessor;
 import org.apache.cassandra.cql3.UntypedResultSet;
 import org.apache.cassandra.db.Clustering;
-import org.apache.cassandra.db.ClusteringBound;
 import org.apache.cassandra.db.ConsistencyLevel;
 import org.apache.cassandra.db.DecoratedKey;
 import org.apache.cassandra.db.ReadQuery;
-import org.apache.cassandra.db.SinglePartitionReadCommand;
+import org.apache.cassandra.db.SinglePartitionReadQuery;
 import org.apache.cassandra.db.Slices;
 import org.apache.cassandra.db.filter.ClusteringIndexFilter;
 import org.apache.cassandra.db.filter.ClusteringIndexNamesFilter;
 import org.apache.cassandra.db.filter.ClusteringIndexSliceFilter;
 import org.apache.cassandra.db.marshal.CompositeType;
 import org.apache.cassandra.db.marshal.TimestampType;
-import org.apache.cassandra.db.partitions.PartitionIterator;
+import org.apache.cassandra.db.partitions.UnfilteredPartitionIterator;
 import org.apache.cassandra.db.rows.Row;
 import org.apache.cassandra.db.timeseries.UnsupportedChunkFormatException;
 import org.apache.cassandra.exceptions.ConfigurationException;
 import org.apache.cassandra.schema.ColumnMetadata;
 import org.apache.cassandra.schema.TableMetadata;
 import org.apache.cassandra.service.ClientWarn;
-import org.apache.cassandra.utils.Clock;
 import org.apache.cassandra.utils.NoSpamLogger;
 
 import static java.lang.String.format;
@@ -58,12 +56,20 @@ import static java.lang.String.format;
 /**
  * SP3 transparent reads (design spec section 3.3.1): decides whether a SELECT on a tiering-enabled
  * table must merge in decoded chunk rows, fetches and decodes the relevant chunks at the user's
- * consistency level, and wraps the hot {@link PartitionIterator} with the merge decorator.
+ * consistency level, and wraps the hot {@link UnfilteredPartitionIterator} with the merge decorator.
  *
  * Activation requires ALL of: a valid tiering policy on the table; a single-partition (or IN) read
  * group; a slice or names clustering filter; and a requested time range reaching below the hot
  * boundary. Everything else returns the hot iterator untouched - the non-tiered fast path pays
  * nothing beyond one schema-extension lookup.
+ *
+ * <b>The wrap happens on the UNFILTERED stream</b>, before {@code Filter} purges tombstones, so
+ * deletes are reconciled by the ordinary read machinery instead of being invisible to the merge --
+ * see {@link ChunkMergeUnfilteredIterator}. Every unfiltered-to-filtered conversion point on a
+ * single-partition read path therefore calls {@link #maybeWrap}: the local ones
+ * ({@code SinglePartitionReadQuery.Group#executeInternal}, {@code AbstractReadQuery#executeInternal})
+ * and the coordinator ones ({@code DigestResolver#getData}, {@code DataResolver#getData},
+ * {@code DataResolver#resolveInternal}).
  */
 public final class TransparentReads
 {
@@ -90,11 +96,18 @@ public final class TransparentReads
         INTERNAL_BYPASS.set(Boolean.FALSE);
     }
 
+    /** True while this thread is inside tiering's own machinery (see {@link #enterInternalBypass}). */
+    public static boolean inInternalBypass()
+    {
+        return INTERNAL_BYPASS.get();
+    }
+
     /**
      * @param cl the user query's consistency level, or null for the internal/local execution path
      * @return the merged iterator, or {@code hot} itself when transparent reading does not apply
      */
-    public static PartitionIterator maybeWrap(TableMetadata metadata, ReadQuery query, PartitionIterator hot, ConsistencyLevel cl)
+    public static UnfilteredPartitionIterator maybeWrap(TableMetadata metadata, ReadQuery query,
+                                                        UnfilteredPartitionIterator hot, ConsistencyLevel cl)
     {
         if (INTERNAL_BYPASS.get())
             return hot;
@@ -110,7 +123,15 @@ public final class TransparentReads
         }
         if (policy == null)
             return hot;
-        if (!(query instanceof SinglePartitionReadCommand.Group))
+        // The hook fires both per read GROUP (the local path executes a whole group at once) and per
+        // read COMMAND (the coordinator resolves one partition at a time), so accept either shape and
+        // normalise to the list of single-partition queries this iterator will carry.
+        List<? extends SinglePartitionReadQuery> commands;
+        if (query instanceof SinglePartitionReadQuery.Group)
+            commands = ((SinglePartitionReadQuery.Group<?>) query).queries;
+        else if (query instanceof SinglePartitionReadQuery)
+            commands = Collections.singletonList((SinglePartitionReadQuery) query);
+        else
         {
             // Range scans cannot merge chunks (no partition context) and would otherwise silently
             // see hot rows only - warn instead of returning a quietly incomplete answer (v1 scope;
@@ -120,8 +141,7 @@ public final class TransparentReads
             return hot;
         }
 
-        SinglePartitionReadCommand.Group group = (SinglePartitionReadCommand.Group) query;
-        if (group.queries.isEmpty())
+        if (commands.isEmpty())
             return hot;
 
         // Every timestamp read below assumes exactly one timestamp clustering column -- what
@@ -131,7 +151,7 @@ public final class TransparentReads
         if (metadata.clusteringColumns().size() != 1)
             return hot;
 
-        SinglePartitionReadCommand first = group.queries.get(0);
+        SinglePartitionReadQuery first = commands.get(0);
         ClusteringIndexFilter filter = first.clusteringIndexFilter();
         // WITH CLUSTERING ORDER BY (ts DESC) wraps the clustering type in ReversedType, so both
         // Slices and the names filter's NavigableSet are ordered by DESCENDING timestamp: the
@@ -139,7 +159,7 @@ public final class TransparentReads
         // end bound its LOWER one. Reading them as if ascending produces a nonsensical (usually
         // empty) time range and silently serves no cold rows at all -- on exactly the DESC shape that
         // is the dominant time-series idiom.
-        boolean clusteringDescending = metadata.clusteringColumns().get(0).isReversedType();
+        boolean clusteringDescending = ColdBoundary.isDescending(metadata);
         // The order rows must be EMITTED in, expressed as timestamps: the hot iterator runs in
         // clustering-comparator order unless the filter reverses it, and comparator order is already
         // descending-by-timestamp on a DESC table.
@@ -153,10 +173,8 @@ public final class TransparentReads
             Slices slices = ((ClusteringIndexSliceFilter) filter).requestedSlices();
             if (slices.isEmpty())
                 return hot;
-            ClusteringBound<?> comparatorStart = slices.get(0).start();
-            ClusteringBound<?> comparatorEnd = slices.get(slices.size() - 1).end();
-            startMs = lowerBoundMs(clusteringDescending ? comparatorEnd : comparatorStart);
-            endMsExcl = upperBoundMsExclusive(clusteringDescending ? comparatorStart : comparatorEnd);
+            startMs = ColdBoundary.lowestMs(slices.get(0), clusteringDescending);
+            endMsExcl = ColdBoundary.highestMsExclusive(slices.get(slices.size() - 1), clusteringDescending);
         }
         else if (filter instanceof ClusteringIndexNamesFilter)
         {
@@ -165,38 +183,32 @@ public final class TransparentReads
                 return hot;
             Clustering<?> comparatorFirst = exactClusterings.first();
             Clustering<?> comparatorLast = exactClusterings.last();
-            startMs = clusteringMs(clusteringDescending ? comparatorLast : comparatorFirst);
-            endMsExcl = clusteringMs(clusteringDescending ? comparatorFirst : comparatorLast) + 1;
+            startMs = ColdBoundary.clusteringMs(clusteringDescending ? comparatorLast : comparatorFirst);
+            endMsExcl = ColdBoundary.clusteringMs(clusteringDescending ? comparatorFirst : comparatorLast) + 1;
         }
         else
         {
             return hot;
         }
 
-        long hotBoundary = Clock.Global.currentTimeMillis() - policy.hotWindowMillis;
+        long hotBoundary = ColdBoundary.hotBoundaryMs(policy);
         if (startMs >= hotBoundary)
             return hot;                                   // entirely within the hot window: fast path
 
-        List<DecoratedKey> keys = new ArrayList<>(group.queries.size());
-        for (SinglePartitionReadCommand command : group.queries)
+        List<DecoratedKey> keys = new ArrayList<>(commands.size());
+        for (SinglePartitionReadQuery command : commands)
             keys.add(command.partitionKey());
 
         long queryStartMs = startMs;
         long queryEndMsExcl = endMsExcl;
         NavigableSet<Clustering<?>> exact = exactClusterings;
         // chunkRows is told the TIMESTAMP order to emit in; the merge decorator is told whether the
-        // iterator runs against clustering-comparator order, which is filter.isReversed() -- the
+        // iterators run against clustering-comparator order, which is filter.isReversed() -- the
         // comparator itself already encodes the DESC-ness.
-        return ChunkMergePartitionIterator.wrap(hot, keys,
-                                                key -> chunkRows(metadata, policy, key, queryStartMs, queryEndMsExcl,
-                                                                 exact, emitDescending, cl),
-                                                metadata, filter.isReversed());
-    }
-
-    /** True when {@link #maybeWrap} returned a merge wrapper rather than the hot iterator itself. */
-    public static boolean isMerged(PartitionIterator iterator)
-    {
-        return iterator instanceof ChunkMergePartitionIterator;
+        return ChunkMergeUnfilteredIterator.wrap(hot, keys,
+                                                 key -> chunkRows(metadata, policy, key, queryStartMs, queryEndMsExcl,
+                                                                  exact, emitDescending, cl),
+                                                 metadata, filter.isReversed());
     }
 
     /** @param descending emit rows newest-timestamp-first (see {@code emitDescending} in {@link #maybeWrap}) */
@@ -314,35 +326,4 @@ public final class TransparentReads
         return result;
     }
 
-    /**
-     * The inclusive lower TIME bound expressed by a slice bound that restricts timestamps from below
-     * -- the comparator-order start on an ASC clustering, the comparator-order end on a DESC one. An
-     * unbounded bound is either BOTTOM (ASC) or TOP (DESC), hence both are tested.
-     */
-    private static long lowerBoundMs(ClusteringBound<?> bound)
-    {
-        if (bound.isBottom() || bound.isTop())
-            return Long.MIN_VALUE;
-        long ms = boundMs(bound);
-        return bound.isInclusive() ? ms : ms + 1;
-    }
-
-    /** The exclusive upper TIME bound of a slice bound that restricts timestamps from above (see above). */
-    private static long upperBoundMsExclusive(ClusteringBound<?> bound)
-    {
-        if (bound.isTop() || bound.isBottom())
-            return Long.MAX_VALUE;
-        long ms = boundMs(bound);
-        return bound.isInclusive() ? ms + 1 : ms;
-    }
-
-    private static long boundMs(ClusteringBound<?> bound)
-    {
-        return TimestampType.instance.compose(bound.bufferAt(0)).getTime();
-    }
-
-    private static long clusteringMs(Clustering<?> clustering)
-    {
-        return TimestampType.instance.compose(clustering.bufferAt(0)).getTime();
-    }
 }

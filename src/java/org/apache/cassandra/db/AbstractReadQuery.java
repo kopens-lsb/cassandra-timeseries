@@ -68,7 +68,10 @@ abstract class AbstractReadQuery extends MonitorableImpl implements ReadQuery
     @Override
     public PartitionIterator executeInternal(ReadExecutionController controller)
     {
-        return UnfilteredPartitionIterators.filter(executeLocally(controller), nowInSec());
+        // Tiered storage: merged before the filter so tombstones still shadow chunk-decoded rows.
+        // No-op for every table without a tiering policy.
+        return UnfilteredPartitionIterators.filter(
+            org.apache.cassandra.db.timeseries.tiering.TransparentReads.maybeWrap(metadata(), this, executeLocally(controller), null), nowInSec());
     }
 
     @Override

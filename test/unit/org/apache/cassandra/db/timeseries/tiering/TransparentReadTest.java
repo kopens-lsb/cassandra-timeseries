@@ -221,25 +221,30 @@ public class TransparentReadTest extends CQLTester
     }
 
     @Test
-    public void multiPageMergedReadFailsWithHint() throws Throwable
+    public void multiPageMergedReadReturnsEveryRow() throws Throwable
     {
+        // SP4: the merge moved inside the read machinery and now runs on each PAGE's own read
+        // command, so chunk rows flow through the same limits and counters as hot rows and paging
+        // composes with the merge. This used to fail with "spans multiple pages" -- a v1 restriction
+        // that only existed because the merge was bolted on after the pager had already counted.
+        // Also the only coverage of the COORDINATOR hook (DigestResolver.getData); every other test
+        // here goes through the local path.
         requireNetwork();
         createTable("CREATE TABLE %s (tag text, ts timestamp, value double, PRIMARY KEY (tag, ts))");
         setPolicy("{\"hot_window\":\"2h\",\"chunk_window\":\"1h\"}");
-        for (int i = 0; i < 3; i++)
-            execute("INSERT INTO %s (tag, ts, value) VALUES ('t1', ?, 1.0)", new Date(1000L * (i + 1)));
+        for (int i = 0; i < 5; i++)
+            execute("INSERT INTO %s (tag, ts, value) VALUES ('t1', ?, ?) USING TIMESTAMP ?",
+                    new Date(i * 600_000L), i * 1.0, 100L + i);
+        execute("INSERT INTO %s (tag, ts, value) VALUES ('t1', ?, 99.0) USING TIMESTAMP 200", new Date(4 * HOUR));
+        assertEquals(1L, new TieredStorageService().runOnce(KEYSPACE, currentTable(), 5 * HOUR).windowsEncoded);
 
-        // A full-range query on a tiering table activates the merge; needing a second page must fail
-        // with a remedy instead of silently duplicating or losing chunk rows (v1 scope).
-        try
-        {
-            executeNetWithPaging("SELECT * FROM %s WHERE tag = 't1'", 2).all();
-            fail("expected InvalidQueryException for a multi-page transparent tiered read");
-        }
-        catch (com.datastax.driver.core.exceptions.InvalidQueryException e)
-        {
-            assertTrue(e.getMessage(), e.getMessage().contains("spans multiple pages"));
-        }
+        // 6 rows (5 chunked + 1 hot) at page size 2 = three pages.
+        java.util.List<com.datastax.driver.core.Row> rows =
+            executeNetWithPaging("SELECT ts, value FROM %s WHERE tag = 't1'", 2).all();
+        assertEquals(6, rows.size());
+        for (int i = 0; i < 5; i++)
+            assertEquals(i * 1.0, rows.get(i).getDouble("value"), 0.0);
+        assertEquals(99.0, rows.get(5).getDouble("value"), 0.0);
     }
 
     @Test

@@ -56,7 +56,9 @@ import static org.junit.Assert.fail;
 public class ChunkReadSupportTest
 {
     private static final long BASE = 1_577_836_800_000L;             // 2020-01-01T00:00Z
-    private static final long WRITETIME = 1_650_000_000_000_000L;    // micros
+    private static final long WRITETIME = 1_650_000_000_000_000L;    // micros (max_row_writetime)
+    /** Reconstructed cells post-date the re-encoder's own tombstone by one micro -- see ChunkReadSupport. */
+    private static final long CELL_WRITETIME = WRITETIME + 1;
 
     private static TableMetadata metadata;
     private static ColumnMetadata valueColumn;
@@ -100,7 +102,7 @@ public class ChunkReadSupportTest
         assertEquals(TimestampType.instance.decompose(new Date(expectedTsMs)), row.clustering().bufferAt(0));
         Cell<?> cell = row.getCell(valueColumn);
         assertEquals(expectedValue, DoubleType.instance.compose(cell.buffer()), 0.0);
-        assertEquals(WRITETIME, cell.timestamp());
+        assertEquals(CELL_WRITETIME, cell.timestamp());
     }
 
     private static List<Row> decode(ByteBuffer payload)
@@ -189,8 +191,8 @@ public class ChunkReadSupportTest
         assertNull("a null quality must not produce a cell", rows.get(2).getCell(qualityColumn));
         assertEquals("", UTF8Type.instance.compose(rows.get(2).getCell(labelColumn).buffer()));
 
-        // Every cell carries the chunk's max_row_writetime.
-        assertEquals(WRITETIME, rows.get(0).getCell(valueColumn).timestamp());
+        // Every cell carries max_row_writetime + 1 (see ChunkReadSupport's class javadoc).
+        assertEquals(CELL_WRITETIME, rows.get(0).getCell(valueColumn).timestamp());
     }
 
     @Test
@@ -209,7 +211,7 @@ public class ChunkReadSupportTest
         Row row = rows.get(0);
         assertNull(row.getCell(valueColumn));
         assertFalse("an all-null sample must not decode to a phantom (dead) row", row.isEmpty());
-        assertEquals(WRITETIME, row.primaryKeyLivenessInfo().timestamp());
+        assertEquals(CELL_WRITETIME, row.primaryKeyLivenessInfo().timestamp());
     }
 
     @Test

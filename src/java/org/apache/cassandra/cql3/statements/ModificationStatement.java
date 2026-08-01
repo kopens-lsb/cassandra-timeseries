@@ -917,7 +917,8 @@ public abstract class ModificationStatement implements CQLStatement.SingleKeyspa
             SingleTableSinglePartitionUpdatesCollector collector = new SingleTableSinglePartitionUpdatesCollector(metadata, updatedColumns);
             addUpdates(collector, keys, state, options, local, timestamp, nowInSeconds, requestTime);
             // local means this is test or internal things that are bypassing distributed system modification/checks
-            return collector.toMutations(state, local ? PotentialTxnConflicts.ALLOW : PotentialTxnConflicts.DISALLOW);
+            return guardTieredColdWrites(collector.toMutations(state, local ? PotentialTxnConflicts.ALLOW : PotentialTxnConflicts.DISALLOW),
+                                         nowInSeconds);
         }
         else
         {
@@ -925,8 +926,25 @@ public abstract class ModificationStatement implements CQLStatement.SingleKeyspa
             SingleTableUpdatesCollector collector = new SingleTableUpdatesCollector(metadata, updatedColumns, perPartitionKeyCounts);
             addUpdates(collector, keys, state, options, local, timestamp, nowInSeconds, requestTime);
             // local means this is test or internal things that are bypassing distributed system modification/checks
-            return collector.toMutations(state, local ? PotentialTxnConflicts.ALLOW : PotentialTxnConflicts.DISALLOW);
+            return guardTieredColdWrites(collector.toMutations(state, local ? PotentialTxnConflicts.ALLOW : PotentialTxnConflicts.DISALLOW),
+                                         nowInSeconds);
         }
+    }
+
+    /**
+     * Tiered storage: cold data is immutable once chunked, so a mutation that tombstones it is
+     * rejected here rather than allowed to mask the chunk's copy until gc_grace purges the tombstone
+     * and the data silently reappears. Inspecting the built mutations (rather than the statement)
+     * means DELETE, {@code UPDATE ... SET col = null} and {@code INSERT ... VALUES (..., null)} are
+     * all caught by the same test -- what matters is whether a tombstone lands on cold clusterings.
+     * No-op for every table without a timeseries_tiering policy.
+     *
+     * @return {@code mutations}, for chaining
+     */
+    private static <T extends IMutation> List<T> guardTieredColdWrites(List<T> mutations, long nowInSeconds)
+    {
+        org.apache.cassandra.db.timeseries.tiering.TieredWrites.guardColdMutations(mutations, nowInSeconds);
+        return mutations;
     }
 
     public List<PartitionUpdate> getTxnUpdate(ClientState state, QueryOptions options)

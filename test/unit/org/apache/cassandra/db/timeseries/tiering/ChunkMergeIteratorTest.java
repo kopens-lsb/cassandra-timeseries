@@ -30,16 +30,18 @@ import org.junit.Test;
 import org.apache.cassandra.config.DatabaseDescriptor;
 import org.apache.cassandra.db.Clustering;
 import org.apache.cassandra.db.DecoratedKey;
-import org.apache.cassandra.db.RegularAndStaticColumns;
+import org.apache.cassandra.db.DeletionTime;
 import org.apache.cassandra.db.marshal.DoubleType;
 import org.apache.cassandra.db.marshal.TimestampType;
 import org.apache.cassandra.db.marshal.UTF8Type;
-import org.apache.cassandra.db.partitions.PartitionIterator;
+import org.apache.cassandra.db.partitions.UnfilteredPartitionIterator;
 import org.apache.cassandra.db.rows.BTreeRow;
 import org.apache.cassandra.db.rows.BufferCell;
+import org.apache.cassandra.db.rows.EncodingStats;
 import org.apache.cassandra.db.rows.Row;
-import org.apache.cassandra.db.rows.RowIterator;
 import org.apache.cassandra.db.rows.Rows;
+import org.apache.cassandra.db.rows.Unfiltered;
+import org.apache.cassandra.db.rows.UnfilteredRowIterator;
 import org.apache.cassandra.dht.Murmur3Partitioner;
 import org.apache.cassandra.schema.ColumnMetadata;
 import org.apache.cassandra.schema.TableMetadata;
@@ -49,9 +51,9 @@ import static org.junit.Assert.assertEquals;
 import static org.junit.Assert.assertFalse;
 
 /**
- * SP3 Task 2: coordinator merge of hot partitions with synthetic chunk rows — clustering-ordered
- * two-way merge, hot wins equal-timestamp conflicts (via writetime reconciliation), fully-chunked
- * partitions synthesized in expected-key order.
+ * SP3 Task 2 / SP4: merge of hot partitions with synthetic chunk rows on the UNFILTERED stream --
+ * clustering-ordered two-way merge, hot wins equal-timestamp conflicts (via writetime
+ * reconciliation), fully-chunked partitions synthesized in expected-key order.
  */
 public class ChunkMergeIteratorTest
 {
@@ -86,45 +88,42 @@ public class ChunkMergeIteratorTest
                                       BufferCell.live(valueColumn, writetime, DoubleType.instance.decompose(value)));
     }
 
-    private static RowIterator partition(DecoratedKey key, boolean reversed, List<Row> rows)
+    private static UnfilteredRowIterator partition(DecoratedKey key, boolean reversed, List<Row> rows)
     {
         Iterator<Row> it = rows.iterator();
-        return new RowIterator()
+        return new org.apache.cassandra.db.rows.AbstractUnfilteredRowIterator(metadata, key, DeletionTime.LIVE,
+                                                                             metadata.regularAndStaticColumns(),
+                                                                             Rows.EMPTY_STATIC_ROW, reversed,
+                                                                             EncodingStats.NO_STATS)
         {
-            public boolean hasNext() { return it.hasNext(); }
-            public Row next() { return it.next(); }
-            public TableMetadata metadata() { return metadata; }
-            public boolean isReverseOrder() { return reversed; }
-            public RegularAndStaticColumns columns() { return metadata.regularAndStaticColumns(); }
-            public DecoratedKey partitionKey() { return key; }
-            public Row staticRow() { return Rows.EMPTY_STATIC_ROW; }
-            public void close() {}
+            protected Unfiltered computeNext() { return it.hasNext() ? it.next() : endOfData(); }
         };
     }
 
-    private static PartitionIterator partitions(List<RowIterator> parts)
+    private static UnfilteredPartitionIterator partitions(List<UnfilteredRowIterator> parts)
     {
-        Iterator<RowIterator> it = parts.iterator();
-        return new PartitionIterator()
+        Iterator<UnfilteredRowIterator> it = parts.iterator();
+        return new UnfilteredPartitionIterator()
         {
+            public TableMetadata metadata() { return metadata; }
             public boolean hasNext() { return it.hasNext(); }
-            public RowIterator next() { return it.next(); }
+            public UnfilteredRowIterator next() { return it.next(); }
             public void close() {}
         };
     }
 
     /** Drains the merged iterator into tag → list of (tsMs, value) for easy assertions. */
-    private static List<String> drain(PartitionIterator merged)
+    private static List<String> drain(UnfilteredPartitionIterator merged)
     {
         List<String> result = new ArrayList<>();
         while (merged.hasNext())
         {
-            try (RowIterator p = merged.next())
+            try (UnfilteredRowIterator p = merged.next())
             {
                 StringBuilder sb = new StringBuilder(UTF8Type.instance.compose(p.partitionKey().getKey()));
                 while (p.hasNext())
                 {
-                    Row r = p.next();
+                    Row r = (Row) p.next();
                     long ts = TimestampType.instance.compose(r.clustering().bufferAt(0)).getTime() - BASE;
                     double v = DoubleType.instance.compose(r.getCell(valueColumn).buffer());
                     sb.append(' ').append(ts).append(':').append(v);
@@ -139,7 +138,7 @@ public class ChunkMergeIteratorTest
     public void hotOnlyPassthrough()
     {
         DecoratedKey k = key("t1");
-        PartitionIterator merged = ChunkMergePartitionIterator.wrap(
+        UnfilteredPartitionIterator merged = ChunkMergeUnfilteredIterator.wrap(
             partitions(List.of(partition(k, false, List.of(row(BASE + 1, 1.0, HOT_WT))))),
             List.of(k), dk -> List.of(), metadata, false);
         assertEquals(List.of("t1 1:1.0"), drain(merged));
@@ -150,7 +149,7 @@ public class ChunkMergeIteratorTest
     {
         DecoratedKey k = key("t1");
         List<Row> chunk = List.of(row(BASE + 1, 10.0, CHUNK_WT), row(BASE + 3, 30.0, CHUNK_WT));
-        PartitionIterator merged = ChunkMergePartitionIterator.wrap(
+        UnfilteredPartitionIterator merged = ChunkMergeUnfilteredIterator.wrap(
             partitions(List.of(partition(k, false, List.of(row(BASE + 2, 20.0, HOT_WT), row(BASE + 4, 40.0, HOT_WT))))),
             List.of(k), dk -> chunk, metadata, false);
         assertEquals(List.of("t1 1:10.0 2:20.0 3:30.0 4:40.0"), drain(merged));
@@ -161,7 +160,7 @@ public class ChunkMergeIteratorTest
     {
         DecoratedKey k = key("t1");
         List<Row> chunk = List.of(row(BASE + 1, 999.0, CHUNK_WT));
-        PartitionIterator merged = ChunkMergePartitionIterator.wrap(
+        UnfilteredPartitionIterator merged = ChunkMergeUnfilteredIterator.wrap(
             partitions(List.of(partition(k, false, List.of(row(BASE + 1, 1.0, HOT_WT))))),
             List.of(k), dk -> chunk, metadata, false);
         assertEquals(List.of("t1 1:1.0"), drain(merged));
@@ -172,7 +171,7 @@ public class ChunkMergeIteratorTest
     {
         DecoratedKey k = key("t1");
         List<Row> chunk = List.of(row(BASE + 1, 10.0, CHUNK_WT), row(BASE + 2, 20.0, CHUNK_WT));
-        PartitionIterator merged = ChunkMergePartitionIterator.wrap(
+        UnfilteredPartitionIterator merged = ChunkMergeUnfilteredIterator.wrap(
             partitions(List.of()),                                   // hot has nothing at all
             List.of(k), dk -> chunk, metadata, false);
         assertEquals(List.of("t1 1:10.0 2:20.0"), drain(merged));
@@ -187,7 +186,7 @@ public class ChunkMergeIteratorTest
         Map<DecoratedKey, List<Row>> chunks = Map.of(k1, List.of(),
                                                      k2, List.of(row(BASE + 5, 50.0, CHUNK_WT)),
                                                      k3, List.of());
-        PartitionIterator merged = ChunkMergePartitionIterator.wrap(
+        UnfilteredPartitionIterator merged = ChunkMergeUnfilteredIterator.wrap(
             partitions(List.of(partition(k1, false, List.of(row(BASE + 1, 1.0, HOT_WT))),
                                partition(k3, false, List.of(row(BASE + 3, 3.0, HOT_WT))))),
             List.of(k1, k2, k3), chunks::get, metadata, false);
@@ -199,7 +198,7 @@ public class ChunkMergeIteratorTest
     {
         DecoratedKey k = key("t1");
         List<Row> chunk = new ArrayList<>(List.of(row(BASE + 3, 30.0, CHUNK_WT), row(BASE + 1, 10.0, CHUNK_WT)));
-        PartitionIterator merged = ChunkMergePartitionIterator.wrap(
+        UnfilteredPartitionIterator merged = ChunkMergeUnfilteredIterator.wrap(
             partitions(List.of(partition(k, true, List.of(row(BASE + 4, 40.0, HOT_WT), row(BASE + 2, 20.0, HOT_WT))))),
             List.of(k), dk -> chunk, metadata, true);
         assertEquals(List.of("t1 4:40.0 3:30.0 2:20.0 1:10.0"), drain(merged));
@@ -210,7 +209,7 @@ public class ChunkMergeIteratorTest
     {
         DecoratedKey k1 = key("t1");
         DecoratedKey k2 = key("t2");
-        PartitionIterator merged = ChunkMergePartitionIterator.wrap(
+        UnfilteredPartitionIterator merged = ChunkMergeUnfilteredIterator.wrap(
             partitions(List.of(partition(k2, false, List.of(row(BASE + 1, 1.0, HOT_WT))))),
             List.of(k1, k2), dk -> List.of(), metadata, false);
         assertEquals(List.of("t2 1:1.0"), drain(merged));

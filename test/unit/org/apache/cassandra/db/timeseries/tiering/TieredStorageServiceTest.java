@@ -204,9 +204,13 @@ public class TieredStorageServiceTest extends CQLTester
         assertEquals(0, raw("SELECT * FROM %s WHERE tag = ? AND ts >= ? AND ts < ?",
                                 "t", new Date(0L), new Date(HOUR)).size());
 
-        // Late row: newer writetime (104) than the tombstone the first run issued (USING TIMESTAMP 103).
+        // Late row: newer writetime than the tombstone the first run issued (USING TIMESTAMP 103).
+        // Deliberately 110, not 104: a chunked window is reconstructed at max_row_writetime + 1, so a
+        // late row written at exactly maxWt + 1 would TIE with the reconstruction at read time and
+        // Cassandra would break the tie by value (see ChunkReadSupport). Physical survival of the
+        // tombstone only needs > 103; the gap is about the read-time rule, so make it explicit.
         long lateTs = 2_400_000L;
-        insertRow("t", lateTs, 42.0, 104);
+        insertRow("t", lateTs, 42.0, 110);
 
         UntypedResultSet survived = raw("SELECT * FROM %s WHERE tag = ? AND ts = ?", "t", new Date(lateTs));
         assertEquals(1, survived.size());

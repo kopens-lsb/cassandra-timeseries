@@ -80,7 +80,12 @@ public class DigestResolver<E extends Endpoints<E>, P extends ReplicaPlan.ForRea
 
         if (!hasTransientResponse(responses))
         {
-            return UnfilteredPartitionIterators.filter(dataResponse.payload.makeIterator(command), command.nowInSec());
+            // Tiered storage: see TransparentReads.maybeWrap -- merged before the filter so
+            // tombstones still shadow chunk-decoded rows. No-op without a tiering policy.
+            return UnfilteredPartitionIterators.filter(
+                org.apache.cassandra.db.timeseries.tiering.TransparentReads.maybeWrap(command.metadata(), command, dataResponse.payload.makeIterator(command),
+                             replicaPlan().consistencyLevel()),
+                command.nowInSec());
         }
         else
         {

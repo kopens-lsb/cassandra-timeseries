@@ -18,6 +18,7 @@
 package org.apache.cassandra.db.timeseries.tiering;
 
 import java.nio.ByteBuffer;
+import java.util.ArrayList;
 import java.util.Date;
 import java.util.LinkedHashMap;
 import java.util.List;
@@ -35,11 +36,13 @@ import org.apache.cassandra.db.marshal.UTF8Type;
 import org.apache.cassandra.db.timeseries.ColumnarChunkCodec;
 import org.apache.cassandra.db.timeseries.ColumnarCursor;
 import org.apache.cassandra.db.timeseries.tiering.TieredStorageService.TierRunStats;
+import org.apache.cassandra.exceptions.InvalidRequestException;
 import org.apache.cassandra.utils.ByteBufferUtil;
 
 import static org.junit.Assert.assertEquals;
 import static org.junit.Assert.assertFalse;
 import static org.junit.Assert.assertTrue;
+import static org.junit.Assert.fail;
 
 /**
  * SP4 Task 3: the re-encoder chunks <b>every</b> regular column, not a designated value column.
@@ -88,9 +91,28 @@ public class TieredStorageColumnsTest extends CQLTester
         execute("INSERT INTO %s (tag_id, area_id, asset_id, line_id, opc_id, site_id, tag_name, type) " +
                 "VALUES ('t1', 'a', 'as', 'l', 'o', 's', 'tn', 'ty') USING TIMESTAMP 100");
         for (int i = 0; i < TS.length; i++)
-            execute("INSERT INTO %s (tag_id, timestamp, attribute, error_code, latency, quality, " +
-                    "value, value_boolean) VALUES (?, ?, ?, 0, ?, 192, ?, ?) USING TIMESTAMP ?",
-                    "t1", new Date(TS[i]), attribute(UNIT[i]), LATENCY[i], VALUE[i], VALUE_BOOLEAN[i], 101L + i);
+        {
+            // Columns that are null on this row are OMITTED rather than bound as null: binding null
+            // writes a cell tombstone, and tombstoning a cold clustering is refused outright now
+            // (TieredWrites). Omitting is also what a real writer does.
+            StringBuilder columns = new StringBuilder("tag_id, timestamp, attribute, error_code, latency, quality");
+            StringBuilder markers = new StringBuilder("?, ?, ?, 0, ?, 192");
+            List<Object> binds = new ArrayList<>(List.of("t1", new Date(TS[i]), attribute(UNIT[i]), LATENCY[i]));
+            if (VALUE[i] != null)
+            {
+                columns.append(", value");
+                markers.append(", ?");
+                binds.add(VALUE[i]);
+            }
+            if (VALUE_BOOLEAN[i] != null)
+            {
+                columns.append(", value_boolean");
+                markers.append(", ?");
+                binds.add(VALUE_BOOLEAN[i]);
+            }
+            binds.add(101L + i);
+            execute("INSERT INTO %s (" + columns + ") VALUES (" + markers + ") USING TIMESTAMP ?", binds.toArray());
+        }
         // Hot row (window [4h,5h) against the synthetic now = 5h): must survive untouched.
         execute("INSERT INTO %s (tag_id, timestamp, latency) VALUES ('t1', ?, 1) USING TIMESTAMP 200",
                 new Date(4 * HOUR));
@@ -326,39 +348,7 @@ public class TieredStorageColumnsTest extends CQLTester
         assertFalse(cursor.advance());
     }
 
-    // ---- deletes against an already-chunked window: a KNOWN, UNFIXED defect ----
-
-    /*
-     * ==========================================================================================
-     *  CRITICAL KNOWN DEFECT -- the four tests below pin BROKEN behaviour on purpose.
-     *
-     *  A DELETE (cell, row, clustering-range or partition) against a window that tiering has
-     *  already chunked is NOT honoured: the deleted data is served again by the very next SELECT.
-     *
-     *  Why: SelectStatement hands TransparentReads an already-FILTERED PartitionIterator.
-     *  db/transform/Filter has by then run purge(PURGE_ALL) over every row and returned null from
-     *  applyToMarker, so every tombstone -- cell, row, range and partition -- is gone before the
-     *  chunk rows are merged in. The merge cannot reconcile against deletion information it can
-     *  never see.
-     *
-     *  Merging on the UNFILTERED stream instead (before Filter) was implemented and measured, and
-     *  does not work either without changing tiering's central invariant: the re-encoder deletes
-     *  the source rows with USING TIMESTAMP maxWt, and the chunk reconstructs those same rows with
-     *  cell timestamp max_row_writetime == maxWt. DeletionTime.deletes() is `timestamp <= marked
-     *  ForDeleteAt`, so the re-encoder's own range tombstone shadows everything the chunk rebuilds.
-     *  Measured output of the unfiltered merge for the first test below:
-     *
-     *      Marker INCL_START_BOUND(1970-01-01T00:00:00.000Z)@100   <- the re-encoder's own delete
-     *      Row: ts=0 | [value=<tombstone> ts=300]                  <- only the user's DELETE left
-     *      Marker INCL_END_BOUND(1970-01-01T00:00:00.000Z)@100
-     *
-     *  i.e. quality=192 and value=1.5 were both eliminated by tiering's own tombstone.
-     *
-     *  See .superpowers/sdd/sp4-columnar-chunks/task-3-report.md "Fix round 1" for the full
-     *  analysis and the two candidate resolutions. DO NOT read these tests as a specification --
-     *  they exist so the defect cannot be forgotten and so its blast radius is written down.
-     * ==========================================================================================
-     */
+    // ---- cold data is immutable: writes that would tombstone it are rejected ----
 
     private void chunkOneRow() throws Throwable
     {
@@ -371,48 +361,117 @@ public class TieredStorageColumnsTest extends CQLTester
         assertEquals(0, raw("SELECT ts FROM %s WHERE tag = 't' AND ts < ?", new Date(HOUR)).size());
     }
 
+    /** Asserts {@code query} is refused as an attempt to mutate chunked (cold) data. */
+    private void assertRejectedAsColdWrite(String query, Object... values) throws Throwable
+    {
+        try
+        {
+            execute(query, values);
+            fail("expected the write to be rejected: " + query);
+        }
+        catch (InvalidRequestException e)
+        {
+            assertTrue(e.getMessage(), e.getMessage().contains("immutable"));
+            assertTrue(e.getMessage(), e.getMessage().contains("cold_window"));
+        }
+    }
+
     @Test
-    public void deletingOneCellOfAChunkedRowIsSilentlyIgnored_KNOWN_DEFECT() throws Throwable
+    public void deletingOneCellOfAChunkedRowIsRejected() throws Throwable
     {
         chunkOneRow();
-        execute("DELETE value FROM %s USING TIMESTAMP 300 WHERE tag = 't' AND ts = ?", new Date(0L));
-
+        assertRejectedAsColdWrite("DELETE value FROM %s USING TIMESTAMP 300 WHERE tag = 't' AND ts = ?", new Date(0L));
+        // ...and nothing changed: the row still reads back complete.
         UntypedResultSet rows = execute("SELECT value, quality FROM %s WHERE tag = 't' AND ts = ?", new Date(0L));
         assertEquals(1, rows.size());
-        assertTrue("DEFECT: the deleted cell is served again from the chunk", rows.one().has("value"));
         assertEquals(1.5, rows.one().getDouble("value"), 0.0);
     }
 
     @Test
-    public void deletingAChunkedRowIsSilentlyIgnored_KNOWN_DEFECT() throws Throwable
+    public void deletingAChunkedRowIsRejected() throws Throwable
     {
         chunkOneRow();
-        execute("DELETE FROM %s USING TIMESTAMP 300 WHERE tag = 't' AND ts = ?", new Date(0L));
-
-        assertEquals("DEFECT: the deleted row is served again from the chunk",
-                     1, execute("SELECT value FROM %s WHERE tag = 't' AND ts = ?", new Date(0L)).size());
+        assertRejectedAsColdWrite("DELETE FROM %s USING TIMESTAMP 300 WHERE tag = 't' AND ts = ?", new Date(0L));
     }
 
     @Test
-    public void deletingAChunkedRangeIsSilentlyIgnored_KNOWN_DEFECT() throws Throwable
+    public void deletingAChunkedRangeIsRejected() throws Throwable
     {
         chunkOneRow();
-        execute("DELETE FROM %s USING TIMESTAMP 300 WHERE tag = 't' AND ts >= ? AND ts < ?",
-                new Date(0L), new Date(HOUR));
-
-        assertEquals("DEFECT: the range-deleted window is served again from the chunk",
-                     1, execute("SELECT value FROM %s WHERE tag = 't' AND ts < ?", new Date(HOUR)).size());
+        assertRejectedAsColdWrite("DELETE FROM %s USING TIMESTAMP 300 WHERE tag = 't' AND ts >= ? AND ts < ?",
+                                  new Date(0L), new Date(HOUR));
     }
 
     @Test
-    public void deletingAChunkedPartitionIsSilentlyIgnored_KNOWN_DEFECT() throws Throwable
+    public void deletingAWholePartitionOfATieredTableIsRejected() throws Throwable
+    {
+        // No clustering bound at all, so it necessarily covers chunked data.
+        chunkOneRow();
+        assertRejectedAsColdWrite("DELETE FROM %s USING TIMESTAMP 300 WHERE tag = 't'");
+    }
+
+    @Test
+    public void updatingAChunkedColumnToNullIsRejected() throws Throwable
+    {
+        // `SET col = null` writes a cell tombstone, which is the same hazard as a DELETE -- and the
+        // guard inspects the built mutation, so it is caught without special-casing the statement.
+        chunkOneRow();
+        assertRejectedAsColdWrite("UPDATE %s USING TIMESTAMP 300 SET value = null WHERE tag = 't' AND ts = ?",
+                                  new Date(0L));
+    }
+
+    @Test
+    public void insertingANullValueIntoAChunkedClusteringIsRejected() throws Throwable
+    {
+        // Same tombstone by another route: an INSERT that binds null for a column deletes that cell.
+        chunkOneRow();
+        assertRejectedAsColdWrite("INSERT INTO %s (tag, ts, value) VALUES ('t', ?, ?) USING TIMESTAMP 300",
+                                  new Date(0L), null);
+    }
+
+    @Test
+    public void writingRealValuesToColdClusteringsIsStillAllowed() throws Throwable
+    {
+        // Only UN-writing cold data is refused. A late correction is a supported operation: the
+        // re-encoder merges it into the chunk per column on its next cycle.
+        chunkOneRow();
+        execute("UPDATE %s USING TIMESTAMP 300 SET quality = 7 WHERE tag = 't' AND ts = ?", new Date(0L));
+        UntypedResultSet rows = execute("SELECT value, quality FROM %s WHERE tag = 't' AND ts = ?", new Date(0L));
+        assertEquals(7, rows.one().getInt("quality"));
+        assertEquals("the columns the UPDATE did not name still come from the chunk",
+                     1.5, rows.one().getDouble("value"), 0.0);
+    }
+
+    @Test
+    public void deletesConfinedToTheHotWindowStillWork() throws Throwable
+    {
+        // The rule is about COLD data. Ordinary deletes of current data must be untouched -- use real
+        // wall-clock clusterings so the rows are unambiguously inside hot_window.
+        createTable("CREATE TABLE %s (tag text, ts timestamp, value double, quality int, PRIMARY KEY (tag, ts))");
+        setPolicy("{\"hot_window\":\"2h\",\"chunk_window\":\"1h\"}");
+        long recent = System.currentTimeMillis() - 60_000L;
+
+        execute("INSERT INTO %s (tag, ts, value, quality) VALUES ('t', ?, 1.0, 5) ", new Date(recent));
+        execute("INSERT INTO %s (tag, ts, value, quality) VALUES ('t', ?, 2.0, 6) ", new Date(recent + 1000));
+
+        execute("DELETE value FROM %s WHERE tag = 't' AND ts = ?", new Date(recent));
+        assertFalse(execute("SELECT value FROM %s WHERE tag = 't' AND ts = ?", new Date(recent)).one().has("value"));
+
+        execute("UPDATE %s SET quality = null WHERE tag = 't' AND ts = ?", new Date(recent + 1000));
+        assertFalse(execute("SELECT quality FROM %s WHERE tag = 't' AND ts = ?", new Date(recent + 1000))
+                    .one().has("quality"));
+
+        execute("DELETE FROM %s WHERE tag = 't' AND ts = ?", new Date(recent + 1000));
+        assertEquals(0, execute("SELECT value FROM %s WHERE tag = 't' AND ts = ?", new Date(recent + 1000)).size());
+    }
+
+    @Test
+    public void aBatchCannotSmuggleAColdDeleteThrough() throws Throwable
     {
         chunkOneRow();
-        execute("DELETE FROM %s USING TIMESTAMP 300 WHERE tag = 't'");
-
-        // The hot row goes (it is a real base row); everything the chunk holds comes back.
-        assertEquals("DEFECT: the deleted partition's chunked rows are served again",
-                     1, execute("SELECT value FROM %s WHERE tag = 't'").size());
+        assertRejectedAsColdWrite("BEGIN BATCH " +
+                                  "DELETE value FROM %s USING TIMESTAMP 300 WHERE tag = 't' AND ts = ? " +
+                                  "APPLY BATCH", new Date(0L));
     }
 
     // ---- values Cassandra accepts that a fixed-width column codec cannot represent ----

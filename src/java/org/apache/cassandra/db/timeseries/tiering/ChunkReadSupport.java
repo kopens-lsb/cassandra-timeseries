@@ -45,12 +45,30 @@ import org.apache.cassandra.utils.ByteBufferUtil;
  * sample. Columns are matched to the table <b>by name</b>: a column the chunk carries but the table
  * has since dropped is ignored, and a column added after the chunk was written simply reads as null.
  *
- * Every synthetic cell carries the chunk's {@code max_row_writetime} as its writetime. That is
- * an approximation for {@code writetime(col)} selections (documented limitation), but it is
- * exactly what makes the merge rule correct with zero custom conflict logic: an un-swept hot row
- * for the same timestamp always has writetime &gt; the chunk's max_row_writetime (else the
- * re-encoder would have absorbed and deleted it), so standard timestamp-based reconciliation picks
- * the hot row - identical to the re-encoder's rows-win rule.
+ * Every synthetic cell carries {@code max_row_writetime + 1} as its writetime. The {@code + 1} is
+ * <b>forced, not chosen</b>: the re-encoder deletes the source rows with
+ * {@code USING TIMESTAMP maxWt} where {@code maxWt == max_row_writetime}, and Cassandra's
+ * {@code DeletionTime.deletes()} is {@code timestamp <= markedForDeleteAt}, so rows reconstructed at
+ * {@code max_row_writetime} are shadowed by tiering's own tombstone the moment they are merged
+ * against the unfiltered stream ({@link ChunkMergeUnfilteredIterator}). Reconstructing rows that a
+ * tombstone removed requires post-dating that tombstone.
+ * <p>
+ * What that buys, and what it costs:
+ * <ul>
+ *   <li>A real user tombstone always post-dates the sweep that chunked the window, so it still
+ *       shadows the reconstruction -- deletes are honoured. (Writing one is nonetheless refused; see
+ *       {@link TieredWrites} for why a delete that only masks the chunk is not good enough.)</li>
+ *   <li>An un-swept hot row survives the tiering tombstone only if its writetime is
+ *       &gt; {@code maxWt}, i.e. &gt;= {@code maxWt + 1} -- so the old strict guarantee "a hot row
+ *       always beats the chunk" weakens to "ties are possible at exactly {@code maxWt + 1}".
+ *       Cassandra breaks cell ties by comparing values, so a late correction landing on exactly that
+ *       microsecond can lose to the chunk's stale value if its value sorts lower. Reachable only
+ *       with client-supplied {@code USING TIMESTAMP}; server-assigned microsecond timestamps make it
+ *       vanishingly unlikely, and it is the same class of hazard explicit timestamps already carry
+ *       in plain Cassandra.</li>
+ * </ul>
+ * The writetime is still an approximation for {@code writetime(col)} selections (documented
+ * limitation): every column of every reconstructed row reports the same value.
  */
 public final class ChunkReadSupport
 {
@@ -62,7 +80,8 @@ public final class ChunkReadSupport
      * @param metadata          the base table's metadata (one timestamp clustering column; any set
      *                          of regular columns)
      * @param payload           the chunk blob ({@link ColumnarChunkCodec}, version 3)
-     * @param maxRowWritetime   the chunk row's max_row_writetime (micros) - used as the cells' writetime
+     * @param maxRowWritetime   the chunk row's max_row_writetime (micros); cells are stamped one
+     *                          microsecond LATER, see the class javadoc
      * @param startMsInclusive  emit samples with timestamp &gt;= this (epoch ms)
      * @param endMsExclusive    emit samples with timestamp &lt; this (epoch ms)
      * @param descending        emit newest timestamp first. NOT the same as the read's "reversed"
@@ -84,6 +103,10 @@ public final class ChunkReadSupport
                                           boolean descending)
     {
         ColumnarCursor cursor = ColumnarChunkCodec.cursor(payload, null);
+        // See the class javadoc: at max_row_writetime itself the re-encoder's own range tombstone
+        // (issued at exactly that timestamp) shadows every row rebuilt here. Saturate rather than
+        // overflow -- a corrupt chunk could carry Long.MAX_VALUE.
+        long cellTimestamp = maxRowWritetime == Long.MAX_VALUE ? Long.MAX_VALUE : maxRowWritetime + 1;
 
         // Resolve the chunk's column names against the table once, not per row.
         List<String> names = new ArrayList<>(cursor.columns().size());
@@ -119,7 +142,7 @@ public final class ChunkReadSupport
                 ByteBuffer value = cursor.getBytes(names.get(i));
                 if (value == null)
                     continue;                             // null cell: stays null, no cell emitted
-                builder.addCell(BufferCell.live(columns.get(i), maxRowWritetime, value));
+                builder.addCell(BufferCell.live(columns.get(i), cellTimestamp, value));
                 anyCell = true;
             }
             if (!anyCell)
@@ -128,7 +151,7 @@ public final class ChunkReadSupport
                 // precisely so its existence would not be lost to the range delete - and a row with
                 // neither cells nor primary-key liveness is indistinguishable from no row at all, so
                 // give it the liveness a bare `INSERT INTO t (key, ts) VALUES (...)` would have had.
-                builder.addPrimaryKeyLivenessInfo(LivenessInfo.create(maxRowWritetime));
+                builder.addPrimaryKeyLivenessInfo(LivenessInfo.create(cellTimestamp));
             }
             rows.add(builder.build());
         }

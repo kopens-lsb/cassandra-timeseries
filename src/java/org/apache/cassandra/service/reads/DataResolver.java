@@ -82,7 +82,12 @@ public class DataResolver<E extends Endpoints<E>, P extends ReplicaPlan.ForRead<
     public PartitionIterator getData()
     {
         ReadResponse response = responses.get(0).payload;
-        return UnfilteredPartitionIterators.filter(response.makeIterator(command), command.nowInSec());
+        // Tiered storage: see TransparentReads.maybeWrap -- merged before the filter so tombstones
+        // still shadow chunk-decoded rows. No-op without a tiering policy.
+        return UnfilteredPartitionIterators.filter(
+            org.apache.cassandra.db.timeseries.tiering.TransparentReads.maybeWrap(command.metadata(), command, response.makeIterator(command),
+                         replicaPlan().consistencyLevel()),
+            command.nowInSec());
     }
 
     public boolean isDataPresent()
@@ -316,6 +321,11 @@ public class DataResolver<E extends Endpoints<E>, P extends ReplicaPlan.ForRead<
          */
 
         UnfilteredPartitionIterator merged = UnfilteredPartitionIterators.merge(results, mergeListener);
+        // Tiered storage: chunk-decoded rows join AFTER the replica merge -- so read repair's merge
+        // listener never sees them and cannot try to "repair" synthetic rows onto replicas -- but
+        // BEFORE the filter, so tombstones still shadow them. No-op without a tiering policy.
+        merged = org.apache.cassandra.db.timeseries.tiering.TransparentReads
+                     .maybeWrap(command.metadata(), command, merged, replicaPlan().consistencyLevel());
         Filter filter = new Filter(command.nowInSec(), command.metadata().enforceStrictLiveness());
         FilteredPartitions filtered = FilteredPartitions.filter(merged, filter);
 

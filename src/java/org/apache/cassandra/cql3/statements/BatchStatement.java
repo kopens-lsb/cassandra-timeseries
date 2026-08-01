@@ -412,7 +412,11 @@ public class BatchStatement implements CQLStatement.CompositeCQLStatement
         }
         // local is either executeWithoutConditions modifying a virtual table (doesn't support txns) or executeLocal
         // which is called by test or internal things that are bypassing distributed system modification/checks
-        return collector.toMutations(state, local ? PotentialTxnConflicts.ALLOW : PotentialTxnConflicts.DISALLOW);
+        List<IMutation> mutations = collector.toMutations(state, local ? PotentialTxnConflicts.ALLOW : PotentialTxnConflicts.DISALLOW);
+        // Tiered storage: cold data is immutable once chunked (see TieredWrites); a batch must not
+        // be a way around the single-statement check.
+        org.apache.cassandra.db.timeseries.tiering.TieredWrites.guardColdMutations(mutations, nowInSeconds);
+        return mutations;
     }
 
     /**
