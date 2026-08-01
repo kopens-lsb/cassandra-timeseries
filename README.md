@@ -79,7 +79,8 @@ ORDER BY timestamp ASC;
 | **[프로덕션 투입 체크리스트 (production-rollout.md)](doc/timeseries/production-rollout.md)**  | 계층화를 실 운영 테이블에 처음 켜기 전 확인 목록 — 되돌릴 수 없는 지점, 스키마 요건, TTL→`cold_window` 이관, 애플리케이션 영향, 검증 절차 |
 | **[계층화 벤치마크 (tiering-benchmark.md)](doc/timeseries/tiering-benchmark.md)** | 운영 형태 3,000만 건 전/후 실측 — 저장 **4.9×↓**, 집계 **2.2×↑**, gap-fill **4.3×↑**, 행 단위 조회 3배↓, 재인코딩 64k rows/s |
 | **[운영 튜닝 가이드 (operations-tuning.md)](doc/timeseries/operations-tuning.md)** | 장기 보존(10년) 전환 실전 가이드 — 용량 산수, 적용 순서, 원본·**청크 테이블** 튜닝값과 근거, TTL과 계층화의 관계, 점검 목록 |
-| **[시계열 컴팩션 (timeseries-compaction.md)](doc/timeseries/timeseries-compaction.md)** | `TimeSeriesCompactionStrategy` — 창 크기·동결·`retention` 설정, 창의 일생, 지각 데이터 격리, 파킹된 창과 JMX 확인, TTL이 아니라 `retention`이 만료를 담당하는 이유 |
+| **[시계열 컴팩션 (timeseries-compaction.md)](doc/timeseries/timeseries-compaction.md)** | `TimeSeriesCompactionStrategy` — 창 크기·동결·`retention` 설정, 창의 일생, 지각 데이터 격리, 파킹된 창의 두 원인과 진단법, TTL이 아니라 `retention`이 만료를 담당하는 이유, **운영 노드 실측** |
+| [프로덕션 `window_size` 점검 (prod-window-size-plan.md)](doc/timeseries/prod-window-size-plan.md) | 운영 75개 테이블을 실측해 `window_size`를 **바꾸지 않기로** 한 판단 과정 — 파킹의 진짜 원인(쓰기 타임스탬프 오염)과 그 진단 절차 |
 | **[계층형 저장 (tiered-storage.md)](doc/timeseries/tiered-storage.md)** | `timeseries_tiering` 정책·청크 재인코더 — 설정, 청크 조회 패턴, 운영(nodetool/가상 테이블), 불변식과 제한사항 |
 | **[청크 포맷 v3 (columnar-chunks.md)](doc/timeseries/columnar-chunks.md)** | 컬럼 지향 청크의 **와이어 포맷 규격** — 헤더·디렉토리·null 비트맵·타입별 인코딩, 결정성/멱등성 규칙, 스키마 진화, 크기 한계, 행당 바이트 실측 |
 | [코덱 bake-off (codec-bakeoff.md)](doc/timeseries/codec-bakeoff.md) | Gorilla vs Chimp128 압축률 실측과 Chimp128 단일화 근거 |
