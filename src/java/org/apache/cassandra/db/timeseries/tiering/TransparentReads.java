@@ -235,13 +235,10 @@ public final class TransparentReads
             return hot;
         }
 
-        // The one correct question: can any chunk hold data at or above this query's start? Coverage
-        // answers it from what the chunk table really contains; the hot boundary is a floor under that
-        // answer, covering the window in which a just-written chunk may not be in this node's cached
-        // coverage yet (it is necessarily below the boundary, so the merge still runs).
-        long mergeBelowMs = coverage.topExclusiveMs();
-        if (policy != null)
-            mergeBelowMs = Math.max(mergeBelowMs, ColdBoundary.hotBoundaryMs(policy));
+        // The one correct question: can any chunk hold data at or above this query's start? Asked
+        // through the definition of cold that TieredWrites enforces on the other side, so the two can
+        // never disagree about which rows a chunk owns (ColdBoundary.coldBelowMs).
+        long mergeBelowMs = ColdBoundary.coldBelowMs(coverage, policy);
         if (startMs >= mergeBelowMs)
             return hot;                                   // no chunk reaches up here: fast path
 

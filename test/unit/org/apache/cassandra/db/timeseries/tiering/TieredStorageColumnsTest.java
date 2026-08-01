@@ -495,6 +495,80 @@ public class TieredStorageColumnsTest extends CQLTester
                           .one().getDouble("value"), 0.0);
     }
 
+    // ---- immutability is keyed on real chunk coverage, not on the policy being installed ----
+
+    /**
+     * The hazard this pair of rules exists to prevent, reached the way an operator actually reaches
+     * it: stop tiering a table by dropping the extension, then delete some old data.
+     * <p>
+     * Reads consult what the chunk table <em>contains</em>, so the encoded rows are still served
+     * after the drop. A write guard keyed on {@code policy != null} would meanwhile accept a
+     * {@code DELETE} against exactly those rows -- a tombstone that masks the chunk's copy only until
+     * {@code gc_grace_seconds} purges it, after which the "deleted" data silently comes back. Both
+     * sides have to key off the same coverage.
+     */
+    @Test
+    public void droppingTheExtensionDoesNotMakeChunkedDataDeletable() throws Throwable
+    {
+        chunkOneRow();
+        alterTable("ALTER TABLE %s WITH extensions = {};");
+        // The base row is gone -- the chunk is the only copy -- and the merge still serves it.
+        assertEquals(0, raw("SELECT ts FROM %s WHERE tag = 't' AND ts = ?", new Date(0L)).size());
+        assertEquals(1.5, execute("SELECT value FROM %s WHERE tag = 't' AND ts = ?", new Date(0L))
+                          .one().getDouble("value"), 0.0);
+
+        // Emptied so the guard has to load the ledger itself: with no policy left, nothing else on
+        // this node would have warmed the coverage cache for this table.
+        ChunkCoverage.invalidateAll();
+        assertRejectedAsColdWrite("DELETE FROM %s USING TIMESTAMP 300 WHERE tag = 't' AND ts = ?", new Date(0L));
+        assertRejectedAsColdWrite("DELETE value FROM %s USING TIMESTAMP 300 WHERE tag = 't' AND ts = ?", new Date(0L));
+        assertRejectedAsColdWrite("UPDATE %s USING TIMESTAMP 300 SET value = null WHERE tag = 't' AND ts = ?",
+                                  new Date(0L));
+        assertRejectedAsColdWrite("DELETE FROM %s USING TIMESTAMP 300 WHERE tag = 't'");
+        assertRejectedAsColdWrite("DELETE FROM %s WHERE tag = 't' AND ts = ? IF value = null", new Date(0L));
+
+        // ...and the chunk's copy is still there and still complete.
+        UntypedResultSet rows = execute("SELECT value, quality FROM %s WHERE tag = 't' AND ts = ?", new Date(0L));
+        assertEquals(1, rows.size());
+        assertEquals(1.5, rows.one().getDouble("value"), 0.0);
+        assertEquals(192, rows.one().getInt("quality"));
+    }
+
+    /**
+     * The other half of the rule: coverage bounds the guard, so dropping the extension does not turn
+     * the table read-only. Nothing above what the chunk table reaches is protected by anything.
+     */
+    @Test
+    public void droppingTheExtensionStillAllowsDeletingWhatNoChunkCovers() throws Throwable
+    {
+        chunkOneRow();
+        alterTable("ALTER TABLE %s WITH extensions = {};");
+        ChunkCoverage.invalidateAll();
+
+        execute("INSERT INTO %s (tag, ts, value) VALUES ('t', ?, 4.0) USING TIMESTAMP 400", new Date(7 * HOUR));
+        execute("DELETE FROM %s USING TIMESTAMP 500 WHERE tag = 't' AND ts = ?", new Date(7 * HOUR));
+        assertEquals(0, execute("SELECT ts FROM %s WHERE tag = 't' AND ts = ?", new Date(7 * HOUR)).size());
+    }
+
+    /**
+     * Fail closed. With the ledger gone, coverage is unknowable -- chunks may reach anywhere -- so
+     * the guard refuses the same {@code DELETE} the test above accepts. A wrongly refused write is an
+     * immediate, visible, fixable error; a wrongly accepted one is data resurrection on a
+     * {@code gc_grace_seconds} timer that nothing reports.
+     */
+    @Test
+    public void anUnknowableCoverageLedgerRejectsRatherThanAccepts() throws Throwable
+    {
+        chunkOneRow();
+        alterTable("ALTER TABLE %s WITH extensions = {};");
+        execute("DROP TABLE " + KEYSPACE + ".\"" + ChunkTables.coverageTableName(currentTable()) + '"');
+        ChunkCoverage.invalidateAll();
+
+        execute("INSERT INTO %s (tag, ts, value) VALUES ('t', ?, 4.0) USING TIMESTAMP 400", new Date(7 * HOUR));
+        assertRejectedAsColdWrite("DELETE FROM %s USING TIMESTAMP 500 WHERE tag = 't' AND ts = ?",
+                                  new Date(7 * HOUR));
+    }
+
     // ---- end-to-end: a tombstone written while the row was hot must survive re-encoding ----
 
     /**

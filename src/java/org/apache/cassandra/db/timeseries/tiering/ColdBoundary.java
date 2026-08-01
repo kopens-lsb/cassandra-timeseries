@@ -59,6 +59,40 @@ public final class ColdBoundary
         return Clock.Global.currentTimeMillis() - policy.hotWindowMillis;
     }
 
+    /**
+     * <b>The</b> definition of cold, for both sides of the feature: the epoch-millis instant below
+     * which a chunk may hold data. A read whose range starts at or above it needs no chunk merge; a
+     * write that tombstones a clustering below it is refused, because the chunk is the only copy of
+     * that row and a tombstone could only mask it until {@code gc_grace_seconds} purged it.
+     * <p>
+     * Both terms are needed, and the maximum of them is what makes staleness safe:
+     * <ul>
+     *     <li><b>Coverage</b> is what the chunk table <em>actually</em> holds
+     *     ({@link ChunkCoverage.Coverage#topExclusiveMs()}), so raising {@code hot_window}, dropping
+     *     the extension or writing an invalid one cannot make already-encoded data unreadable --
+     *     or, on the write side, make it deletable.</li>
+     *     <li>The <b>hot boundary</b> floors that answer while a policy is installed: a chunk the
+     *     re-encoder has just written may not be in this node's cached coverage yet, but it is by
+     *     definition below the current hot boundary, so it is still covered.</li>
+     * </ul>
+     * Two sentinels come straight through from coverage and both are deliberate:
+     * {@link Long#MIN_VALUE} when nothing is encoded and no policy is installed (nothing is cold,
+     * and neither side needs to do anything), and {@link Long#MAX_VALUE} when coverage cannot be
+     * established -- chunks may reach anywhere, so reads merge everything and writes reject
+     * everything. Failing that way round is the cheap mistake: a merge that was not needed costs a
+     * query, and a refused write is an immediate, visible error, while the other direction is silent
+     * data resurrection on a {@code gc_grace_seconds} timer.
+     *
+     * @param policy the table's tiering policy, or {@code null} if it has none (or an invalid one --
+     *               a typo in the extension JSON is a configuration error, not an instruction to
+     *               un-protect the data already encoded under it)
+     */
+    public static long coldBelowMs(ChunkCoverage.Coverage coverage, TieringPolicy policy)
+    {
+        long coldBelow = coverage.topExclusiveMs();
+        return policy == null ? coldBelow : Math.max(coldBelow, hotBoundaryMs(policy));
+    }
+
     /** @return the timestamp of a (non-static) clustering, in epoch millis. */
     public static long clusteringMs(Clustering<?> clustering)
     {

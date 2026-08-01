@@ -101,6 +101,15 @@ public final class ChunkCoverage
     static final String SCOPE_COLUMN = "scope";
     static final String NODE_COLUMN = "node";
 
+    /**
+     * The consistency level to read or write the ledger at when no policy names one -- which happens
+     * on the write guard's path once the extension has been dropped, and inside {@link #claim} when
+     * it is called without one. Deliberately not the node-local internal path: the ledger describes
+     * the whole cluster's chunks, and a node that holds no replica of its partition would read it as
+     * empty. Matches {@link TieringPolicy}'s own documented {@code consistency} default.
+     */
+    static final ConsistencyLevel DEFAULT_CONSISTENCY = ConsistencyLevel.LOCAL_QUORUM;
+
     private static final long REFRESH_SECONDS = 60;
     private static final long REFRESH_MILLIS = TimeUnit.SECONDS.toMillis(REFRESH_SECONDS);
 
@@ -333,7 +342,7 @@ public final class ChunkCoverage
         // Deliberately unguarded: a failure here must abort the window rather than let the chunk be
         // written behind a ledger that does not cover it. The re-encoder's per-tag handler catches it
         // and counts the tag as skipped.
-        QueryProcessor.process(insert, cl == null ? ConsistencyLevel.LOCAL_QUORUM : cl, values);
+        QueryProcessor.process(insert, cl == null ? DEFAULT_CONSISTENCY : cl, values);
         put(base.id, widened, Clock.Global.currentTimeMillis());
     }
 

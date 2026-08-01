@@ -42,12 +42,24 @@ import org.apache.cassandra.schema.TableMetadata;
  * data-resurrection bug on a timer, so instead such writes are rejected outright, and
  * {@code cold_window} is the supported way to remove cold data.
  * <p>
- * Rejected on a tiering-enabled table, when the write reaches a clustering older than
- * {@code now - hot_window}: partition-level deletes (which necessarily reach cold data -- they have
- * no clustering bound at all), range deletes, row deletes, and deletes of individual cells. A cell
- * tombstone is also what {@code UPDATE ... SET col = null} and {@code INSERT ... VALUES (..., null)}
- * write, so those are caught by the same check -- the test is what the mutation actually contains,
- * not which statement produced it.
+ * Rejected when the write reaches a clustering below {@link ColdBoundary#coldBelowMs}: partition-level
+ * deletes (which necessarily reach cold data -- they have no clustering bound at all), range deletes,
+ * row deletes, and deletes of individual cells. A cell tombstone is also what
+ * {@code UPDATE ... SET col = null} and {@code INSERT ... VALUES (..., null)} write, so those are
+ * caught by the same check -- the test is what the mutation actually contains, not which statement
+ * produced it.
+ * <p>
+ * That boundary is the <b>same one {@link TransparentReads} merges below</b>, and it is derived from
+ * what the chunk table actually holds rather than from the current policy. The two have to agree: a
+ * row the read path merges out of a chunk is a row this guard must refuse to tombstone. Keying the
+ * guard on {@code policy != null} instead let the agreement break in one direction -- drop the
+ * {@code timeseries_tiering} extension (or write a typo into it) and reads still serve the encoded
+ * history while a {@code DELETE} against it was accepted, masking chunk rows until
+ * {@code gc_grace_seconds} purged the tombstone and the deleted data came back.
+ * <p>
+ * When coverage cannot be established at all the guard <b>rejects</b> (see
+ * {@link ColdBoundary#coldBelowMs}): a wrongly refused write is loud and fixable in the moment, a
+ * wrongly accepted one is silent until gc_grace.
  * <p>
  * <b>Not</b> rejected: anything confined to the hot window (ordinary current-data deletes are
  * untouched), and writes of real values to cold clusterings -- a late {@code UPDATE ... SET x = 1}
@@ -61,8 +73,8 @@ public final class TieredWrites
     }
 
     /**
-     * @throws InvalidRequestException if any of {@code mutations} tombstones data at or below the
-     * hot boundary of a tiering-enabled table
+     * @throws InvalidRequestException if any of {@code mutations} tombstones data below the cold
+     * boundary of a table the chunk table covers (see {@link ColdBoundary#coldBelowMs})
      */
     public static void guardColdMutations(List<? extends IMutation> mutations)
     {
@@ -93,6 +105,12 @@ public final class TieredWrites
     private static void guard(PartitionUpdate update)
     {
         TableMetadata metadata = update.metadata();
+        // Same guard the read path applies: without exactly one timestamp clustering column nothing
+        // has ever been chunked, so there is no cold copy for a tombstone to mask. Checked first
+        // because it is free, and because everything below reads a timestamp out of a clustering.
+        if (metadata.clusteringColumns().size() != 1)
+            return;
+
         TieringPolicy policy;
         try
         {
@@ -100,16 +118,24 @@ public final class TieredWrites
         }
         catch (ConfigurationException e)
         {
-            return;                                       // an invalid policy must not break writes
+            // An invalid policy must not break writes -- and must not un-protect already-encoded
+            // data either. Treated as an absent policy, exactly as the read path treats it, so the
+            // answer still comes from coverage.
+            policy = null;
         }
-        if (policy == null)
-            return;
-        // Same guard the read path applies: without exactly one timestamp clustering column nothing
-        // has ever been chunked, so there is no cold copy for a tombstone to mask.
-        if (metadata.clusteringColumns().size() != 1)
+
+        // Where cold begins, asked of what the chunk table REALLY holds rather than of the policy:
+        // the policy can be raised, invalidated or dropped after data has been encoded, and none of
+        // those makes a chunk's rows writable again. This is the same call the read path makes to
+        // decide whether to merge, off the same per-table cache -- one map lookup for the
+        // overwhelming majority of writes, which are to tables that have no chunk table at all.
+        long coldBelowMs = ColdBoundary.coldBelowMs(coverage(metadata, policy), policy);
+        // Nothing has ever been encoded and no policy calls anything cold: there is no cold copy for
+        // any tombstone in this update to mask, whatever it contains. (Load-bearing: the
+        // partition-delete rejection below is otherwise unconditional.)
+        if (coldBelowMs == Long.MIN_VALUE)
             return;
 
-        long hotBoundary = ColdBoundary.hotBoundaryMs(policy);
         boolean descending = ColdBoundary.isDescending(metadata);
 
         if (!update.partitionLevelDeletion().isLive())
@@ -123,8 +149,8 @@ public final class TieredWrites
             while (ranges.hasNext())
             {
                 RangeTombstone range = ranges.next();
-                if (ColdBoundary.lowestMs(range.deletedSlice(), descending) < hotBoundary)
-                    throw reject(metadata, "a range DELETE", describeBoundary(hotBoundary));
+                if (ColdBoundary.lowestMs(range.deletedSlice(), descending) < coldBelowMs)
+                    throw reject(metadata, "a range DELETE", describeBoundary(coldBelowMs));
             }
         }
 
@@ -136,12 +162,28 @@ public final class TieredWrites
                 continue;
             if (!hasTombstone(row))
                 continue;
-            if (ColdBoundary.clusteringMs(row.clustering()) < hotBoundary)
+            if (ColdBoundary.clusteringMs(row.clustering()) < coldBelowMs)
                 throw reject(metadata,
                              row.deletion().isLive() ? "deleting a column (or writing a null value into one)"
                                                      : "a row DELETE",
-                             describeBoundary(hotBoundary));
+                             describeBoundary(coldBelowMs));
         }
+    }
+
+    /**
+     * The chunk coverage this mutation must be judged against.
+     * <p>
+     * Read at the policy's own consistency level so the guard sees the ledger with the same reach the
+     * re-encoder wrote it with; when the policy is gone -- the case this exists for -- at the same
+     * {@code LOCAL_QUORUM} default the re-encoder falls back to. Never at {@code null} (the
+     * internal, node-local path): a coordinator that holds no replica of the ledger partition would
+     * read it as empty and conclude that nothing is cold, which is precisely the mistake being
+     * prevented, and it would cache that answer for the read path to make as well.
+     */
+    private static ChunkCoverage.Coverage coverage(TableMetadata metadata, TieringPolicy policy)
+    {
+        return ChunkCoverage.forTable(metadata, policy != null ? policy.consistency
+                                                               : ChunkCoverage.DEFAULT_CONSISTENCY);
     }
 
     private static boolean hasTombstone(Row row)
@@ -154,9 +196,10 @@ public final class TieredWrites
         return false;
     }
 
-    private static String describeBoundary(long hotBoundary)
+    private static String describeBoundary(long coldBelowMs)
     {
-        return "it reaches clusterings older than the hot window (before epoch millis " + hotBoundary + ')';
+        return "it reaches clusterings that are already cold (before epoch millis " + coldBelowMs +
+               ", which is the later of the hot window and the newest timestamp the chunk table covers)";
     }
 
     private static InvalidRequestException reject(TableMetadata metadata, String what, String why)
