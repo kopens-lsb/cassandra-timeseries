@@ -28,6 +28,7 @@ import java.util.function.LongUnaryOperator;
 
 import org.junit.BeforeClass;
 import org.junit.Test;
+import org.slf4j.LoggerFactory;
 
 import org.apache.cassandra.Util;
 import org.apache.cassandra.config.DatabaseDescriptor;
@@ -50,6 +51,10 @@ import org.apache.cassandra.schema.ColumnMetadata;
 import org.apache.cassandra.schema.TableMetadata;
 import org.apache.cassandra.utils.ByteBufferUtil;
 import org.apache.cassandra.utils.btree.BTree;
+
+import ch.qos.logback.classic.Level;
+import ch.qos.logback.classic.spi.ILoggingEvent;
+import ch.qos.logback.core.read.ListAppender;
 
 import static org.junit.Assert.assertEquals;
 import static org.junit.Assert.assertFalse;
@@ -369,10 +374,15 @@ public class WindowRoutingIteratorTest
 
         Source(DeletionTime partitionDeletion, Row staticRow, List<Unfiltered> content)
         {
+            this(WindowRoutingIteratorTest.metadata, partitionDeletion, staticRow, content);
+        }
+
+        Source(TableMetadata md, DeletionTime partitionDeletion, Row staticRow, List<Unfiltered> content)
+        {
             // Qualified: AbstractUnfilteredRowIterator has its own protected `metadata` field, which
             // would otherwise shadow the outer class's static one inside this super() call.
-            super(WindowRoutingIteratorTest.metadata, WindowRoutingIteratorTest.key, partitionDeletion,
-                  WindowRoutingIteratorTest.metadata.regularAndStaticColumns(),
+            super(md, WindowRoutingIteratorTest.key, partitionDeletion,
+                  md.regularAndStaticColumns(),
                   staticRow == null ? org.apache.cassandra.db.rows.Rows.EMPTY_STATIC_ROW : staticRow,
                   false, org.apache.cassandra.db.rows.EncodingStats.NO_STATS);
             this.content = content.iterator();
@@ -396,6 +406,71 @@ public class WindowRoutingIteratorTest
     private static NavigableMap<Long, UnfilteredRowIterator> slices(DeletionTime partitionDeletion, Row staticRow, List<Unfiltered> content)
     {
         return WindowRoutingIterator.slices(new Source(partitionDeletion, staticRow, content), WINDOW, TimeUnit.MICROSECONDS);
+    }
+
+    /**
+     * The overflow warning must name every table that overflows, not just the first one per minute.
+     * <p>
+     * {@link NoSpamLogger} keeps one rate-limiter per key string, so a constant key makes whichever
+     * table overflowed first that minute silence all the others -- and a silenced table is
+     * indistinguishable from a table that never overflowed. That is the only question the message
+     * exists to answer: an operator looking at parked windows needs to know which tables are hitting
+     * the buffer. On a production node this cost real diagnosis time -- four tables appeared in the
+     * log while ten had parked windows, which reads as two different root causes and is not.
+     * <p>
+     * Both partitions are routed back-to-back, far inside the one-minute interval, so a per-table key
+     * is the only thing that lets the second one through.
+     */
+    @Test
+    public void overflowWarningNamesEveryOverflowingTableWithinOneInterval()
+    {
+        // Both names are unique to this test. The rate-limiter is process-wide and never resets
+        // inside a run, so reusing the shared `metadata` would make the assertion depend on whether
+        // an earlier test in this class had already spent that key's minute.
+        TableMetadata first = overflowTable("t3tbl_spam_a");
+        TableMetadata other = overflowTable("t3tbl_spam_b");
+
+        long saved = WindowRoutingIterator.maxBufferedBytesPerPartition;
+        ch.qos.logback.classic.Logger routingLogger =
+            (ch.qos.logback.classic.Logger) LoggerFactory.getLogger(WindowRoutingIterator.class);
+        ListAppender<ILoggingEvent> appender = new ListAppender<>();
+        appender.start();
+        routingLogger.addAppender(appender);
+        try
+        {
+            WindowRoutingIterator.maxBufferedBytesPerPartition = 1;   // overflow on the first row
+            List<Unfiltered> spanning = List.of(row(BASE + 1, BASE + 1), row(BASE + 2, BASE + HOUR_MS + 2));
+
+            WindowRoutingIterator.slices(new Source(first, DeletionTime.LIVE, null, spanning),
+                                         WINDOW, TimeUnit.MICROSECONDS);
+            WindowRoutingIterator.slices(new Source(other, DeletionTime.LIVE, null, spanning),
+                                         WINDOW, TimeUnit.MICROSECONDS);
+
+            String logged = appender.list.stream()
+                                         .filter(e -> e.getLevel() == Level.WARN)
+                                         .map(ILoggingEvent::getFormattedMessage)
+                                         .collect(java.util.stream.Collectors.joining("\n"));
+            assertTrue("the first overflowing table must be named; got:\n" + logged,
+                       logged.contains("t3ks.t3tbl_spam_a "));
+            assertTrue("the second table overflowed in the same interval and must not be suppressed;"
+                       + " got:\n" + logged,
+                       logged.contains("t3ks.t3tbl_spam_b "));
+        }
+        finally
+        {
+            routingLogger.detachAppender(appender);
+            WindowRoutingIterator.maxBufferedBytesPerPartition = saved;
+        }
+    }
+
+    private static TableMetadata overflowTable(String name)
+    {
+        return TableMetadata.builder("t3ks", name)
+                            .partitioner(Murmur3Partitioner.instance)
+                            .addPartitionKeyColumn("tag_id", UTF8Type.instance)
+                            .addClusteringColumn("timestamp", TimestampType.instance)
+                            .addRegularColumn("value", DoubleType.instance)
+                            .build();
     }
 
     /** Static cells are individually timestamped, so they split exactly like regular cells. */

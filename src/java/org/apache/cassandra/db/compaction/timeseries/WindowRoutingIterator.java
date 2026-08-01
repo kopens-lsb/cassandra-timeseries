@@ -442,7 +442,16 @@ public final class WindowRoutingIterator
         if (routed.overflowed())
         {
             // Degraded, memory-bounded path: one slice carrying the whole partition, header included.
-            NoSpamLogger.log(logger, NoSpamLogger.Level.WARN, "window-routing-buffer", 1, TimeUnit.MINUTES,
+            //
+            // The rate-limiter key names the table. NoSpamLogger keeps one interval per key, so a
+            // constant key would let whichever table overflowed first that minute suppress every
+            // other table's warning - and the tables that vanish are indistinguishable from tables
+            // that never overflowed. That is the one question this message exists to answer: an
+            // operator seeing parked windows needs to know which tables are hitting the buffer.
+            // Observed on a production node, where four tables logged and six parked silently.
+            NoSpamLogger.log(logger, NoSpamLogger.Level.WARN,
+                             "window-routing-buffer:" + partition.metadata().keyspace + '.' + partition.metadata().name,
+                             1, TimeUnit.MINUTES,
                              "Partition {} of {}.{} exceeded the {}-byte window-routing buffer; writing it " +
                              "unsplit into window {}. The resulting sstable will span windows and will be " +
                              "parked by the no-progress guard rather than re-split - consider a larger " +
