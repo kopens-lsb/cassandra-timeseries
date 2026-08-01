@@ -39,6 +39,8 @@ import com.google.common.annotations.VisibleForTesting;
 import org.slf4j.Logger;
 import org.slf4j.LoggerFactory;
 
+import org.apache.cassandra.concurrent.ExecutorFactory;
+import org.apache.cassandra.concurrent.ScheduledExecutorPlus;
 import org.apache.cassandra.concurrent.ScheduledExecutors;
 import org.apache.cassandra.cql3.CQLStatement;
 import org.apache.cassandra.cql3.ColumnIdentifier;
@@ -193,9 +195,22 @@ public class TieredStorageService implements TieredStorageServiceMBean
     volatile int maxSamplesPerWindow = 200_000;
 
     /**
+     * The sweep's own executor, deliberately <b>not</b> {@link ScheduledExecutors#optionalTasks}.
+     * That one is single-threaded and shared with hint buffer flushing, key/row cache saving and the
+     * auth cache refresh; a re-encode cycle is not a short task -- {@code ChunkTables.ensureChunkTable}
+     * alone will wait up to 10s per table for a lagging peer's schema, and every window it encodes is
+     * a distributed read plus a write plus a range delete -- so a slow tiered table would stall those
+     * unrelated periodic jobs behind it. Non-periodic on shutdown, like {@code optionalTasks}: an
+     * in-flight cycle has nothing that must complete (it claims coverage before it writes, so an
+     * interrupted cycle only over-states coverage) and draining must not wait for one.
+     */
+    private static final ScheduledExecutorPlus tieringExecutor =
+        ExecutorFactory.Global.executorFactory().scheduled(false, "TieredStorage");
+
+    /**
      * Registers the {@value #MBEAN_NAME} MBean and schedules the single, process-wide sweep
-     * ({@link #sweep}) that drives every policy-bearing table's re-encode cycle, on
-     * {@link ScheduledExecutors#optionalTasks} at a fixed {@value #SWEEP_DELAY_SECONDS}s delay.
+     * ({@link #sweep}) that drives every policy-bearing table's re-encode cycle, on tiering's own
+     * executor at a fixed {@value #SWEEP_DELAY_SECONDS}s delay.
      * <p>
      * Idempotent: guarded by {@link #setupDone}, so a second (or later) call is a silent no-op rather
      * than double-registering the MBean or scheduling a second sweep loop -- callers (namely
@@ -208,7 +223,7 @@ public class TieredStorageService implements TieredStorageServiceMBean
             return;
 
         MBeanWrapper.instance.registerMBean(this, MBEAN_NAME);
-        ScheduledExecutors.optionalTasks.scheduleWithFixedDelay(this::sweep, SWEEP_DELAY_SECONDS, SWEEP_DELAY_SECONDS, TimeUnit.SECONDS);
+        tieringExecutor.scheduleWithFixedDelay(this::sweep, SWEEP_DELAY_SECONDS, SWEEP_DELAY_SECONDS, TimeUnit.SECONDS);
     }
 
     /**

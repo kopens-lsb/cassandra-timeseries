@@ -57,9 +57,14 @@ import org.apache.cassandra.schema.TableMetadata;
  * history while a {@code DELETE} against it was accepted, masking chunk rows until
  * {@code gc_grace_seconds} purged the tombstone and the deleted data came back.
  * <p>
- * When coverage cannot be established at all the guard <b>rejects</b> (see
- * {@link ColdBoundary#coldBelowMs}): a wrongly refused write is loud and fixable in the moment, a
- * wrongly accepted one is silent until gc_grace.
+ * When coverage cannot be established at all the guard still <b>rejects</b> (see
+ * {@link ColdBoundary#coldBelowMs}) -- a wrongly refused write is loud and fixable in the moment, a
+ * wrongly accepted one is silent until gc_grace -- but only the shapes that are unambiguously
+ * deletions: a partition, range or row deletion. Cell-level tombstones are let through, because they
+ * are indistinguishable from what an ordinary live write emits (assigning any non-frozen collection
+ * or UDT produces a complex deletion; binding {@code null} in a prepared statement produces a cell
+ * tombstone), and refusing every one of those while the ledger is unreadable would break plain
+ * current-timestamp {@code INSERT}s -- an outage larger than the one being prevented.
  * <p>
  * <b>Not</b> rejected: anything confined to the hot window (ordinary current-data deletes are
  * untouched), and writes of real values to cold clusterings -- a late {@code UPDATE ... SET x = 1}
@@ -105,10 +110,20 @@ public final class TieredWrites
     private static void guard(PartitionUpdate update)
     {
         TableMetadata metadata = update.metadata();
-        // Same guard the read path applies: without exactly one timestamp clustering column nothing
+        // Same shape the read path requires: without exactly one timestamp clustering column nothing
         // has ever been chunked, so there is no cold copy for a tombstone to mask. Checked first
-        // because it is free, and because everything below reads a timestamp out of a clustering.
-        if (metadata.clusteringColumns().size() != 1)
+        // because it is free, and because everything below reads a timestamp out of a clustering --
+        // on any other clustering type that would throw MarshalException mid-DELETE.
+        if (!ColdBoundary.hasTimestampClustering(metadata))
+            return;
+
+        // CONTENT FIRST, coverage second. Coverage can cost a ledger read, and the overwhelming
+        // majority of writes -- every plain INSERT/UPDATE of real values -- cannot un-write anything
+        // whatever the coverage turns out to be. Asking coverage before looking at the update made
+        // every write to the table pay for the ledger, so a ledger that was timing out blocked a
+        // request thread per mutation.
+        Tombstones tombstones = tombstonesIn(update, ColdBoundary.isDescending(metadata));
+        if (tombstones == null)
             return;
 
         TieringPolicy policy;
@@ -127,47 +142,34 @@ public final class TieredWrites
         // Where cold begins, asked of what the chunk table REALLY holds rather than of the policy:
         // the policy can be raised, invalidated or dropped after data has been encoded, and none of
         // those makes a chunk's rows writable again. This is the same call the read path makes to
-        // decide whether to merge, off the same per-table cache -- one map lookup for the
-        // overwhelming majority of writes, which are to tables that have no chunk table at all.
-        long coldBelowMs = ColdBoundary.coldBelowMs(coverage(metadata, policy), policy);
+        // decide whether to merge, off the same per-table cache.
+        ChunkCoverage.Coverage coverage = coverage(metadata, policy);
+        long coldBelowMs = ColdBoundary.coldBelowMs(coverage, policy);
         // Nothing has ever been encoded and no policy calls anything cold: there is no cold copy for
         // any tombstone in this update to mask, whatever it contains. (Load-bearing: the
         // partition-delete rejection below is otherwise unconditional.)
         if (coldBelowMs == Long.MIN_VALUE)
             return;
 
-        boolean descending = ColdBoundary.isDescending(metadata);
-
-        if (!update.partitionLevelDeletion().isLive())
+        if (tombstones.partitionDelete)
             throw reject(metadata, "a partition-level DELETE", "it has no clustering bound, so it necessarily " +
                                                                "covers data that has already been chunked");
+        if (tombstones.lowestRangeMs < coldBelowMs)
+            throw reject(metadata, "a range DELETE", describeBoundary(coldBelowMs));
+        if (tombstones.lowestRowDeleteMs < coldBelowMs)
+            throw reject(metadata, "a row DELETE", describeBoundary(coldBelowMs));
 
-        DeletionInfo deletionInfo = update.deletionInfo();
-        if (deletionInfo.hasRanges())
-        {
-            Iterator<RangeTombstone> ranges = deletionInfo.rangeIterator(false);
-            while (ranges.hasNext())
-            {
-                RangeTombstone range = ranges.next();
-                if (ColdBoundary.lowestMs(range.deletedSlice(), descending) < coldBelowMs)
-                    throw reject(metadata, "a range DELETE", describeBoundary(coldBelowMs));
-            }
-        }
-
-        for (Row row : update)
-        {
-            // Static cells are never chunked (the re-encoder deletes a clustering RANGE, which cannot
-            // touch them), so deleting one is always safe.
-            if (row.clustering() == Clustering.STATIC_CLUSTERING)
-                continue;
-            if (!hasTombstone(row))
-                continue;
-            if (ColdBoundary.clusteringMs(row.clustering()) < coldBelowMs)
-                throw reject(metadata,
-                             row.deletion().isLive() ? "deleting a column (or writing a null value into one)"
-                                                     : "a row DELETE",
-                             describeBoundary(coldBelowMs));
-        }
+        // Cell-level tombstones are refused only against a coverage that was actually established.
+        // When it could not be, coldBelowMs is Long.MAX_VALUE -- EVERY clustering is nominally cold
+        // -- and this shape is not evidence of an attempt to remove anything: a complex deletion is
+        // what assigning any non-frozen collection or UDT emits, and a cell tombstone is what binding
+        // null in a prepared INSERT emits. Refusing those would reject ordinary current-timestamp
+        // writes for as long as the ledger stayed unreadable, which is a worse outage than the one it
+        // guards against. The unambiguously destructive shapes above are still refused, so an actual
+        // DELETE never slips through an unreadable ledger.
+        if (coverage.known() && tombstones.lowestCellMs < coldBelowMs)
+            throw reject(metadata, "deleting a column (or writing a null value into one)",
+                         describeBoundary(coldBelowMs));
     }
 
     /**
@@ -179,6 +181,7 @@ public final class TieredWrites
      * internal, node-local path): a coordinator that holds no replica of the ledger partition would
      * read it as empty and conclude that nothing is cold, which is precisely the mistake being
      * prevented, and it would cache that answer for the read path to make as well.
+     * ({@link ChunkCoverage#ledgerConsistency} enforces the same floor on every other caller.)
      */
     private static ChunkCoverage.Coverage coverage(TableMetadata metadata, TieringPolicy policy)
     {
@@ -186,9 +189,66 @@ public final class TieredWrites
                                                                : ChunkCoverage.DEFAULT_CONSISTENCY);
     }
 
-    private static boolean hasTombstone(Row row)
+    /**
+     * The oldest clustering an update tombstones, split by how much the shape says about intent.
+     * <p>
+     * The split exists because the guard has to behave differently when coverage is unknown. A
+     * partition, range or row deletion is produced by nothing but a {@code DELETE}, so it is
+     * unambiguously an attempt to remove data and is refused whether or not coverage could be
+     * established. A cell tombstone or a complex (collection/UDT) deletion is <em>also</em> what an
+     * ordinary {@code INSERT}/{@code UPDATE} of live data emits, so it is only refused against a
+     * coverage that is actually known.
+     */
+    private static final class Tombstones
     {
-        if (!row.deletion().isLive() || row.hasComplexDeletion())
+        boolean partitionDelete;
+        long lowestRangeMs = Long.MAX_VALUE;
+        long lowestRowDeleteMs = Long.MAX_VALUE;
+        long lowestCellMs = Long.MAX_VALUE;
+
+        boolean any()
+        {
+            return partitionDelete
+                   || lowestRangeMs != Long.MAX_VALUE
+                   || lowestRowDeleteMs != Long.MAX_VALUE
+                   || lowestCellMs != Long.MAX_VALUE;
+        }
+    }
+
+    /** @return what {@code update} tombstones, or {@code null} if it tombstones nothing at all. */
+    private static Tombstones tombstonesIn(PartitionUpdate update, boolean descending)
+    {
+        Tombstones found = new Tombstones();
+        found.partitionDelete = !update.partitionLevelDeletion().isLive();
+
+        DeletionInfo deletionInfo = update.deletionInfo();
+        if (deletionInfo.hasRanges())
+        {
+            Iterator<RangeTombstone> ranges = deletionInfo.rangeIterator(false);
+            while (ranges.hasNext())
+                found.lowestRangeMs = Math.min(found.lowestRangeMs,
+                                               ColdBoundary.lowestMs(ranges.next().deletedSlice(), descending));
+        }
+
+        for (Row row : update)
+        {
+            // Static cells are never chunked (the re-encoder deletes a clustering RANGE, which cannot
+            // touch them), so deleting one is always safe.
+            if (row.clustering() == Clustering.STATIC_CLUSTERING)
+                continue;
+            if (!row.deletion().isLive())
+                found.lowestRowDeleteMs = Math.min(found.lowestRowDeleteMs,
+                                                   ColdBoundary.clusteringMs(row.clustering()));
+            else if (hasCellTombstone(row))
+                found.lowestCellMs = Math.min(found.lowestCellMs, ColdBoundary.clusteringMs(row.clustering()));
+        }
+
+        return found.any() ? found : null;
+    }
+
+    private static boolean hasCellTombstone(Row row)
+    {
+        if (row.hasComplexDeletion())
             return true;
         for (Cell<?> cell : row.cells())
             if (cell.isTombstone())

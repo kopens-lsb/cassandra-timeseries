@@ -33,6 +33,7 @@ import org.slf4j.LoggerFactory;
 
 import org.apache.cassandra.cql3.CQLTester;
 import org.apache.cassandra.cql3.UntypedResultSet;
+import org.apache.cassandra.db.ConsistencyLevel;
 import org.apache.cassandra.db.marshal.BooleanType;
 import org.apache.cassandra.db.marshal.DoubleType;
 import org.apache.cassandra.db.marshal.Int32Type;
@@ -42,6 +43,7 @@ import org.apache.cassandra.db.timeseries.ColumnarChunkCodec;
 import org.apache.cassandra.db.timeseries.ColumnarCursor;
 import org.apache.cassandra.db.timeseries.tiering.TieredStorageService.TierRunStats;
 import org.apache.cassandra.exceptions.InvalidRequestException;
+import org.apache.cassandra.schema.TableMetadata;
 import org.apache.cassandra.utils.ByteBufferUtil;
 
 import static org.junit.Assert.assertEquals;
@@ -647,6 +649,179 @@ public class TieredStorageColumnsTest extends CQLTester
         execute("INSERT INTO %s (tag, ts, value) VALUES ('t', ?, 4.0) USING TIMESTAMP 400", new Date(7 * HOUR));
         assertRejectedAsColdWrite("DELETE FROM %s USING TIMESTAMP 500 WHERE tag = 't' AND ts = ?",
                                   new Date(7 * HOUR));
+    }
+
+    /** Drops {@code base}'s coverage ledger and empties the cache, so coverage reads back UNKNOWN. */
+    private void makeCoverageUnknowable() throws Throwable
+    {
+        execute("DROP TABLE " + KEYSPACE + ".\"" + ChunkTables.coverageTableName(currentTable()) + '"');
+        ChunkCoverage.invalidateAll();
+        assertFalse("precondition: coverage must be unknowable", ChunkCoverage.forTable(baseMetadata(), null).known());
+    }
+
+    private TableMetadata baseMetadata()
+    {
+        return getCurrentColumnFamilyStore().metadata();
+    }
+
+    /**
+     * ...but "fail closed" has to mean "refuse deletions", not "refuse writes". The write guard sees
+     * mutations, not statements, and two shapes of perfectly ordinary <em>live</em> write carry a
+     * tombstone in them: assigning any non-frozen collection or UDT emits a complex deletion (that is
+     * how a full collection assignment replaces the old one), and binding {@code null} for a column
+     * -- what every driver does for an unset field of a prepared INSERT -- emits a cell tombstone.
+     * <p>
+     * With an unreadable ledger every clustering is nominally cold, so refusing on those shapes
+     * refused current-timestamp inserts of the most common CQL shapes there are, for as long as the
+     * ledger stayed unreadable. That is a bigger outage than the one being prevented -- and the
+     * shapes that are unambiguously deletions are still refused, so nothing slips through.
+     */
+    @Test
+    public void anUnknowableLedgerStillAcceptsOrdinaryLiveWrites() throws Throwable
+    {
+        chunkOneRow();
+        execute("ALTER TABLE %s ADD attrs map<text, text>");
+        makeCoverageUnknowable();
+
+        // A prepared INSERT binding null for one column: a cell tombstone, and nothing more.
+        execute("INSERT INTO %s (tag, ts, value, quality) VALUES ('t', ?, ?, 7) USING TIMESTAMP 400",
+                new Date(7 * HOUR), null);
+        assertEquals(7, execute("SELECT quality FROM %s WHERE tag = 't' AND ts = ?", new Date(7 * HOUR))
+                        .one().getInt("quality"));
+
+        // Assigning a whole non-frozen collection: a complex deletion, and nothing more.
+        execute("UPDATE %s USING TIMESTAMP 401 SET attrs = {'unit': 'C'} WHERE tag = 't' AND ts = ?",
+                new Date(7 * HOUR));
+        assertEquals(1, execute("SELECT attrs FROM %s WHERE tag = 't' AND ts = ?", new Date(7 * HOUR))
+                        .one().getMap("attrs", UTF8Type.instance, UTF8Type.instance).size());
+
+        // The unambiguous shapes are still refused, on the same unreadable ledger.
+        assertRejectedAsColdWrite("DELETE FROM %s USING TIMESTAMP 500 WHERE tag = 't' AND ts = ?", new Date(7 * HOUR));
+        assertRejectedAsColdWrite("DELETE FROM %s USING TIMESTAMP 500 WHERE tag = 't' AND ts >= ? AND ts < ?",
+                                  new Date(0L), new Date(HOUR));
+        assertRejectedAsColdWrite("DELETE FROM %s USING TIMESTAMP 500 WHERE tag = 't'");
+    }
+
+    /**
+     * The guard inspects the update before it asks for coverage, because coverage can cost a ledger
+     * read and a write that tombstones nothing cannot un-write anything whatever the answer would
+     * have been. Asking first meant every write to a tiered table paid for the ledger -- and, with the
+     * ledger timing out, blocked a request thread for {@code read_request_timeout} each, one per
+     * mutation.
+     */
+    @Test
+    public void aWriteThatTombstonesNothingNeverReadsTheLedger() throws Throwable
+    {
+        chunkOneRow();
+        ChunkCoverage.invalidateAll();
+
+        execute("INSERT INTO %s (tag, ts, value, quality) VALUES ('t', ?, 2.5, 7) USING TIMESTAMP 400",
+                new Date(7 * HOUR));
+        execute("UPDATE %s USING TIMESTAMP 401 SET value = 3.5 WHERE tag = 't' AND ts = ?", new Date(7 * HOUR));
+        assertFalse("a write carrying no tombstone must not pay for a coverage lookup",
+                    ChunkCoverage.isCached(baseMetadata()));
+
+        // ...while one that does carry a tombstone still pays for it, and is still judged against it.
+        assertRejectedAsColdWrite("DELETE FROM %s USING TIMESTAMP 500 WHERE tag = 't' AND ts = ?", new Date(0L));
+        assertTrue(ChunkCoverage.isCached(baseMetadata()));
+    }
+
+    /**
+     * An unreadable ledger is remembered briefly rather than re-probed by every request. Without a
+     * negative cache, a ledger that is timing out costs one blocked request thread per read of the
+     * table -- node-wide request-thread exhaustion, which is a far larger failure than the degraded
+     * ledger that triggered it. Both consequences of remembering UNKNOWN are the safe ones.
+     */
+    @Test
+    public void anUnreadableLedgerIsNegativelyCached() throws Throwable
+    {
+        chunkOneRow();
+        makeCoverageUnknowable();
+        assertTrue("an unreadable ledger must be remembered, or every request re-reads it",
+                   ChunkCoverage.isCached(baseMetadata()));
+    }
+
+    // ---- the ledger is a monotone claim: nothing may narrow it ----
+
+    /**
+     * {@code claim} must refuse to run on a coverage it could not establish.
+     * <p>
+     * The claim it would otherwise write is built by widening <em>this node's current row</em>, and an
+     * UNKNOWN coverage carries no numbers at all -- so the "widened" row would contain only this
+     * cycle's window and this cycle's {@code chunk_window}, overwriting whatever this node had already
+     * claimed. After a {@code chunk_window} was shrunk (7d to 1h, say) that drops the aggregate widest
+     * to 1h, which shortens the read path's look-back to 1h, which stops it ever selecting the 7d-wide
+     * chunks whose {@code window_start} sits further back than that -- permanently hiding rows whose
+     * base copies were deleted when they were encoded. One unreadable ledger read, one cycle, and the
+     * data is gone from every subsequent read.
+     */
+    @Test
+    public void wideningAnUnknownCoverageIsRefusedInsteadOfNarrowingTheLedger()
+    {
+        try
+        {
+            ChunkCoverage.Coverage.UNKNOWN.widenedBy(0L, HOUR, HOUR);
+            fail("widening an unknown coverage must be refused, not silently treated as 'nothing recorded yet'");
+        }
+        catch (IllegalStateException e)
+        {
+            assertTrue(e.getMessage(), e.getMessage().contains("unknown"));
+        }
+    }
+
+    @Test
+    public void claimIsRefusedWhenTheLedgerCannotBeRead() throws Throwable
+    {
+        chunkOneRow();
+        makeCoverageUnknowable();
+        try
+        {
+            ChunkCoverage.claim(baseMetadata(), null, 0L, HOUR, HOUR);
+            fail("claiming against an unreadable ledger must abort the window");
+        }
+        catch (IllegalStateException e)
+        {
+            assertTrue(e.getMessage(), e.getMessage().contains("could not be read"));
+        }
+    }
+
+    /**
+     * The widest {@code chunk_window} ever written is a maximum across claims, so re-claiming with a
+     * narrower one leaves the read path's look-back reaching the older, wider chunks.
+     */
+    @Test
+    public void aNarrowerClaimDoesNotShrinkTheRecordedChunkWindow() throws Throwable
+    {
+        chunkOneRow();                                     // chunk_window = 1h, so widest = 1h
+        ChunkCoverage.invalidateAll();
+        ChunkCoverage.claim(baseMetadata(), null, 8 * HOUR, 9 * HOUR, HOUR / 4);
+        ChunkCoverage.invalidateAll();
+        assertEquals("a later, narrower claim must not shrink the look-back",
+                     HOUR, ChunkCoverage.forTable(baseMetadata(), null).lookbackMillis());
+    }
+
+    /**
+     * The ledger is consulted at quorum strength whatever the asking query's own consistency level
+     * is. It cannot be the caller's: the cache is keyed by table alone, so a {@code SELECT} at
+     * {@code CL=ONE} that landed on a replica without the ledger row would publish
+     * {@code Coverage.EMPTY} -- an authoritative "nothing is cold" -- for the write guard to act on,
+     * and a {@code DELETE} against chunked data would be accepted until the entry expired. The
+     * {@code null} (node-local internal) path is the same mistake by another route.
+     */
+    @Test
+    public void theLedgerIsNeverConsultedBelowQuorumStrength()
+    {
+        assertEquals(ConsistencyLevel.LOCAL_QUORUM, ChunkCoverage.ledgerConsistency(null));
+        assertEquals(ConsistencyLevel.LOCAL_QUORUM, ChunkCoverage.ledgerConsistency(ConsistencyLevel.ONE));
+        assertEquals(ConsistencyLevel.LOCAL_QUORUM, ChunkCoverage.ledgerConsistency(ConsistencyLevel.LOCAL_ONE));
+        assertEquals(ConsistencyLevel.LOCAL_QUORUM, ChunkCoverage.ledgerConsistency(ConsistencyLevel.TWO));
+        assertEquals(ConsistencyLevel.LOCAL_QUORUM, ChunkCoverage.ledgerConsistency(ConsistencyLevel.ANY));
+        assertEquals(ConsistencyLevel.LOCAL_QUORUM, ChunkCoverage.ledgerConsistency(ConsistencyLevel.SERIAL));
+        // Quorum-strength levels -- exactly those a tiering policy may name -- pass through unchanged.
+        assertEquals(ConsistencyLevel.QUORUM, ChunkCoverage.ledgerConsistency(ConsistencyLevel.QUORUM));
+        assertEquals(ConsistencyLevel.LOCAL_QUORUM, ChunkCoverage.ledgerConsistency(ConsistencyLevel.LOCAL_QUORUM));
+        assertEquals(ConsistencyLevel.EACH_QUORUM, ChunkCoverage.ledgerConsistency(ConsistencyLevel.EACH_QUORUM));
+        assertEquals(ConsistencyLevel.ALL, ChunkCoverage.ledgerConsistency(ConsistencyLevel.ALL));
     }
 
     // ---- end-to-end: a tombstone written while the row was hot must survive re-encoding ----

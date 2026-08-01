@@ -51,6 +51,24 @@ public final class ColdBoundary
     }
 
     /**
+     * The precondition every timestamp reader below has: exactly one clustering column, of type
+     * {@code timestamp}. It is what {@link TieringPolicy#unsupportedSchemaError} enforces before
+     * anything is ever chunked, but both the read gate and the write guard run on tables that have
+     * <em>not</em> been through that check -- every non-tiered table in the cluster, and any table
+     * carrying the extension on a shape tiering refuses. Composing a timestamp out of, say, an
+     * {@code int} clustering throws {@code MarshalException} in the middle of an ordinary query, so
+     * the shape is tested first and cheaply, off in-memory metadata.
+     * <p>
+     * {@code unwrap()}: {@code CLUSTERING ORDER BY (ts DESC)} wraps the type in {@code ReversedType},
+     * and both orders are supported.
+     */
+    public static boolean hasTimestampClustering(TableMetadata metadata)
+    {
+        return metadata.clusteringColumns().size() == 1
+               && metadata.clusteringColumns().get(0).type.unwrap().equals(TimestampType.instance);
+    }
+
+    /**
      * @return the epoch-millis instant at which data stops being hot: anything strictly older has
      * either been chunked already or is eligible to be on the next sweep.
      */

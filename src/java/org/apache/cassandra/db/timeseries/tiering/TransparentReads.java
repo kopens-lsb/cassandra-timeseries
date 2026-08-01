@@ -82,8 +82,19 @@ import static java.lang.String.format;
  * see {@link ChunkMergeUnfilteredIterator}. Every unfiltered-to-filtered conversion point on a
  * single-partition read path therefore calls {@link #maybeWrap}: the local ones
  * ({@code SinglePartitionReadQuery.Group#executeInternal}, {@code AbstractReadQuery#executeInternal})
- * and the coordinator ones ({@code DigestResolver#getData}, {@code DataResolver#getData},
- * {@code DataResolver#resolveInternal}).
+ * and the coordinator ones -- {@code DigestResolver#getData}, which serves a read whose digests
+ * agreed, and {@code DataResolver#resolveInternal}, which is the single point every reconciling path
+ * funnels through: the digest-<em>mismatch</em> retry ({@code AbstractReadRepair#startRepair} ->
+ * {@code DataResolver#resolve}), the transient-replica branch of {@code DigestResolver#getData},
+ * short-read protection and replica filtering protection.
+ *
+ * <p><b>Where in {@code resolveInternal} is load-bearing.</b> The wrap goes on the output of
+ * {@code UnfilteredPartitionIterators.merge(results, mergeListener)}, i.e. strictly after read
+ * repair's merge listener has been attached to the replica sources. A synthetic chunk row reaching
+ * that listener would look like a row present in the merged result and absent from every replica, so
+ * read repair would write it back into the base table as a real row -- undoing the compression and
+ * resurrecting data the re-encoder deliberately deleted. {@code TieredStorageDistributedTest#
+ * digestMismatchStillMergesChunksWithoutRepairingThemBack} holds both halves of that in place.
  */
 public final class TransparentReads
 {
@@ -179,11 +190,12 @@ public final class TransparentReads
         if (commands.isEmpty())
             return hot;
 
-        // Every timestamp read below assumes exactly one timestamp clustering column -- what
+        // Every timestamp read below assumes exactly one clustering column, of type timestamp -- what
         // TieringPolicy.unsupportedSchemaError enforces before anything is ever chunked. A table
         // carrying the extension but not that shape has no chunks to merge, and must not have its
-        // ordinary SELECTs broken by this code path.
-        if (metadata.clusteringColumns().size() != 1)
+        // ordinary SELECTs broken by this code path (composing a timestamp out of, say, an int
+        // clustering throws MarshalException mid-query).
+        if (!ColdBoundary.hasTimestampClustering(metadata))
             return hot;
 
         // Policy present, but nothing encoded yet: the shadow table has never been created, so there

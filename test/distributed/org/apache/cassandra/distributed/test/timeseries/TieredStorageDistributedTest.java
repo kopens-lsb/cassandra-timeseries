@@ -20,11 +20,16 @@ package org.apache.cassandra.distributed.test.timeseries;
 
 import java.io.IOException;
 import java.util.Date;
+import java.util.concurrent.TimeUnit;
+
+import com.google.common.util.concurrent.Uninterruptibles;
 
 import org.junit.AfterClass;
 import org.junit.BeforeClass;
 import org.junit.Test;
 
+import org.apache.cassandra.cql3.QueryProcessor;
+import org.apache.cassandra.db.timeseries.tiering.TransparentReads;
 import org.apache.cassandra.distributed.Cluster;
 import org.apache.cassandra.distributed.api.ConsistencyLevel;
 import org.apache.cassandra.distributed.test.TestBaseImpl;
@@ -228,6 +233,109 @@ public class TieredStorageDistributedTest extends TestBaseImpl
                      4L, countAt(3, "SELECT count(*) FROM %s." + t + " WHERE tag = ?", ConsistencyLevel.QUORUM, "tag-1"));
         assertTrue("chunks must survive the restart",
                    countAt(3, "SELECT count(*) FROM %s." + t + "__chunks", ConsistencyLevel.QUORUM) > 0);
+    }
+
+    /**
+     * The one read path the other tests here cannot reach: a <b>digest mismatch</b>.
+     * <p>
+     * When every replica agrees, a coordinator read is served by {@code DigestResolver#getData}. When
+     * they do not -- a replica that missed the re-encoder's range delete because it was restarting,
+     * dropped the mutation, or is still holding a hint -- the coordinator re-reads full data and
+     * resolves it through {@code DataResolver}, a completely different method. If the chunk merge is
+     * not on that path too, a {@code SELECT} over a chunked window returns hot rows only: no warning,
+     * no error, all cold history silently missing, and correct again as soon as the digests converge.
+     * The base rows for that history were deleted when it was encoded, so there is nothing else to
+     * serve it. Every test above passes with the merge missing from this path, because none of them
+     * ever makes the replicas disagree.
+     * <p>
+     * The second assertion is the other half, and it is about <em>where</em> in {@code DataResolver}
+     * the merge sits: after the replica merge, so read repair's merge listener never sees a synthetic
+     * chunk row. A row present in the merged result and absent from every replica is exactly what read
+     * repair writes back -- so a merge placed upstream of the listener would repair the whole decoded
+     * chunk into the base table as real rows, undoing the compression and resurrecting rows the
+     * re-encoder deliberately deleted. That is invisible to a client (the answer is still right) and
+     * permanent, so it is asserted on the replicas' own storage rather than on the query result.
+     */
+    @Test
+    public void digestMismatchStillMergesChunksWithoutRepairingThemBack()
+    {
+        String t = "digest_mismatch";
+        // Default read_repair (BLOCKING) -- unlike the other tables here, the repair path IS the test.
+        CLUSTER.schemaChange(withKeyspace("CREATE TABLE %s." + t + " (tag text, ts timestamp, value double, " +
+                                          "PRIMARY KEY (tag, ts))"));
+        setPolicy(t, POLICY);
+        for (int i = 0; i < 5; i++)
+            CLUSTER.coordinator(1).execute(withKeyspace("INSERT INTO %s." + t + " (tag, ts, value) VALUES (?, ?, ?)"),
+                                           ConsistencyLevel.ALL, "tag-0", new Date(i * 60_000L), 1.0 + i);
+        retierAllNodes(t);
+
+        // The chunk is now the only copy: no replica has a base row left for tag-0.
+        for (int node = 1; node <= 3; node++)
+            awaitLocalBaseRows(node, t, 0);
+
+        // Diverge exactly one replica, locally, without going through the coordinator -- the same
+        // shape a dropped mutation or a hint replayed after the delete leaves behind.
+        CLUSTER.get(2).executeInternal(withKeyspace("INSERT INTO %s." + t + " (tag, ts, value) VALUES (?, ?, ?)"),
+                                       "tag-0", new Date(30_000L), 42.0);
+        assertEquals(1, localBaseRows(2, t));
+
+        // ALL contacts every replica, so the digests cannot agree and the read must go through
+        // DataResolver rather than DigestResolver.
+        Object[][] rows = CLUSTER.coordinator(1).execute(
+            withKeyspace("SELECT ts, value FROM %s." + t + " WHERE tag = ?"), ConsistencyLevel.ALL, "tag-0");
+        assertEquals("a digest mismatch must not cost the read its cold half", 6, rows.length);
+        double[] expected = { 1.0, 42.0, 2.0, 3.0, 4.0, 5.0 };
+        long[] expectedTs = { 0L, 30_000L, 60_000L, 120_000L, 180_000L, 240_000L };
+        for (int i = 0; i < expected.length; i++)
+        {
+            assertEquals("row " + i + " timestamp", expectedTs[i], ((Date) rows[i][0]).getTime());
+            assertEquals("row " + i + " value", expected[i], (Double) rows[i][1], 0.0);
+        }
+
+        // Read repair has run once the divergent row has reached the replicas that lacked it...
+        for (int node = 1; node <= 3; node++)
+            awaitLocalBaseRows(node, t, 1);
+        // ...and it repaired that row and NOTHING ELSE. Six here would mean the decoded chunk was
+        // written back into the base table as real rows.
+        for (int node = 1; node <= 3; node++)
+            assertEquals("node " + node + " must hold only the repaired row, not the decoded chunk",
+                         1, localBaseRows(node, t));
+    }
+
+    /**
+     * @return how many rows {@code node} physically holds for {@code tag-0} in {@code table}'s base
+     * table. Bracketed with tiering's internal bypass, so this is the storage engine's answer and not
+     * the merged hot+cold view every other read in this class asserts on.
+     */
+    private static int localBaseRows(int node, String table)
+    {
+        String cql = withKeyspace("SELECT ts FROM %s." + table + " WHERE tag = 'tag-0'");
+        return CLUSTER.get(node).callOnInstance(() -> {
+            TransparentReads.enterInternalBypass();
+            try
+            {
+                return QueryProcessor.executeInternal(cql).size();
+            }
+            finally
+            {
+                TransparentReads.exitInternalBypass();
+            }
+        });
+    }
+
+    /** Waits (briefly) for {@code node} to physically hold exactly {@code expected} base rows. */
+    private static void awaitLocalBaseRows(int node, String table, int expected)
+    {
+        long deadline = System.nanoTime() + TimeUnit.SECONDS.toNanos(30);
+        int actual;
+        do
+        {
+            actual = localBaseRows(node, table);
+            if (actual == expected)
+                return;
+            Uninterruptibles.sleepUninterruptibly(50, TimeUnit.MILLISECONDS);
+        } while (System.nanoTime() < deadline);
+        assertEquals("node " + node + " base rows", expected, actual);
     }
 
     @Test

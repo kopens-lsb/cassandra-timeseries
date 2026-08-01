@@ -79,17 +79,6 @@ public class DataResolver<E extends Endpoints<E>, P extends ReplicaPlan.ForRead<
         this.trackRepairedStatus = trackRepairedStatus;
     }
 
-    public PartitionIterator getData()
-    {
-        ReadResponse response = responses.get(0).payload;
-        // Tiered storage: see TransparentReads.maybeWrap -- merged before the filter so tombstones
-        // still shadow chunk-decoded rows. No-op without a tiering policy.
-        return UnfilteredPartitionIterators.filter(
-            org.apache.cassandra.db.timeseries.tiering.TransparentReads.maybeWrap(command.metadata(), command, response.makeIterator(command),
-                         replicaPlan().consistencyLevel()),
-            command.nowInSec());
-    }
-
     public boolean isDataPresent()
     {
         return !responses.isEmpty();
@@ -233,7 +222,7 @@ public class DataResolver<E extends Endpoints<E>, P extends ReplicaPlan.ForRead<
             listener = wrapMergeListener(readRepair.getMergeListener(sources), sources, repairedDataTracker);
         }
 
-        return resolveInternal(context, listener, responseProvider, preCountFilter);
+        return resolveInternal(context, listener, responseProvider, preCountFilter, true);
     }
 
     private PartitionIterator resolveWithReplicaFilteringProtection(E replicas, RepairedDataTracker repairedDataTracker)
@@ -266,10 +255,19 @@ public class DataResolver<E extends Endpoints<E>, P extends ReplicaPlan.ForRead<
 
         // We need separate contexts, as each context has his own counter
         ResolveContext firstPhaseContext = new ResolveContext(replicas, false);
+        // Tiered storage: the first phase merges chunks NOT AT ALL (the `false`). Its output is not
+        // the query's answer -- it exists only to drive RFP's merge listener, which caches each
+        // replica's version of every row and marks a replica "silent" wherever the merged row has no
+        // version from it. A synthetic chunk row has no version from ANY replica, so every one would
+        // be marked silent for it and re-queried for a row that exists only in the chunk table; the
+        // rows those re-queries complete are what the second phase then hands to read repair. Chunks
+        // join once, in the second phase, after read repair's listener is attached -- exactly as on
+        // the ordinary path.
         PartitionIterator firstPhasePartitions = resolveInternal(firstPhaseContext,
                                                                  rfp.mergeController(),
                                                                  i -> shortReadProtectedResponse(i, firstPhaseContext, null),
-                                                                 null);
+                                                                 null,
+                                                                 false);
 
         ResolveContext secondPhaseContext = new ResolveContext(replicas, true);
         PartitionIterator completedPartitions = resolveWithReadRepair(secondPhaseContext,
@@ -296,10 +294,17 @@ public class DataResolver<E extends Endpoints<E>, P extends ReplicaPlan.ForRead<
         };
     }
 
+    /**
+     * @param mergeChunkRows whether decoded tiered-storage chunk rows should join this stream. True
+     *                       on every path whose output is the query's answer; false for the replica-
+     *                       filtering-protection first phase, whose output is only a driver for
+     *                       {@link ReplicaFilteringProtection}'s listener (see the call site).
+     */
     private PartitionIterator resolveInternal(ResolveContext context,
                                               UnfilteredPartitionIterators.MergeListener mergeListener,
                                               ResponseProvider responseProvider,
-                                              @Nullable UnaryOperator<PartitionIterator> preCountFilter)
+                                              @Nullable UnaryOperator<PartitionIterator> preCountFilter,
+                                              boolean mergeChunkRows)
     {
         int count = context.replicas.size();
         List<UnfilteredPartitionIterator> results = new ArrayList<>(count);
@@ -322,10 +327,14 @@ public class DataResolver<E extends Endpoints<E>, P extends ReplicaPlan.ForRead<
 
         UnfilteredPartitionIterator merged = UnfilteredPartitionIterators.merge(results, mergeListener);
         // Tiered storage: chunk-decoded rows join AFTER the replica merge -- so read repair's merge
-        // listener never sees them and cannot try to "repair" synthetic rows onto replicas -- but
-        // BEFORE the filter, so tombstones still shadow them. No-op without a tiering policy.
-        merged = org.apache.cassandra.db.timeseries.tiering.TransparentReads
-                     .maybeWrap(command.metadata(), command, merged, replicaPlan().consistencyLevel());
+        // listener never sees them and cannot try to "repair" synthetic rows onto replicas, which
+        // would write the decoded chunk back into the base table as real rows and resurrect data the
+        // re-encoder deliberately deleted -- but BEFORE the filter, so tombstones still shadow them.
+        // Both halves are held by TieredStorageDistributedTest#
+        // digestMismatchStillMergesChunksWithoutRepairingThemBack. No-op without a tiering policy.
+        if (mergeChunkRows)
+            merged = org.apache.cassandra.db.timeseries.tiering.TransparentReads
+                         .maybeWrap(command.metadata(), command, merged, replicaPlan().consistencyLevel());
         Filter filter = new Filter(command.nowInSec(), command.metadata().enforceStrictLiveness());
         FilteredPartitions filtered = FilteredPartitions.filter(merged, filter);
 

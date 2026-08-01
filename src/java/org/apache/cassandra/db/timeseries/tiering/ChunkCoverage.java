@@ -95,6 +95,13 @@ public final class ChunkCoverage
      */
     static final String SCOPE = "chunks";
 
+    /**
+     * The oldest {@code window_start} this node has encoded. Recorded and aggregated, but deliberately
+     * <b>not</b> consulted by the read path: a symmetric "query ends below the oldest chunk, skip the
+     * merge" fast path has no equivalent of the hot-boundary floor that makes the top one safe when
+     * coverage is stale, so a node whose cache predates a backfill (or a {@code retier} over historical
+     * data) would silently omit the newly encoded windows for up to {@value #REFRESH_SECONDS}s.
+     */
     static final String MIN_WINDOW_START = "min_window_start";
     static final String MAX_WINDOW_START = "max_window_start";
     static final String MAX_CHUNK_WINDOW = "max_chunk_window";
@@ -102,21 +109,38 @@ public final class ChunkCoverage
     static final String NODE_COLUMN = "node";
 
     /**
-     * The consistency level to read or write the ledger at when no policy names one -- which happens
-     * on the write guard's path once the extension has been dropped, and inside {@link #claim} when
-     * it is called without one. Deliberately not the node-local internal path: the ledger describes
-     * the whole cluster's chunks, and a node that holds no replica of its partition would read it as
-     * empty. Matches {@link TieringPolicy}'s own documented {@code consistency} default.
+     * The consistency level to read or write the ledger at when the caller does not name a
+     * quorum-strength one -- see {@link #ledgerConsistency}. Deliberately not the node-local internal
+     * path: the ledger describes the whole cluster's chunks, and a node that holds no replica of its
+     * partition would read it as empty. Matches {@link TieringPolicy}'s own documented
+     * {@code consistency} default.
      */
     static final ConsistencyLevel DEFAULT_CONSISTENCY = ConsistencyLevel.LOCAL_QUORUM;
 
     private static final long REFRESH_SECONDS = 60;
     private static final long REFRESH_MILLIS = TimeUnit.SECONDS.toMillis(REFRESH_SECONDS);
 
+    /**
+     * How long an {@link Coverage#UNKNOWN} answer is remembered. Short, because it is a fault state
+     * that should be re-probed soon -- but not zero: an unreadable ledger with no negative cache at
+     * all means <em>every</em> read and every tombstone-bearing write of the table issues its own
+     * ledger read, each blocking a request thread for up to {@code read_request_timeout}. That turns
+     * a degraded ledger into node-wide request-thread exhaustion, which is a far bigger outage than
+     * the one being reported. Both consequences of a cached UNKNOWN are the safe ones (reads merge
+     * chunks unconditionally, deletes are refused), so paying them for a few seconds is cheap.
+     */
+    private static final long UNKNOWN_REFRESH_MILLIS = TimeUnit.SECONDS.toMillis(5);
+
     /** Bounded like {@code TieringPolicy.PARSED}: cleared wholesale rather than grown without limit. */
     private static final int MAX_CACHED_TABLES = 4096;
 
     private static final ConcurrentHashMap<TableId, Entry> CACHE = new ConcurrentHashMap<>();
+
+    /**
+     * One monitor per table, held across a ledger load so concurrent requests for the same table
+     * coalesce onto one read instead of each starting their own -- see {@link #forTable}.
+     */
+    private static final ConcurrentHashMap<TableId, Object> LOADING = new ConcurrentHashMap<>();
 
     private ChunkCoverage()
     {
@@ -179,6 +203,18 @@ public final class ChunkCoverage
         }
 
         /**
+         * @return {@code false} when the ledger could not be consulted at all, so nothing here is a
+         * statement about the chunk table. Callers that would otherwise <em>act</em> on the numbers
+         * -- rather than merely fail safe on the sentinels {@link #topExclusiveMs()} returns -- have
+         * to distinguish the two: see {@link TieredWrites} (which narrows what it refuses) and
+         * {@link #claim} (which refuses to run at all).
+         */
+        public boolean known()
+        {
+            return known;
+        }
+
+        /**
          * @return one past the newest timestamp any chunk can hold: a query starting at or after this
          * needs no merge. {@link Long#MIN_VALUE} when nothing is encoded (nothing to merge, ever),
          * {@link Long#MAX_VALUE} when coverage is unknown (merge everything).
@@ -196,18 +232,6 @@ public final class ChunkCoverage
         }
 
         /**
-         * @return the oldest {@code window_start} any chunk carries: a query ending at or before this
-         * needs no merge. {@link Long#MAX_VALUE} when nothing is encoded, {@link Long#MIN_VALUE} when
-         * coverage is unknown.
-         */
-        public long bottomInclusiveMs()
-        {
-            if (!known)
-                return Long.MIN_VALUE;
-            return anyChunks ? minWindowStartMs : Long.MAX_VALUE;
-        }
-
-        /**
          * @return how far before a query's start the chunk {@code SELECT} must look for a chunk that
          * could still reach into the range -- the <b>widest</b> {@code chunk_window} any existing
          * chunk was written with, not the currently configured one. Falls back to the validated
@@ -222,10 +246,22 @@ public final class ChunkCoverage
         /**
          * @return this coverage widened to also span {@code [minWindowStart, maxWindowStart]} with a
          * chunk width of at least {@code widthMs}.
+         * @throws IllegalStateException if this coverage is unknown -- there is nothing to widen, and
+         * treating "unknown" as "empty" here would <b>narrow</b> the ledger (see below)
          */
         Coverage widenedBy(long minWindowStart, long maxWindowStart, long widthMs)
         {
-            if (!anyChunks())
+            // Deliberately explicit rather than falling through to the anyChunks() branch below.
+            // anyChunks() answers `known && anyChunks`, so an UNKNOWN coverage would take the
+            // "nothing recorded yet" path and RESET this node's ledger row to just this cycle's
+            // window and this cycle's chunk_window -- narrowing the cluster's recorded coverage. That
+            // is precisely the failure the ledger exists to prevent: after a chunk_window was
+            // shrunk, the aggregate widest would drop to the new value and the read path's look-back
+            // would stop reaching the wider legacy chunks, whose base rows are already deleted.
+            if (!known)
+                throw new IllegalStateException("chunk coverage is unknown, so it cannot be widened");
+
+            if (!anyChunks)
                 return new Coverage(true, true, true, minWindowStart, maxWindowStart, widthMs);
 
             return new Coverage(true, true, true,
@@ -258,34 +294,52 @@ public final class ChunkCoverage
     private static final class Entry
     {
         final Coverage coverage;
-        final long loadedAtMillis;
+        final long expiresAtMillis;
 
         Entry(Coverage coverage, long loadedAtMillis)
         {
             this.coverage = coverage;
-            this.loadedAtMillis = loadedAtMillis;
+            this.expiresAtMillis = loadedAtMillis + (coverage.known ? REFRESH_MILLIS : UNKNOWN_REFRESH_MILLIS);
         }
     }
 
     /**
      * @param cl the consistency level of the query asking, or {@code null} on the internal/local
-     *           execution path -- mirrored from {@link TransparentReads}'s chunk read so the ledger
-     *           and the chunks it describes are always read with the same reach.
+     *           execution path. Advisory only: the ledger is always consulted at quorum strength
+     *           (see {@link #ledgerConsistency}), because a weaker read that missed the ledger row
+     *           would be cached as {@link Coverage#EMPTY} -- an authoritative "nothing is cold" that
+     *           the write guard would then act on.
      * @return {@code base}'s chunk coverage, from cache when fresh.
      */
     public static Coverage forTable(TableMetadata base, ConsistencyLevel cl)
     {
-        Entry entry = CACHE.get(base.id);
-        long now = Clock.Global.currentTimeMillis();
-        if (entry != null && now - entry.loadedAtMillis < REFRESH_MILLIS)
-            return entry.coverage;
+        Coverage cached = cached(base.id);
+        if (cached != null)
+            return cached;
 
-        Coverage loaded = load(base, cl);
-        // An unreadable ledger is not cached: it must be retried on the next read rather than pinning
-        // "merge everything" (or, worse, a wrong answer) for a whole refresh interval.
-        if (loaded.known || !loaded.chunkTableExists)
-            put(base.id, loaded, now);
-        return loaded;
+        // Single-flight, per table. Without it, every request arriving while a slow (or timing-out)
+        // ledger read is in flight starts its own: one blocked request thread per concurrent query
+        // instead of one for the whole table. The waiters re-check the cache on entry, so all but the
+        // first pay the wait rather than the read -- and, once the loser of the race has published,
+        // nothing at all.
+        Object lock = LOADING.computeIfAbsent(base.id, ignored -> new Object());
+        synchronized (lock)
+        {
+            cached = cached(base.id);
+            if (cached != null)
+                return cached;
+
+            Coverage loaded = load(base, cl);
+            put(base.id, loaded);
+            return loaded;
+        }
+    }
+
+    /** @return the cached coverage for {@code id} if it has not expired, else {@code null}. */
+    private static Coverage cached(TableId id)
+    {
+        Entry entry = CACHE.get(id);
+        return entry != null && Clock.Global.currentTimeMillis() < entry.expiresAtMillis ? entry.coverage : null;
     }
 
     /**
@@ -303,6 +357,42 @@ public final class ChunkCoverage
     public static void invalidateAll()
     {
         CACHE.clear();
+        LOADING.clear();
+    }
+
+    /**
+     * @return {@code true} if {@code base}'s coverage is currently cached, i.e. some caller has read
+     * the ledger recently. The only observable difference between "the ledger was consulted" and
+     * "the ledger was not consulted", which is what the write guard's cost depends on.
+     */
+    @VisibleForTesting
+    public static boolean isCached(TableMetadata base)
+    {
+        return cached(base.id) != null;
+    }
+
+    /**
+     * The consistency level the ledger itself is read and written at, which is deliberately not
+     * (always) the caller's.
+     * <p>
+     * The cache is keyed by table alone, so whatever the first caller after an expiry loads is what
+     * every later caller sees for the next refresh interval -- including {@link TieredWrites}, whose
+     * whole correctness rests on never being handed a coverage that was read too weakly to see the
+     * ledger row. A user {@code SELECT} at {@code CL=ONE} landing on a replica that does not have the
+     * row would otherwise cache {@link Coverage#EMPTY} -- an authoritative "nothing is cold" -- and
+     * for the rest of that interval a {@code DELETE} against chunked data would be accepted, masking
+     * the chunk until {@code gc_grace_seconds} purged the tombstone and the data came back. The
+     * {@code null} (node-local internal) path is the same mistake by another route: a coordinator
+     * holding no replica of the ledger partition reads it as empty.
+     * <p>
+     * Quorum strength is exactly the set a {@link TieringPolicy} may name for its own writes, so a
+     * ledger row written by the re-encoder is always visible to a read at any level this returns.
+     *
+     * @param requested the caller's consistency level, or {@code null}
+     */
+    static ConsistencyLevel ledgerConsistency(ConsistencyLevel requested)
+    {
+        return TieringPolicy.isQuorumStrength(requested) ? requested : DEFAULT_CONSISTENCY;
     }
 
     /**
@@ -321,11 +411,26 @@ public final class ChunkCoverage
      * it is exactly the bug this class exists to prevent.
      * <p>
      * A no-op when the claim adds nothing to what is already recorded, which is the steady state.
+     *
+     * @throws IllegalStateException if the ledger cannot be read, so this node's existing claim is
+     * not known. Writing one anyway would <b>narrow</b> the ledger to this cycle's window and this
+     * cycle's {@code chunk_window} -- and after a {@code chunk_window} was shrunk, that permanently
+     * hides every wider legacy chunk from the read path's look-back.
      */
     public static void claim(TableMetadata base, ConsistencyLevel cl,
                              long windowStartMs, long cutoffMs, long chunkWindowMillis)
     {
-        Coverage current = forTable(base, cl);
+        ConsistencyLevel ledgerCl = ledgerConsistency(cl);
+        Coverage current = forTable(base, ledgerCl);
+        if (!current.known())
+            throw new IllegalStateException(format(
+                "Tiered storage: %s.%s's chunk coverage ledger could not be read, so what this node has already " +
+                "claimed is unknown and this window cannot be claimed. Writing a claim built on an unknown " +
+                "coverage would overwrite this node's ledger row with only this cycle's window and chunk_window, " +
+                "narrowing the cluster's recorded coverage -- after which reads stop looking for the chunks it no " +
+                "longer mentions, whose base rows are already deleted. The window is skipped and retried next cycle.",
+                base.keyspace, base.name));
+
         Coverage widened = current.widenedBy(windowStartMs, cutoffMs, chunkWindowMillis);
         if (current.sameAs(widened))
             return;
@@ -342,18 +447,24 @@ public final class ChunkCoverage
         // Deliberately unguarded: a failure here must abort the window rather than let the chunk be
         // written behind a ledger that does not cover it. The re-encoder's per-tag handler catches it
         // and counts the tag as skipped.
-        QueryProcessor.process(insert, cl == null ? DEFAULT_CONSISTENCY : cl, values);
-        put(base.id, widened, Clock.Global.currentTimeMillis());
+        QueryProcessor.process(insert, ledgerCl, values);
+        put(base.id, widened);
     }
 
-    private static void put(TableId id, Coverage coverage, long atMillis)
+    private static void put(TableId id, Coverage coverage)
     {
         if (CACHE.size() >= MAX_CACHED_TABLES)
+        {
+            // Wholesale, like TieringPolicy.PARSED: at 4096 distinct tables this is a once-in-a-very-
+            // long-while event whose only cost is re-reading each ledger once, and an eviction policy
+            // would need per-entry bookkeeping on the hottest lookup in the read path.
             CACHE.clear();
-        CACHE.put(id, new Entry(coverage, atMillis));
+            LOADING.clear();
+        }
+        CACHE.put(id, new Entry(coverage, Clock.Global.currentTimeMillis()));
     }
 
-    private static Coverage load(TableMetadata base, ConsistencyLevel cl)
+    private static Coverage load(TableMetadata base, ConsistencyLevel requestedCl)
     {
         if (Schema.instance.getTableMetadata(base.keyspace, ChunkTables.chunkTableName(base.name)) == null)
             return Coverage.NO_CHUNK_TABLE;
@@ -382,9 +493,11 @@ public final class ChunkCoverage
         TransparentReads.enterInternalBypass();
         try
         {
-            rows = cl == null
-                   ? QueryProcessor.executeInternal(select, SCOPE)
-                   : QueryProcessor.process(select, cl, List.of(UTF8Type.instance.decompose(SCOPE)));
+            // Never executeInternal, and never weaker than a quorum -- see ledgerConsistency(). The
+            // answer is cached for every later caller, including the write guard, so it has to be one
+            // that could not have missed a ledger row simply because of where this read landed.
+            rows = QueryProcessor.process(select, ledgerConsistency(requestedCl),
+                                          List.of(UTF8Type.instance.decompose(SCOPE)));
         }
         catch (RuntimeException e)
         {

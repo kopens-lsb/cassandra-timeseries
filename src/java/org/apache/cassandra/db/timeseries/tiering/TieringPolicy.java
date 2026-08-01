@@ -480,6 +480,17 @@ public final class TieringPolicy
         return (String) value;
     }
 
+    /**
+     * @return {@code true} if {@code cl} is one of the quorum-strength levels a policy may name for
+     * the re-encoder's own reads and writes -- i.e. one at which anything written by any accepted
+     * policy is guaranteed visible. {@link ChunkCoverage} uses it to refuse to consult the coverage
+     * ledger any more weakly than the re-encoder wrote it, whatever the asking query's own CL is.
+     */
+    static boolean isQuorumStrength(ConsistencyLevel cl)
+    {
+        return cl != null && ALLOWED_CONSISTENCY_LEVELS.contains(cl);
+    }
+
     private static ConsistencyLevel parseConsistency(String value)
     {
         ConsistencyLevel consistency;

@@ -44,6 +44,7 @@ import org.apache.cassandra.gms.Gossiper;
 import org.apache.cassandra.schema.ColumnMetadata;
 import org.apache.cassandra.schema.CompactionParams;
 import org.apache.cassandra.schema.Schema;
+import org.apache.cassandra.schema.TableId;
 import org.apache.cassandra.schema.TableMetadata;
 import org.apache.cassandra.schema.TableParams;
 import org.apache.cassandra.service.StorageProxy;
@@ -77,12 +78,19 @@ public final class ChunkTables
     private static final long SCHEMA_AGREEMENT_TIMEOUT_MILLIS = TimeUnit.SECONDS.toMillis(10);
 
     /**
-     * {@code "keyspace.table"} of every chunk table this node has already watched the whole cluster
-     * converge on. Schema only moves forwards and a chunk table is never dropped by this code, so a
-     * table that was once visible everywhere stays visible: the check is worth paying exactly once
-     * per chunk table per process, not on every sweep tick.
+     * The {@link TableId} of every chunk table this node has already watched the whole cluster
+     * converge on. Schema only moves forwards, so a table that was once visible everywhere stays
+     * visible: the check is worth paying exactly once per chunk table per process, not on every
+     * sweep tick.
+     * <p>
+     * Keyed on the id, <b>not</b> on {@code "keyspace.table"}, because this code is not the only
+     * thing that can remove a chunk table: {@link org.apache.cassandra.db.timeseries.UnsupportedChunkFormatException}
+     * tells an operator in as many words to {@code DROP} it and let tiering re-run. Re-creating it
+     * mints a new id, so the agreement wait runs again for the new table rather than being skipped
+     * for the rest of the process's life on the strength of the dropped one's name -- which would
+     * reinstate exactly the first-cycle tag loss the wait exists to prevent.
      */
-    private static final Set<String> agreedChunkTables = ConcurrentHashMap.newKeySet();
+    private static final Set<TableId> agreedChunkTables = ConcurrentHashMap.newKeySet();
 
     static final String CLUSTERING_COLUMN = "window_start";
     static final String CODEC_COLUMN = "codec";
@@ -330,8 +338,11 @@ public final class ChunkTables
      */
     private static void awaitClusterWideVisibility(String keyspace, String table)
     {
-        String key = keyspace + '.' + table;
-        if (agreedChunkTables.contains(key))
+        TableMetadata chunkTable = Schema.instance.getTableMetadata(keyspace, table);
+        // Null only if the CREATE above has not landed in this node's own schema, which is not a
+        // state the wait can be memoized against -- fall through and wait, unmemoized.
+        TableId id = chunkTable == null ? null : chunkTable.id;
+        if (id != null && agreedChunkTables.contains(id))
             return;
 
         // Nobody to propagate to. Also the shape every single-node unit test runs in, where the
@@ -345,7 +356,8 @@ public final class ChunkTables
         {
             if (everyReachableNodeHasOurSchema())
             {
-                agreedChunkTables.add(key);
+                if (id != null)
+                    agreedChunkTables.add(id);
                 return;
             }
 
@@ -356,9 +368,10 @@ public final class ChunkTables
             backoffMillis = Math.min(1000, backoffMillis * 2);
         }
 
-        logger.warn("Tiered storage: {} did not become visible cluster-wide within {}ms of being ensured. " +
+        logger.warn("Tiered storage: {}.{} did not become visible cluster-wide within {}ms of being ensured. " +
                     "Tags whose replicas are still behind will fail this re-encode cycle with " +
-                    "INCOMPATIBLE_SCHEMA and be retried on the next one.", key, SCHEMA_AGREEMENT_TIMEOUT_MILLIS);
+                    "INCOMPATIBLE_SCHEMA and be retried on the next one.",
+                    keyspace, table, SCHEMA_AGREEMENT_TIMEOUT_MILLIS);
     }
 
     /** @return {@code true} if no reachable node reports a schema version other than this node's. */
