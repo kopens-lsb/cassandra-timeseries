@@ -18,13 +18,18 @@
 package org.apache.cassandra.db.timeseries.tiering;
 
 import java.nio.ByteBuffer;
+import java.nio.ByteOrder;
+import java.nio.charset.StandardCharsets;
 import java.util.ArrayList;
 import java.util.Date;
 import java.util.LinkedHashMap;
 import java.util.List;
 import java.util.Map;
+import java.util.Random;
 
 import org.junit.Test;
+import org.slf4j.Logger;
+import org.slf4j.LoggerFactory;
 
 import org.apache.cassandra.cql3.CQLTester;
 import org.apache.cassandra.cql3.UntypedResultSet;
@@ -41,6 +46,7 @@ import org.apache.cassandra.utils.ByteBufferUtil;
 
 import static org.junit.Assert.assertEquals;
 import static org.junit.Assert.assertFalse;
+import static org.junit.Assert.assertNotNull;
 import static org.junit.Assert.assertTrue;
 import static org.junit.Assert.fail;
 
@@ -54,6 +60,8 @@ import static org.junit.Assert.fail;
  */
 public class TieredStorageColumnsTest extends CQLTester
 {
+    private static final Logger logger = LoggerFactory.getLogger(TieredStorageColumnsTest.class);
+
     private static final long HOUR = 3_600_000L;
     private static final MapType<String, String> ATTRIBUTE_TYPE =
         MapType.getInstance(UTF8Type.instance, UTF8Type.instance, false);
@@ -795,7 +803,223 @@ public class TieredStorageColumnsTest extends CQLTester
         assertEquals(9.0, rows.get(2).getDouble("value"), 0.0);
     }
 
+    // ---- SP4 Task 5 (D2): the production shape at production density ----
+
+    /**
+     * One sample a second across the whole 1h chunk window -- pp.tm_tag_point's real density, and the
+     * only density at which a bytes-per-row number means anything (six rows would be all header).
+     */
+    private static final int REAL_SHAPE_ROWS = 3600;
+    private static final long REAL_SHAPE_STEP_MS = 1000L;
+
+    /** {@code attribute} as pp actually stores it: an empty frozen map, identical on every row. */
+    private static ByteBuffer emptyAttribute()
+    {
+        return ATTRIBUTE_TYPE.decompose(new LinkedHashMap<>());
+    }
+
+    /**
+     * Writes one full chunk window of tm_tag_point-shaped rows whose column behaviour is pp's
+     * measured behaviour:
+     * <ul>
+     *   <li>{@code quality} constantly 192, {@code error_code} constantly 0,
+     *       {@code attribute} constantly {@code {}} -- the CONSTANT path;</li>
+     *   <li>{@code value_numeric} never written at all -- the all-null path (as is
+     *       {@code value_boolean}: a numeric tag point never carries one);</li>
+     *   <li>{@code latency} high-entropy (a deterministic uniform draw over 1..999);</li>
+     *   <li>{@code value} a short numeric-looking text, produced by a deterministic random walk
+     *       rounded to one decimal -- a slowly-varying sensor reading, not white noise.</li>
+     * </ul>
+     * The generator is deliberately seeded and spelled out here because the encoded size this
+     * produces is the number Task 6 compares against production.
+     */
+    private void loadRealShapeWindow() throws Throwable
+    {
+        execute("INSERT INTO %s (tag_id, area_id, asset_id, line_id, opc_id, site_id, tag_name, type) " +
+                "VALUES ('t1', 'a', 'as', 'l', 'o', 's', 'tn', 'ty') USING TIMESTAMP 100");
+
+        Random random = new Random(20260801L);
+        double reading = 23.4;
+        ByteBuffer attribute = emptyAttribute();
+        for (int i = 0; i < REAL_SHAPE_ROWS; i++)
+        {
+            reading += (random.nextDouble() - 0.5) * 0.4;
+            execute("INSERT INTO %s (tag_id, timestamp, attribute, error_code, latency, quality, value) " +
+                    "VALUES ('t1', ?, ?, 0, ?, 192, ?) USING TIMESTAMP ?",
+                    new Date(i * REAL_SHAPE_STEP_MS), attribute, 1 + random.nextInt(999),
+                    String.format("%.1f", reading), 1000L + i);
+        }
+        // One hot row, so the window boundary is exercised exactly as in the other tests.
+        execute("INSERT INTO %s (tag_id, timestamp, latency) VALUES ('t1', ?, 1) USING TIMESTAMP 200",
+                new Date(4 * HOUR));
+    }
+
+    @Test
+    public void productionShapedColumnsTakeTheConstantAndAllNullPaths() throws Throwable
+    {
+        createProductionShapedTable();
+        loadRealShapeWindow();
+
+        TierRunStats stats = new TieredStorageService().runOnce(KEYSPACE, currentTable(), 5 * HOUR);
+        assertEquals(1, stats.windowsEncoded);
+        assertEquals(REAL_SHAPE_ROWS, stats.rowsEncoded);
+
+        UntypedResultSet.Row chunkRow = execute(chunkSelectQuery(), "t1", new Date(0L)).one();
+        assertEquals(REAL_SHAPE_ROWS, chunkRow.getInt("samples"));
+        ByteBuffer payload = chunkRow.getBytes("payload");
+        Map<String, DirectoryEntry> directory = readDirectory(payload);
+
+        // Round-tripping alone cannot tell a CONSTANT column from one that silently fell back to a
+        // full-width section holding 3600 copies of 192, so assert the directory itself: the flag is
+        // set AND the column's data section is empty. Both halves matter -- a flag with a non-empty
+        // section would mean the bytes were written anyway.
+        for (String constant : new String[]{ "quality", "error_code", "attribute" })
+        {
+            DirectoryEntry entry = directory.get(constant);
+            assertNotNull("no directory entry for " + constant + " in " + directory.keySet(), entry);
+            assertTrue(constant + " must be encoded via the CONSTANT flag, flags=" + entry.flags, entry.constant());
+            assertEquals(constant + " must occupy no data section at all", 0, entry.sectionLen);
+        }
+
+        DirectoryEntry numeric = directory.get("value_numeric");
+        assertNotNull("no directory entry for value_numeric", numeric);
+        assertTrue("value_numeric was never written and must take the all-null flag, flags=" + numeric.flags,
+                   numeric.allNull());
+        assertFalse("an all-null column must not also claim to be constant", numeric.constant());
+        assertEquals("value_numeric must occupy no data section at all", 0, numeric.sectionLen);
+
+        // The control: the high-entropy column must NOT have been folded away, or the assertions
+        // above would be satisfied by an encoder that constant-folds everything.
+        DirectoryEntry latency = directory.get("latency");
+        assertFalse("latency varies per row and must not be CONSTANT", latency.constant());
+        assertTrue("latency must occupy a real data section, got " + latency.sectionLen, latency.sectionLen > 1000);
+
+        // Bytes per row -- the number Task 6 compares against pp's ~9 B/row on disk (already
+        // Zstd-compressed) and the plan's ~2.9 B/row expectation. Measured 3.26 B/row on this
+        // generator at the time of writing; the assertion is against the production baseline rather
+        // than that exact figure, so it stays a real gate without breaking on codec tuning.
+        double bytesPerRow = payload.remaining() / (double) REAL_SHAPE_ROWS;
+        logger.info("SP4 real-shape chunk: {} rows, {} payload bytes, {} bytes/row",
+                    REAL_SHAPE_ROWS, payload.remaining(), bytesPerRow);
+        assertTrue("real-shape chunk must beat pp's ~9 B/row on-disk baseline, measured " + bytesPerRow,
+                   bytesPerRow < 9.0);
+    }
+
+    @Test
+    public void everyCellOfTheProductionShapeSurvivesADenseWindow() throws Throwable
+    {
+        // The dense counterpart to everyColumnOfEveryRowRoundTripsThroughTheChunk: 3600 rows is where
+        // the null bitmap RLE, the dictionary threshold and the timestamp DoD stream all actually run,
+        // rather than being short-circuited by a six-row window.
+        createProductionShapedTable();
+        loadRealShapeWindow();
+        assertEquals(1, new TieredStorageService().runOnce(KEYSPACE, currentTable(), 5 * HOUR).windowsEncoded);
+
+        Random random = new Random(20260801L);
+        double reading = 23.4;
+        UntypedResultSet merged = execute("SELECT timestamp, attribute, error_code, latency, quality, value, " +
+                                          "value_boolean, value_numeric FROM %s WHERE tag_id = 't1' " +
+                                          "AND timestamp < ? ORDER BY timestamp ASC", new Date(HOUR));
+        assertEquals(REAL_SHAPE_ROWS, merged.size());
+        int i = 0;
+        for (UntypedResultSet.Row row : merged)
+        {
+            reading += (random.nextDouble() - 0.5) * 0.4;
+            assertEquals(new Date(i * REAL_SHAPE_STEP_MS), row.getTimestamp("timestamp"));
+            assertEquals(emptyAttribute(), row.getBytes("attribute"));
+            assertEquals(0, row.getInt("error_code"));
+            assertEquals(192, row.getInt("quality"));
+            assertEquals("row " + i, 1 + random.nextInt(999), row.getInt("latency"));
+            assertEquals("row " + i, String.format("%.1f", reading), row.getString("value"));
+            assertFalse("value_boolean was never written", row.has("value_boolean"));
+            assertFalse("value_numeric was never written", row.has("value_numeric"));
+            i++;
+        }
+
+        // The statics are outside every clustering range the re-encoder deletes, so they must still
+        // be here after a window that removed 3600 rows.
+        UntypedResultSet.Row statics = raw("SELECT area_id, site_id, tag_name, type FROM %s WHERE tag_id = 't1'").one();
+        assertEquals("s", statics.getString("site_id"));
+        assertEquals("tn", statics.getString("tag_name"));
+        assertEquals(0, raw("SELECT timestamp FROM %s WHERE tag_id = 't1' AND timestamp < ?", new Date(HOUR)).size());
+    }
+
     // ---- helpers ----
+
+    /**
+     * One column's v3 directory entry, re-read test-side. Asserting on the round trip alone cannot
+     * distinguish "encoded as CONSTANT" from "encoded at full width and decoded correctly", so this
+     * deliberately re-implements the documented directory layout: header ({@code HEADER_SIZE} bytes),
+     * then one entry per column of {@code typeCode(1) flags(1) nameLen(1) name sectionLen(varint)
+     * [constLen(varint) constBytes]}.
+     */
+    private static final class DirectoryEntry
+    {
+        // Mirrors ColumnarChunkCodec's private FLAG_* constants; a change to either must break this.
+        private static final byte FLAG_ALL_NULL = 0x02;
+        private static final byte FLAG_CONSTANT = 0x04;
+
+        final byte typeCode;
+        final byte flags;
+        final int sectionLen;
+
+        DirectoryEntry(byte typeCode, byte flags, int sectionLen)
+        {
+            this.typeCode = typeCode;
+            this.flags = flags;
+            this.sectionLen = sectionLen;
+        }
+
+        boolean constant()
+        {
+            return (flags & FLAG_CONSTANT) != 0;
+        }
+
+        boolean allNull()
+        {
+            return (flags & FLAG_ALL_NULL) != 0;
+        }
+    }
+
+    private static Map<String, DirectoryEntry> readDirectory(ByteBuffer payload)
+    {
+        ByteBuffer buffer = payload.duplicate().order(ByteOrder.BIG_ENDIAN);
+        assertEquals("not a v3 columnar payload", ColumnarChunkCodec.VERSION, buffer.get());
+        buffer.position(buffer.position() + Integer.BYTES + Long.BYTES + Long.BYTES);   // count, first ts, last ts
+        int columnCount = buffer.getShort() & 0xFFFF;
+        buffer.getShort();                                                              // directory size
+        Map<String, DirectoryEntry> directory = new LinkedHashMap<>();
+        for (int c = 0; c < columnCount; c++)
+        {
+            byte typeCode = buffer.get();
+            byte flags = buffer.get();
+            byte[] name = new byte[buffer.get() & 0xFF];
+            buffer.get(name);
+            int sectionLen = (int) readVarLong(buffer);
+            if ((flags & DirectoryEntry.FLAG_CONSTANT) != 0)
+            {
+                // Two statements, not buffer.position(buffer.position() + readVarLong(buffer)): Java
+                // evaluates the outer position() BEFORE readVarLong advances it, which would rewind
+                // over the length varint itself and desynchronise every later entry.
+                int constLen = (int) readVarLong(buffer);
+                buffer.position(buffer.position() + constLen);
+            }
+            directory.put(new String(name, StandardCharsets.UTF_8), new DirectoryEntry(typeCode, flags, sectionLen));
+        }
+        return directory;
+    }
+
+    private static long readVarLong(ByteBuffer buffer)
+    {
+        long value = 0;
+        for (int shift = 0; ; shift += 7)
+        {
+            byte b = buffer.get();
+            value |= (long) (b & 0x7F) << shift;
+            if ((b & 0x80) == 0)
+                return value;
+        }
+    }
 
     private static ByteBuffer attribute(String unit)
     {
