@@ -89,7 +89,9 @@ ORDER BY timestamp ASC;
 | [코덱 bake-off (codec-bakeoff.md)](doc/timeseries/codec-bakeoff.md) | Gorilla vs Chimp128 압축률 실측과 Chimp128 단일화 근거 |
 | [통합 테스트 보고서](doc/timeseries/integration-test-report.md) | 실제 컨테이너에서 실행한 52개 검증의 CQL·결과·소요 시간 |
 | [스케일 테스트 보고서 (1억 건)](doc/timeseries/scale-test-report.md) | 1억 행 적재 후 측정한 쿼리별 CQL 실행 시간 |
-| **[읽기/쓰기 처리량 벤치마크 (rw-throughput-benchmark.md)](doc/timeseries/rw-throughput-benchmark.md)** | 단일 노드(24코어) 초당 처리량 실측 — 쓰기 **145k rows/s**(운영 형태 배치) · 단건 쓰기 82.5k ops/s · 단건 읽기 한계 **~66k ops/s**(포화점 실측) · 100행 윈도우 읽기 **285k rows/s** |
+| **[읽기/쓰기 처리량 벤치마크 (rw-throughput-benchmark.md)](doc/timeseries/rw-throughput-benchmark.md)** | 단일 노드(24코어) 초당 처리량 실측 + **구성 비교**(기본/시계열 스택/계층화) — 쓰기 145k→**155.6k rows/s**(TS 스택이 기본보다 +7%) · 단건 읽기 한계 ~66k ops/s · 100행 윈도우 285k rows/s · 계층화 저장 **-48%** · tiered latest 병목(62 ops/s) 실측과 원인 |
+| **[Memtable 쓰기 튜닝 기록 (memtable-write-tuning.md)](doc/timeseries/memtable-write-tuning.md)** | 시계열 스택 쓰기 -36%→**+7%** 역전의 전 과정 — DESC가 끈 두 고속 경로, 설정 튜닝의 한계(+6%), 코드 수정 3라운드(min 가드·역순 long 스토어·꼬리 인덱스), ALTER 순서 함정, 남은 과제 |
+| [SP4 계획 (sp4-plan.md)](doc/timeseries/sp4-plan.md) | 다음 단계 로드맵 — Compressed Query(존맵·청크 메타 집계·latest 푸시다운), vectorized 집계 커널, ALP 코덱, SIMD, 쓰기 3라운드 — 삽입 지점·마일스톤·검증 게이트 |
 | [GC 비교: ZGC generational vs G1](doc/timeseries/gc-comparison.md) | 같은 1억 건 데이터로 두 GC의 쿼리 시간·쓰기 처리량 비교 (원자료) |
 | **[아티클: 시계열 DB에서 G1GC vs Generational ZGC](doc/timeseries/g1gc-vs-zgc-article.md)** | 위 측정을 정리한 성능 비교 아티클 (환경·방법·해석·권장 설정) |
 
