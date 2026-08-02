@@ -41,6 +41,7 @@ import org.slf4j.Logger;
 import org.slf4j.LoggerFactory;
 
 import org.apache.cassandra.db.Clustering;
+import org.apache.cassandra.db.ClusteringComparator;
 import org.apache.cassandra.db.Columns;
 import org.apache.cassandra.db.DataRange;
 import org.apache.cassandra.db.DecoratedKey;
@@ -51,6 +52,7 @@ import org.apache.cassandra.db.LivenessInfo;
 import org.apache.cassandra.db.PartitionPosition;
 import org.apache.cassandra.db.RangeTombstone;
 import org.apache.cassandra.db.RegularAndStaticColumns;
+import org.apache.cassandra.db.Slice;
 import org.apache.cassandra.db.Slices;
 import org.apache.cassandra.db.commitlog.CommitLogPosition;
 import org.apache.cassandra.db.compaction.TimeSeriesCompactionStrategy;
@@ -89,6 +91,7 @@ import org.apache.cassandra.utils.FBUtilities;
 import org.apache.cassandra.utils.NoSpamLogger;
 import org.apache.cassandra.utils.concurrent.OpOrder;
 import org.apache.cassandra.utils.memory.Cloner;
+import org.apache.cassandra.utils.memory.HeapCloner;
 import org.apache.cassandra.utils.memory.MemtableAllocator;
 
 /**
@@ -570,12 +573,20 @@ public class TimeSeriesMemtable extends AbstractAllocatorMemtable
         if (!keys.containsKey(key))
             return null;
 
+        boolean sliced = slices != Slices.ALL;
         List<UnfilteredRowIterator> iterators = new ArrayList<>(2);
         for (WindowShard shard : shards.values())
         {
             ShardPartition partition = shard.partitions.get(key);
-            if (partition != null)
-                iterators.add(partition.unfilteredIterator(selectedColumns, slices, reversed));
+            if (partition == null)
+                continue;
+            // A sliced read skips a shard partition by the CLUSTERING range it actually holds, never
+            // by the shard's write-time window: clustering time and write time are independent, and
+            // window pruning would silently drop backfilled rows — old clusterings living in the
+            // current write window's shard.
+            if (sliced && !partition.mayContainRowsIn(slices))
+                continue;
+            iterators.add(partition.unfilteredIterator(selectedColumns, slices, reversed));
         }
         return mergeRows(iterators);
     }
@@ -604,6 +615,60 @@ public class TimeSeriesMemtable extends AbstractAllocatorMemtable
             case 1: return iterators.get(0);
             default: return UnfilteredRowIterators.merge(iterators);
         }
+    }
+
+    /**
+     * Whether any of {@code slices} intersects the inclusive clustering range [{@code min},
+     * {@code max}], decided by comparing the slices' <b>existing</b> bounds against the two
+     * clusterings with the table's comparator — so it is exact on reversed (DESC) clusterings,
+     * whose min/max are maintained in comparator order throughout this memtable.
+     *
+     * <p>No {@code ClusteringBound} is ever fabricated from {@code min}/{@code max}: they are
+     * memtable-owned clusterings, and building bounds from them ({@code Slice.make} →
+     * {@code ClusteringBound.create}) goes through the value accessor's object factory, which the
+     * native (offheap_objects) accessor refuses with {@code UnsupportedOperationException}. That is
+     * how shard pruning took down production paged reads on 2026-08-02: page one of a paged read
+     * carries {@code Slices.ALL} and skips pruning, but every later page carries the pager's
+     * {@code Slices.forPaging} rewrite — never {@code ALL} — so every page after the first
+     * fabricated bounds from native clusterings and threw. Iterating the slices allocates nothing
+     * and works for every accessor and every {@code Slices} shape, including {@code Slices.NONE}
+     * (empty iteration, correctly pruned).
+     */
+    static boolean intersectsBounds(Slices slices, ClusteringComparator comparator, Clustering<?> min, Clustering<?> max)
+    {
+        for (Slice slice : slices)
+        {
+            // A bound never ties with a clustering (the bound kind breaks value ties), so these two
+            // comparisons decide inclusive and exclusive slice bounds alike.
+            if (comparator.compare(slice.start(), max) <= 0 && comparator.compare(min, slice.end()) <= 0)
+                return true;
+        }
+        return false;
+    }
+
+    /**
+     * The answer when a pruning probe fails unexpectedly: read the shard. Pruning is an
+     * optimisation, and an exception on this path is a read outage — fail open, but loudly enough
+     * (rate-limited, with the stack) that the swallowed defect stays visible.
+     */
+    static boolean pruneFailedOpen(RuntimeException e)
+    {
+        NoSpamLogger.log(logger, NoSpamLogger.Level.WARN, "timeseries-memtable-prune-fail-open",
+                         1, TimeUnit.MINUTES,
+                         "Time-series shard-pruning probe failed; reading the shard instead", e);
+        return true;
+    }
+
+    /**
+     * The answer when the streaming read path fails to open: rebuild the partition the slow way.
+     * Same fail-open contract as {@link #pruneFailedOpen}: streaming is an optimisation, an
+     * exception on the read path is an outage, and the swallowed defect must stay visible.
+     */
+    static void streamFailedOpen(RuntimeException e)
+    {
+        NoSpamLogger.log(logger, NoSpamLogger.Level.WARN, "timeseries-memtable-stream-fail-open",
+                         1, TimeUnit.MINUTES,
+                         "Time-series streaming read failed to open; rebuilding the partition instead", e);
     }
 
     // --------------------------------------------------------------------------------- statistics
@@ -852,12 +917,35 @@ public class TimeSeriesMemtable extends AbstractAllocatorMemtable
          * the object form of every partition at once.
          */
         Partition flushView();
+
+        /**
+         * Whether a read restricted to {@code slices} can find anything here. Implementations answer
+         * from the <b>clustering</b> values actually present (plus any deletion or static row, which
+         * every slice must see) — never from the shard's write-time window, because clustering time
+         * and write time are independent: a backfilled row carries an old clustering but lives in
+         * the current write window's shard. Any doubt must answer {@code true} and no
+         * implementation may throw — every {@code Slices} shape a read can carry (including the
+         * pager's {@code forPaging} rewrites and {@code Slices.NONE}) must get a boolean; skipping
+         * is only an optimisation, and this default declines it.
+         */
+        default boolean mayContainRowsIn(Slices slices)
+        {
+            return true;
+        }
     }
 
     /** The reference representation: one {@link AtomicBTreePartition}, exactly as the default memtables store it. */
     public static final class ObjectShardPartition implements ShardPartition
     {
         private final AtomicBTreePartition partition;
+
+        /**
+         * Comparator-least/greatest row clustering ever written here, for {@link #mayContainRowsIn};
+         * null until the first row. Cloned onto plain heap because an update's buffers belong to the
+         * write and are not guaranteed stable afterwards. Guarded by 'this'.
+         */
+        private Clustering<?> minClustering;
+        private Clustering<?> maxClustering;
 
         ObjectShardPartition(TableMetadataRef metadata, DecoratedKey key, MemtableAllocator allocator)
         {
@@ -867,9 +955,56 @@ public class TimeSeriesMemtable extends AbstractAllocatorMemtable
         @Override
         public long put(PartitionUpdate update, UpdateTransaction indexer, Cloner cloner, OpOrder.Group opGroup, AtomicLong liveDataSize)
         {
+            // Widened before the rows land, so a concurrent sliced read can never see a row whose
+            // clustering the bounds do not yet cover — too-wide bounds only cost a skipped skip.
+            widenClusteringBounds(update);
             BTreePartitionUpdater updater = partition.addAll(update, cloner, opGroup, indexer);
             liveDataSize.addAndGet(updater.dataSize);
             return updater.colUpdateTimeDelta;
+        }
+
+        private synchronized void widenClusteringBounds(PartitionUpdate update)
+        {
+            Row last = update.lastRow();
+            if (last == null)
+                return;
+            Row first = update.iterator().next();
+            ClusteringComparator comparator = update.metadata().comparator;
+            if (minClustering == null || comparator.compare(first.clustering(), minClustering) < 0)
+                minClustering = HeapCloner.instance.clone(first.clustering());
+            if (maxClustering == null || comparator.compare(last.clustering(), maxClustering) > 0)
+                maxClustering = HeapCloner.instance.clone(last.clustering());
+        }
+
+        /**
+         * Same contract as the columnar override: prune by held clusterings only, compared against
+         * the slices' existing bounds (never fabricated ones), and fail open on anything else.
+         */
+        @Override
+        public boolean mayContainRowsIn(Slices slices)
+        {
+            try
+            {
+                if (!partition.deletionInfo().isLive() || !partition.staticRow().isEmpty())
+                    return true;
+
+                ClusteringComparator comparator = partition.metadata().comparator;
+                if (comparator.size() == 0)
+                    return true;
+
+                Clustering<?> min;
+                Clustering<?> max;
+                synchronized (this)
+                {
+                    min = minClustering;
+                    max = maxClustering;
+                }
+                return min == null || intersectsBounds(slices, comparator, min, max);
+            }
+            catch (RuntimeException e)
+            {
+                return pruneFailedOpen(e);
+            }
         }
 
         @Override
@@ -1137,10 +1272,12 @@ public class TimeSeriesMemtable extends AbstractAllocatorMemtable
     }
 
     /**
-     * One partition key's versions from several window shards, presented as a single partition. Only
-     * the flush path builds these — reads go through the iterator merges above.
+     * One partition key's versions from several window shards — or a demoted
+     * {@link TimeSeriesColumnarPartition}'s frozen columnar state and its object-tier sibling —
+     * presented as a single partition. Only the flush path and the demoted-partition read path build
+     * these; ordinary reads go through the iterator merges above.
      */
-    private static final class MergedWindowPartition implements Partition
+    static final class MergedWindowPartition implements Partition
     {
         private final TableMetadata metadata;
         private final DecoratedKey key;

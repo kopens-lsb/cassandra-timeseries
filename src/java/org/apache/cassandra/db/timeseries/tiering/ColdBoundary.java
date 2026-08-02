@@ -136,7 +136,12 @@ public final class ColdBoundary
      */
     public static long lowerBoundMs(ClusteringBound<?> bound)
     {
-        if (bound.isBottom() || bound.isTop())
+        // A bound with no clustering component restricts nothing. BOTTOM and TOP are the usual
+        // shapes, but they are not the only ones: the covered range of an sstable holding only
+        // static rows surfaces here as an empty bound of other kinds. Production hit exactly that
+        // (AIOOBE at bufferAt(0)) on the first cold-window flush of a table whose seed writes were
+        // static-only, and the whole flush fell back to rows because of it.
+        if (bound.size() == 0)
             return Long.MIN_VALUE;
         long ms = boundMs(bound);
         return bound.isInclusive() ? ms : ms + 1;
@@ -145,7 +150,8 @@ public final class ColdBoundary
     /** The exclusive upper TIME bound of a slice bound that restricts timestamps from above (see above). */
     public static long upperBoundMsExclusive(ClusteringBound<?> bound)
     {
-        if (bound.isTop() || bound.isBottom())
+        // See lowerBoundMs for why this tests emptiness rather than BOTTOM/TOP.
+        if (bound.size() == 0)
             return Long.MAX_VALUE;
         long ms = boundMs(bound);
         return bound.isInclusive() ? ms + 1 : ms;

@@ -463,6 +463,14 @@ public final class ColdWindowChunkFlush
             for (SSTableReader sstable : cfs.getLiveSSTables())
             {
                 Slice covered = sstable.getSSTableMetadata().coveredClustering;
+                // An sstable that never saw a clustering — static rows or partition deletions only —
+                // records the EMPTY slice (MAX_START, MIN_END), whose bounds carry no clustering
+                // component without being BOTTOM or TOP. It covers no clustered range, so it cannot
+                // intersect any window; reading a timestamp out of those bounds is what produced the
+                // production AIOOBE, and treating them as unbounded instead would veto every window
+                // for as long as one static-only sstable is live.
+                if (covered.isEmpty(metadata.comparator))
+                    continue;
                 sstableRanges.add(new long[]{ ColdBoundary.lowestMs(covered, descending),
                                               ColdBoundary.highestMsExclusive(covered, descending) });
             }
