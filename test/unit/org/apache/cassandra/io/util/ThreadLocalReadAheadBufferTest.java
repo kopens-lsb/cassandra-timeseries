@@ -21,10 +21,17 @@ package org.apache.cassandra.io.util;
 
 import java.io.FileOutputStream;
 import java.io.IOException;
+import java.lang.management.BufferPoolMXBean;
+import java.lang.management.ManagementFactory;
 import java.nio.ByteBuffer;
 import java.nio.file.Files;
+import java.util.ArrayList;
 import java.util.List;
 import java.util.Random;
+import java.util.concurrent.ExecutorService;
+import java.util.concurrent.Executors;
+import java.util.concurrent.Future;
+import java.util.concurrent.TimeUnit;
 
 import org.junit.AfterClass;
 import org.junit.Assert;
@@ -77,6 +84,73 @@ public class ThreadLocalReadAheadBufferTest implements WithQuickTheories
                 // ignore
             }
         }
+    }
+
+    /**
+     * Production shape of the 2026-08-02 direct-memory exhaustion: pooled compaction threads fault in
+     * per-thread read-ahead blocks, then close() runs on a different thread once the shared reader's
+     * last reference is released. close() must release every thread's block — the worker threads stay
+     * alive (pool threads are eternal in production), so anything close() misses is retained until
+     * MaxDirectMemorySize is exhausted.
+     */
+    @Test
+    public void closeReleasesBuffersAllocatedByOtherThreads() throws Exception
+    {
+        BufferPoolMXBean directPool = directBufferPool();
+        int threads = 4;
+        ExecutorService pool = Executors.newFixedThreadPool(threads);
+        try (ChannelProxy channel = openChannel(files[0]))
+        {
+            ThreadLocalReadAheadBuffer tlrab = newReadAheadBuffer(channel);
+            long minBlockBytes = minBlockBytes(files[0]);
+            long before = directPool.getMemoryUsed();
+
+            // Each pool thread faults in its own read-ahead block; barrier on completion.
+            List<Future<?>> allocations = new ArrayList<>();
+            for (int i = 0; i < threads; i++)
+                allocations.add(pool.submit(() -> tlrab.fill(0)));
+            for (Future<?> allocation : allocations)
+                allocation.get(30, TimeUnit.SECONDS);
+
+            long allocated = directPool.getMemoryUsed() - before;
+            Assert.assertTrue("each reader thread should have allocated a direct block; delta was " + allocated,
+                              allocated >= threads * minBlockBytes);
+
+            // Worker threads are still alive; close() runs on this (different) thread.
+            tlrab.close();
+
+            long retained = directPool.getMemoryUsed() - before;
+            Assert.assertTrue("close() must release blocks allocated by other threads; still retaining " +
+                              retained + " of " + allocated + " bytes",
+                              retained < minBlockBytes);
+        }
+        finally
+        {
+            pool.shutdownNow();
+        }
+    }
+
+    protected ChannelProxy openChannel(File file)
+    {
+        return new ChannelProxy(file);
+    }
+
+    protected ThreadLocalReadAheadBuffer newReadAheadBuffer(ChannelProxy channel)
+    {
+        return new ThreadLocalReadAheadBuffer(channel, new DataStorageSpec.IntKibibytesBound("256KiB").toBytes(), BufferType.OFF_HEAP);
+    }
+
+    protected long minBlockBytes(File file)
+    {
+        return new DataStorageSpec.IntKibibytesBound("256KiB").toBytes();
+    }
+
+    protected static BufferPoolMXBean directBufferPool()
+    {
+        for (BufferPoolMXBean pool : ManagementFactory.getPlatformMXBeans(BufferPoolMXBean.class))
+            if (pool.getName().equals("direct"))
+                return pool;
+        throw new IllegalStateException("Direct buffer pool not found");
     }
 
     @Test

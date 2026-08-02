@@ -66,6 +66,25 @@ public class DirectThreadLocalReadAheadBufferTest extends ThreadLocalReadAheadBu
         }
     }
 
+    @Override
+    protected ChannelProxy openChannel(File file)
+    {
+        return new ChannelProxy(file, ChannelProxy.IOMode.DIRECT);
+    }
+
+    @Override
+    protected ThreadLocalReadAheadBuffer newReadAheadBuffer(ChannelProxy channel)
+    {
+        int blockSize = FileUtils.getFileBlockSize(channel.file());
+        return new DirectThreadLocalReadAheadBuffer(channel, blockSize * 64, blockSize);
+    }
+
+    @Override
+    protected long minBlockBytes(File file)
+    {
+        return FileUtils.getFileBlockSize(file) * 64L;
+    }
+
     @Test
     public void testDirectMemoryIsCleanedOnClose()
     {

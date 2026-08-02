@@ -19,16 +19,13 @@
 package org.apache.cassandra.io.util;
 
 import java.nio.ByteBuffer;
-import java.util.HashMap;
-import java.util.Map;
+import java.util.concurrent.ConcurrentHashMap;
 import java.util.function.Supplier;
 
 import org.apache.cassandra.io.compress.BufferType;
 import org.apache.cassandra.io.sstable.CorruptSSTableException;
 import org.apache.cassandra.utils.Closeable;
 import org.apache.cassandra.utils.memory.MemoryUtil;
-
-import io.netty.util.concurrent.FastThreadLocal;
 
 public class ThreadLocalReadAheadBuffer implements Closeable
 {
@@ -43,14 +40,13 @@ public class ThreadLocalReadAheadBuffer implements Closeable
 
     private final Supplier<ByteBuffer> bufferSupplier;
 
-    private static final FastThreadLocal<Map<String, Block>> blockMap = new FastThreadLocal<>()
-    {
-        @Override
-        protected Map<String, Block> initialValue()
-        {
-            return new HashMap<>();
-        }
-    };
+    // One read-ahead block per reader thread, owned by THIS instance. Deliberately not a
+    // thread-local: close() runs on whichever thread releases the reader's last reference, and it
+    // must release blocks faulted in by OTHER (still-live, pooled) threads. The previous design —
+    // a static FastThreadLocal<Map<filePath, Block>> — could only clean the closing thread's own
+    // entry, so eternal compaction threads accumulated one direct buffer per (thread, sstable)
+    // until MaxDirectMemorySize was exhausted (node 41, 2026-08-02: 6 GiB in ~2.5 h, OOM storm).
+    private final ConcurrentHashMap<Thread, Block> blocks = new ConcurrentHashMap<>();
 
     private volatile int bufferSize = -1;
     private final long channelSize;
@@ -97,7 +93,7 @@ public class ThreadLocalReadAheadBuffer implements Closeable
 
     private Block block()
     {
-        return blockMap.get().computeIfAbsent(channel.filePath(), k -> new Block());
+        return blocks.computeIfAbsent(Thread.currentThread(), t -> new Block());
     }
 
     public void fill(long position)
@@ -144,7 +140,7 @@ public class ThreadLocalReadAheadBuffer implements Closeable
     public void clear(boolean deallocate)
     {
         // avoid calling block() here to reduce unintended allocations
-        Block block = blockMap.get().get(channel.filePath());
+        Block block = blocks.get(Thread.currentThread());
         if (block == null)
             return;
 
@@ -169,7 +165,18 @@ public class ThreadLocalReadAheadBuffer implements Closeable
     @Override
     public void close()
     {
-        clear(true);
-        blockMap.get().remove(channel.filePath());
+        // Sweeps every thread's block, not just the closing thread's. Safe: by the reader contract
+        // (SharedCloseable ref-counting) close() runs only after all reads through this instance
+        // have completed, so no block is in use.
+        for (Block block : blocks.values())
+        {
+            block.index = -1;
+            if (block.buffer != null)
+            {
+                cleanBuffer(block.buffer);
+                block.buffer = null;
+            }
+        }
+        blocks.clear();
     }
 }
