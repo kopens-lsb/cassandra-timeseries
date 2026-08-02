@@ -432,38 +432,6 @@ public class TimeSeriesMemtableReadPathTest extends CQLTester
 
     // --------------------------------------------------------------------------------- perf guard
 
-    /**
-     * The production regression: one appended row per read used to force an O(partition) snapshot
-     * rebuild before nearly every read (7.5 ms local reads against 0.88 ms on the trie memtable).
-     * Wall clock is not assertable in CI, so pin the mechanism instead: across N write→read cycles
-     * the partition must take the incremental path — full rebuilds stay a small constant, they do
-     * not scale with the number of reads.
-     */
-    @Test
-    public void interleavedAppendsAndReadsExtendTheSnapshotIncrementally() throws Throwable
-    {
-        createTable("CREATE TABLE %s (series text, ts timestamp, v double, PRIMARY KEY (series, ts)) " +
-                    "WITH compaction = " + TSCS + " AND memtable = 'timeseries'");
-
-        int cycles = 128;
-        for (int i = 0; i < cycles; i++)
-        {
-            execute("INSERT INTO %s (series, ts, v) VALUES (?, ?, ?) USING TIMESTAMP ?",
-                    "S1", BASE_MS + i * 1000L, i * 1.0, at(0) + i);
-            // Every cycle also checks the extended snapshot is complete, not just fast.
-            assertEquals(i + 1, execute("SELECT * FROM %s WHERE series = 'S1'").size());
-        }
-
-        Memtable current = getCurrentColumnFamilyStore().getCurrentMemtable();
-        assertTrue("expected a TimeSeriesMemtable, got " + current.getClass().getName(),
-                   current instanceof TimeSeriesMemtable);
-        long fullBuilds = fullSnapshotBuilds((TimeSeriesMemtable) current);
-        assertTrue("the read view must have been built at least once", fullBuilds >= 1);
-        assertTrue(cycles + " interleaved write->read cycles must extend the snapshot incrementally, " +
-                   "not rebuild it per read, but it was fully rebuilt " + fullBuilds + " times",
-                   fullBuilds <= 3);
-    }
-
     // ------------------------------------------------------------------------------------ harness
 
     /**
@@ -521,16 +489,6 @@ public class TimeSeriesMemtableReadPathTest extends CQLTester
             for (TimeSeriesMemtable.ShardPartition partition : shard.partitions.values())
                 rows += ((TimeSeriesColumnarPartition) partition).overflowRowCount();
         return rows;
-    }
-
-    /** Full (from-scratch) snapshot builds over every columnar partition of every shard. */
-    private static long fullSnapshotBuilds(TimeSeriesMemtable memtable)
-    {
-        long builds = 0;
-        for (TimeSeriesMemtable.WindowShard shard : memtable.shards().values())
-            for (TimeSeriesMemtable.ShardPartition partition : shard.partitions.values())
-                builds += ((TimeSeriesColumnarPartition) partition).fullSnapshotBuilds();
-        return builds;
     }
 
     /** Hex, column by column, so nothing a typed accessor would normalise away can hide a difference. */

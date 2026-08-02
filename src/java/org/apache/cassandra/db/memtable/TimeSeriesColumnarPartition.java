@@ -66,7 +66,6 @@ import org.apache.cassandra.schema.TableMetadata;
 import org.apache.cassandra.schema.TableMetadataRef;
 import org.apache.cassandra.utils.ByteBufferUtil;
 import org.apache.cassandra.utils.btree.BTree;
-import org.apache.cassandra.utils.btree.UpdateFunction;
 import org.apache.cassandra.utils.concurrent.OpOrder;
 import org.apache.cassandra.utils.memory.Cloner;
 import org.apache.cassandra.utils.memory.HeapCloner;
@@ -174,28 +173,6 @@ public final class TimeSeriesColumnarPartition implements TimeSeriesMemtable.Sha
      */
     private volatile Snapshot snapshot;
 
-    /**
-     * The most recently built read view, kept across writes so an append-only interleaving can
-     * extend it with just the newly appended rows instead of rebuilding O(partition) per
-     * write→read cycle. Guarded by 'this'.
-     */
-    private Snapshot lastSnapshot;
-
-    /** Value of {@link #size} when {@link #lastSnapshot} was built. */
-    private int lastSnapshotSize;
-
-    /**
-     * Whether anything other than a pure array append happened since {@link #lastSnapshot} was
-     * built: an in-place slot merge, a promotion into the overflow tier, any overflow write, a
-     * static or deletion-info change, or a consolidation that reordered the arrays. Any of these
-     * makes {@link #lastSnapshot} unusable as an extension base — correctness first — and the next
-     * read rebuilds from scratch.
-     */
-    private boolean changedBeyondAppend;
-
-    /** Full rebuilds of the read view, so tests can pin that append interleavings extend instead. */
-    private long fullSnapshotBuilds;
-
     TimeSeriesColumnarPartition(TableMetadataRef metadata, DecoratedKey key, MemtableAllocator allocator)
     {
         this.metadata = metadata;
@@ -262,7 +239,6 @@ public final class TimeSeriesColumnarPartition implements TimeSeriesMemtable.Sha
         if (update.isLive() || !update.mayModify(deletionInfo))
             return;
 
-        changedBeyondAppend = true;
         if (!update.getPartitionDeletion().isLive())
             put.indexer.onPartitionDeletion(update.getPartitionDeletion());
         if (update.hasRanges())
@@ -275,7 +251,6 @@ public final class TimeSeriesColumnarPartition implements TimeSeriesMemtable.Sha
 
     private void mergeStatic(Row update, Put put)
     {
-        changedBeyondAppend = true;
         if (staticRow.isEmpty())
         {
             Row cloned = update.clone(put.cloner);
@@ -475,7 +450,6 @@ public final class TimeSeriesColumnarPartition implements TimeSeriesMemtable.Sha
     {
         // Both outcomes mutate a row the cached snapshot may already hold — in place or by
         // promotion — so neither is an append and the snapshot must be rebuilt from scratch.
-        changedBeyondAppend = true;
         Row existing = materializeRow(slot);
         Row merged = Rows.merge(existing, update, put);
         put.indexer.onUpdated(existing, merged);
@@ -504,7 +478,6 @@ public final class TimeSeriesColumnarPartition implements TimeSeriesMemtable.Sha
 
     private void putOverflow(Row cloned, Row replaced, Put put)
     {
-        changedBeyondAppend = true;
         if (overflow == null)
             overflow = new TreeMap<>(metadata.get().comparator);
         overflow.put(cloned.clustering(), cloned);
@@ -619,7 +592,6 @@ public final class TimeSeriesColumnarPartition implements TimeSeriesMemtable.Sha
             return;
 
         // Folding shifts rows across slots, so a snapshot's row count no longer names a suffix.
-        changedBeyondAppend = true;
 
         int tailLength = size - sortedCount;
         Integer[] tail = new Integer[tailLength];
@@ -717,11 +689,8 @@ public final class TimeSeriesColumnarPartition implements TimeSeriesMemtable.Sha
             current = snapshot;
             if (current == null)
             {
-                current = refreshSnapshot();
+                current = buildSnapshot();
                 snapshot = current;
-                lastSnapshot = current;
-                lastSnapshotSize = size;
-                changedBeyondAppend = false;
             }
             return current;
         }
@@ -739,60 +708,13 @@ public final class TimeSeriesColumnarPartition implements TimeSeriesMemtable.Sha
             // Deliberately not cached: the flush set walks every partition, and pinning each one's
             // materialized object form until the memtable is discarded would recreate at flush time
             // the very heap footprint the arrays exist to avoid.
-            return current != null ? current : refreshSnapshot();
+            return current != null ? current : buildSnapshot();
         }
-    }
-
-    /**
-     * The partition's current read view: {@link #lastSnapshot} extended with just the rows appended
-     * since it was built when pure appends are all that happened, a full {@link #buildSnapshot()}
-     * otherwise. Caller must hold the lock.
-     */
-    private Snapshot refreshSnapshot()
-    {
-        Snapshot base = lastSnapshot;
-        if (base == null || changedBeyondAppend || size < lastSnapshotSize)
-            return buildSnapshot();
-        return extendSnapshot(base, lastSnapshotSize);
-    }
-
-    /**
-     * Rebuilds the read view as {@code base} plus only the rows appended after it was built —
-     * O(appended), not O(partition). Only sound when nothing but appends happened since: an appended
-     * row's clustering is guaranteed distinct from everything the base holds (a write to an existing
-     * clustering goes through {@link #mergeIntoSlot} or the overflow map, both of which invalidate
-     * fully), so the merge is a pure union, ordered on both sides by the table's comparator — which
-     * keeps reversed (DESC) clusterings exactly as a full rebuild would. Caller must hold the lock.
-     */
-    private Snapshot extendSnapshot(Snapshot base, int from)
-    {
-        if (from == size)
-            return base;
-
-        List<Row> appended = new ArrayList<>(size - from);
-        for (int i = from; i < size; i++)
-        {
-            // Belt and braces: a promoted slot here means the invalidation bookkeeping failed.
-            // Rebuild rather than serve a row the overflow map now owns.
-            if ((flags[i] & FLAG_PROMOTED) != 0)
-                return buildSnapshot();
-            appended.add(materializeRow(i));
-        }
-
-        ClusteringComparator comparator = metadata.get().comparator;
-        // The appended region may end in an unsorted tail; the base tree is never touched.
-        appended.sort(comparator);
-
-        Object[] tree = BTree.update(base.tree, BTree.build(appended, UpdateFunction.noOp()), comparator);
-        EncodingStats stats = EncodingStats.Collector.collect(staticRow, appended.iterator(), deletionInfo)
-                                                     .mergeWith(base.stats());
-        return new Snapshot(metadata.get(), key, columns, staticRow, tree, deletionInfo, stats);
     }
 
     /** Caller must hold the lock. */
     private Snapshot buildSnapshot()
     {
-        fullSnapshotBuilds++;
         consolidate();
         TableMetadata tableMetadata = metadata.get();
         ClusteringComparator comparator = tableMetadata.comparator;
@@ -974,17 +896,6 @@ public final class TimeSeriesColumnarPartition implements TimeSeriesMemtable.Sha
     public boolean usesLongClusterings()
     {
         return longClusterings;
-    }
-
-    /**
-     * How many times the read view was rebuilt from scratch, as opposed to extended with only the
-     * appended rows. An append-mostly write→read interleaving must keep this a small constant —
-     * one full build per non-append mutation, not one per read.
-     */
-    @VisibleForTesting
-    public synchronized long fullSnapshotBuilds()
-    {
-        return fullSnapshotBuilds;
     }
 
     // ------------------------------------------------------------------------------ inner classes
