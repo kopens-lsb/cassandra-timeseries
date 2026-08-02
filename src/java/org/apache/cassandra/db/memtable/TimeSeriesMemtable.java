@@ -41,6 +41,7 @@ import org.slf4j.Logger;
 import org.slf4j.LoggerFactory;
 
 import org.apache.cassandra.db.Clustering;
+import org.apache.cassandra.db.ClusteringComparator;
 import org.apache.cassandra.db.Columns;
 import org.apache.cassandra.db.DataRange;
 import org.apache.cassandra.db.DecoratedKey;
@@ -51,6 +52,7 @@ import org.apache.cassandra.db.LivenessInfo;
 import org.apache.cassandra.db.PartitionPosition;
 import org.apache.cassandra.db.RangeTombstone;
 import org.apache.cassandra.db.RegularAndStaticColumns;
+import org.apache.cassandra.db.Slice;
 import org.apache.cassandra.db.Slices;
 import org.apache.cassandra.db.commitlog.CommitLogPosition;
 import org.apache.cassandra.db.compaction.TimeSeriesCompactionStrategy;
@@ -89,6 +91,7 @@ import org.apache.cassandra.utils.FBUtilities;
 import org.apache.cassandra.utils.NoSpamLogger;
 import org.apache.cassandra.utils.concurrent.OpOrder;
 import org.apache.cassandra.utils.memory.Cloner;
+import org.apache.cassandra.utils.memory.HeapCloner;
 import org.apache.cassandra.utils.memory.MemtableAllocator;
 
 /**
@@ -570,12 +573,20 @@ public class TimeSeriesMemtable extends AbstractAllocatorMemtable
         if (!keys.containsKey(key))
             return null;
 
+        boolean sliced = slices != Slices.ALL;
         List<UnfilteredRowIterator> iterators = new ArrayList<>(2);
         for (WindowShard shard : shards.values())
         {
             ShardPartition partition = shard.partitions.get(key);
-            if (partition != null)
-                iterators.add(partition.unfilteredIterator(selectedColumns, slices, reversed));
+            if (partition == null)
+                continue;
+            // A sliced read skips a shard partition by the CLUSTERING range it actually holds, never
+            // by the shard's write-time window: clustering time and write time are independent, and
+            // window pruning would silently drop backfilled rows — old clusterings living in the
+            // current write window's shard.
+            if (sliced && !partition.mayContainRowsIn(slices))
+                continue;
+            iterators.add(partition.unfilteredIterator(selectedColumns, slices, reversed));
         }
         return mergeRows(iterators);
     }
@@ -852,12 +863,33 @@ public class TimeSeriesMemtable extends AbstractAllocatorMemtable
          * the object form of every partition at once.
          */
         Partition flushView();
+
+        /**
+         * Whether a read restricted to {@code slices} can find anything here. Implementations answer
+         * from the <b>clustering</b> values actually present (plus any deletion or static row, which
+         * every slice must see) — never from the shard's write-time window, because clustering time
+         * and write time are independent: a backfilled row carries an old clustering but lives in
+         * the current write window's shard. Any doubt must answer {@code true}; skipping is only an
+         * optimisation, and this default declines it.
+         */
+        default boolean mayContainRowsIn(Slices slices)
+        {
+            return true;
+        }
     }
 
     /** The reference representation: one {@link AtomicBTreePartition}, exactly as the default memtables store it. */
     public static final class ObjectShardPartition implements ShardPartition
     {
         private final AtomicBTreePartition partition;
+
+        /**
+         * Comparator-least/greatest row clustering ever written here, for {@link #mayContainRowsIn};
+         * null until the first row. Cloned onto plain heap because an update's buffers belong to the
+         * write and are not guaranteed stable afterwards. Guarded by 'this'.
+         */
+        private Clustering<?> minClustering;
+        private Clustering<?> maxClustering;
 
         ObjectShardPartition(TableMetadataRef metadata, DecoratedKey key, MemtableAllocator allocator)
         {
@@ -867,9 +899,46 @@ public class TimeSeriesMemtable extends AbstractAllocatorMemtable
         @Override
         public long put(PartitionUpdate update, UpdateTransaction indexer, Cloner cloner, OpOrder.Group opGroup, AtomicLong liveDataSize)
         {
+            // Widened before the rows land, so a concurrent sliced read can never see a row whose
+            // clustering the bounds do not yet cover — too-wide bounds only cost a skipped skip.
+            widenClusteringBounds(update);
             BTreePartitionUpdater updater = partition.addAll(update, cloner, opGroup, indexer);
             liveDataSize.addAndGet(updater.dataSize);
             return updater.colUpdateTimeDelta;
+        }
+
+        private synchronized void widenClusteringBounds(PartitionUpdate update)
+        {
+            Row last = update.lastRow();
+            if (last == null)
+                return;
+            Row first = update.iterator().next();
+            ClusteringComparator comparator = update.metadata().comparator;
+            if (minClustering == null || comparator.compare(first.clustering(), minClustering) < 0)
+                minClustering = HeapCloner.instance.clone(first.clustering());
+            if (maxClustering == null || comparator.compare(last.clustering(), maxClustering) > 0)
+                maxClustering = HeapCloner.instance.clone(last.clustering());
+        }
+
+        /** Same contract as the columnar override: prune by held clusterings only, fail open otherwise. */
+        @Override
+        public boolean mayContainRowsIn(Slices slices)
+        {
+            if (!partition.deletionInfo().isLive() || !partition.staticRow().isEmpty())
+                return true;
+
+            ClusteringComparator comparator = partition.metadata().comparator;
+            if (comparator.size() == 0)
+                return true;
+
+            Clustering<?> min;
+            Clustering<?> max;
+            synchronized (this)
+            {
+                min = minClustering;
+                max = maxClustering;
+            }
+            return min == null || slices.intersects(Slice.make(min, max));
         }
 
         @Override
