@@ -174,8 +174,18 @@ docker-cluster-test:
   # Alpine ships no bash and cluster-test.sh is #!/bin/bash — see docker-integration-test.
   before_script:
     - apk add --no-cache bash coreutils
+  # Must mirror docker-image's rules, for the same reason docker-image-publish does: this job needs
+  # docker-image's artifact, and `- when: manual` with no `if` creates the job on EVERY ref. On a ref
+  # where docker-image is not created -- any branch that is not the default one -- the need cannot be
+  # resolved and GitLab fails the whole pipeline at creation time, before a single job starts. That
+  # is what the 6.0.0 mirror branch hit: identical commit, green on master, instantly failed on
+  # 6.0.0 with zero jobs and no yaml error to point at.
   rules:
-    - when: manual
+    - if: $CI_COMMIT_TAG
+      when: manual
+      allow_failure: true
+    - if: $CI_COMMIT_BRANCH == $CI_DEFAULT_BRANCH
+      when: manual
       allow_failure: true
   script:
     - docker load -i cassandra-timeseries-6.0.0-docker.tar

@@ -84,6 +84,8 @@ memtable:
     configurations:
         skiplist:
             class_name: SkipListMemtable
+        timeseries:
+            class_name: TimeSeriesMemtable
         trie:
             class_name: TrieMemtable
             parameters:
