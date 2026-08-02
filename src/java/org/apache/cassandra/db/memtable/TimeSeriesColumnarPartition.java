@@ -39,7 +39,6 @@ import org.apache.cassandra.db.DeletionInfo;
 import org.apache.cassandra.db.DeletionTime;
 import org.apache.cassandra.db.LivenessInfo;
 import org.apache.cassandra.db.RegularAndStaticColumns;
-import org.apache.cassandra.db.Slice;
 import org.apache.cassandra.db.Slices;
 import org.apache.cassandra.db.filter.ColumnFilter;
 import org.apache.cassandra.db.marshal.AbstractType;
@@ -902,38 +901,50 @@ public final class TimeSeriesColumnarPartition implements TimeSeriesMemtable.Sha
      * <b>clustering</b> values actually held — the arrays' maintained min/max plus the overflow
      * map's ends — and never from the shard's write-time window, because clustering time and write
      * time are independent. Fails open: any partition or range deletion, any static row, an empty
-     * partition and a clustering-less table all answer {@code true}. Deliberately does not touch
-     * {@link #snapshot()}, so pruning never materialises anything.
+     * partition, a clustering-less table, and any state or slices shape the probe cannot handle all
+     * answer {@code true} — pruning is an optimisation, and throwing here is a read outage.
+     * Deliberately touches neither {@link #snapshot()} (pruning must not materialise anything) nor
+     * {@code Slice.make} on min/max: they are memtable-owned clusterings, and fabricating bounds
+     * from them needs the value accessor's object factory, which the native (offheap_objects)
+     * accessor refuses with {@code UnsupportedOperationException} — the 2026-08-02 paged-read
+     * outage, hit on every page after the first because only page one carries {@code Slices.ALL}.
      */
     @Override
     public synchronized boolean mayContainRowsIn(Slices slices)
     {
-        if (!deletionInfo.isLive() || !staticRow.isEmpty())
-            return true;
-
-        ClusteringComparator comparator = metadata.get().comparator;
-        if (comparator.size() == 0)
-            return true;
-
-        Clustering<?> min = null;
-        Clustering<?> max = null;
-        if (size > 0)
+        try
         {
-            min = longClusterings ? Clustering.make(ByteBufferUtil.bytes(minClusteringKey))
-                                  : (Clustering<?>) minClusteringObject;
-            max = longClusterings ? Clustering.make(ByteBufferUtil.bytes(maxClusteringKey))
-                                  : (Clustering<?>) maxClusteringObject;
+            if (!deletionInfo.isLive() || !staticRow.isEmpty())
+                return true;
+
+            ClusteringComparator comparator = metadata.get().comparator;
+            if (comparator.size() == 0)
+                return true;
+
+            Clustering<?> min = null;
+            Clustering<?> max = null;
+            if (size > 0)
+            {
+                min = longClusterings ? Clustering.make(ByteBufferUtil.bytes(minClusteringKey))
+                                      : (Clustering<?>) minClusteringObject;
+                max = longClusterings ? Clustering.make(ByteBufferUtil.bytes(maxClusteringKey))
+                                      : (Clustering<?>) maxClusteringObject;
+            }
+            if (overflow != null && !overflow.isEmpty())
+            {
+                // Promoted slots keep their clustering in the arrays, so the array bounds already
+                // cover them; this widens for the rows the arrays never fit.
+                Clustering<?> first = overflow.firstKey();
+                Clustering<?> last = overflow.lastKey();
+                min = min == null || comparator.compare(first, min) < 0 ? first : min;
+                max = max == null || comparator.compare(last, max) > 0 ? last : max;
+            }
+            return min == null || TimeSeriesMemtable.intersectsBounds(slices, comparator, min, max);
         }
-        if (overflow != null && !overflow.isEmpty())
+        catch (RuntimeException e)
         {
-            // Promoted slots keep their clustering in the arrays, so the array bounds already cover
-            // them; this widens for the rows the arrays never fit.
-            Clustering<?> first = overflow.firstKey();
-            Clustering<?> last = overflow.lastKey();
-            min = min == null || comparator.compare(first, min) < 0 ? first : min;
-            max = max == null || comparator.compare(last, max) > 0 ? last : max;
+            return TimeSeriesMemtable.pruneFailedOpen(e);
         }
-        return min == null || slices.intersects(Slice.make(min, max));
     }
 
     // ------------------------------------------------------------------------------ observability
