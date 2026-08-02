@@ -659,6 +659,18 @@ public class TimeSeriesMemtable extends AbstractAllocatorMemtable
         return true;
     }
 
+    /**
+     * The answer when the streaming read path fails to open: rebuild the partition the slow way.
+     * Same fail-open contract as {@link #pruneFailedOpen}: streaming is an optimisation, an
+     * exception on the read path is an outage, and the swallowed defect must stay visible.
+     */
+    static void streamFailedOpen(RuntimeException e)
+    {
+        NoSpamLogger.log(logger, NoSpamLogger.Level.WARN, "timeseries-memtable-stream-fail-open",
+                         1, TimeUnit.MINUTES,
+                         "Time-series streaming read failed to open; rebuilding the partition instead", e);
+    }
+
     // --------------------------------------------------------------------------------- statistics
 
     @Override
@@ -1260,10 +1272,12 @@ public class TimeSeriesMemtable extends AbstractAllocatorMemtable
     }
 
     /**
-     * One partition key's versions from several window shards, presented as a single partition. Only
-     * the flush path builds these — reads go through the iterator merges above.
+     * One partition key's versions from several window shards — or a demoted
+     * {@link TimeSeriesColumnarPartition}'s frozen columnar state and its object-tier sibling —
+     * presented as a single partition. Only the flush path and the demoted-partition read path build
+     * these; ordinary reads go through the iterator merges above.
      */
-    private static final class MergedWindowPartition implements Partition
+    static final class MergedWindowPartition implements Partition
     {
         private final TableMetadata metadata;
         private final DecoratedKey key;
