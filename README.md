@@ -89,6 +89,7 @@ ORDER BY timestamp ASC;
 | [코덱 bake-off (codec-bakeoff.md)](doc/timeseries/codec-bakeoff.md) | Gorilla vs Chimp128 압축률 실측과 Chimp128 단일화 근거 |
 | [통합 테스트 보고서](doc/timeseries/integration-test-report.md) | 실제 컨테이너에서 실행한 52개 검증의 CQL·결과·소요 시간 |
 | [스케일 테스트 보고서 (1억 건)](doc/timeseries/scale-test-report.md) | 1억 행 적재 후 측정한 쿼리별 CQL 실행 시간 |
+| **[읽기/쓰기 처리량 벤치마크 (rw-throughput-benchmark.md)](doc/timeseries/rw-throughput-benchmark.md)** | 단일 노드(24코어) 초당 처리량 실측 — 쓰기 **145k rows/s**(운영 형태 배치) · 단건 쓰기 82.5k ops/s · 단건 읽기 한계 **~66k ops/s**(포화점 실측) · 100행 윈도우 읽기 **285k rows/s** |
 | [GC 비교: ZGC generational vs G1](doc/timeseries/gc-comparison.md) | 같은 1억 건 데이터로 두 GC의 쿼리 시간·쓰기 처리량 비교 (원자료) |
 | **[아티클: 시계열 DB에서 G1GC vs Generational ZGC](doc/timeseries/g1gc-vs-zgc-article.md)** | 위 측정을 정리한 성능 비교 아티클 (환경·방법·해석·권장 설정) |
 
@@ -664,6 +665,10 @@ GC를 바꿔 비교할 수도 있습니다 — `SCALE_GC=g1`(기본은 `zgc`, `c
 결과는 `build/timeseries-scale-report.html`(+ 같은 내용의 `.md`)에 생성됩니다. **실행 결과 예시: [스케일 테스트 보고서 (1억 건)](doc/timeseries/scale-test-report.md)** — 쿼리별 CQL 실행 시간이 요약표로 정리돼 있습니다.
 
 주의: 수백만 행 이상을 집계하려면 서버 타임아웃을 올려야 합니다. `read/range_request_timeout`뿐 아니라 **`native_transport_timeout`(기본 12초)** 이 요청 전체를 자르므로 이 값도 함께 올려야 하며, 이 키는 기본 `cassandra.yaml`에 없어서 추가해야 합니다. 스크립트가 이 설정을 대신 해 줍니다.
+
+### 초당 처리량 (ops/s) 벤치마크
+
+위 스케일 테스트가 분석 쿼리 1건의 실행 시간을 잰다면, **초당 몇 건을 처리하는가**는 별도로 측정합니다: 쓰기는 `scale-workload.py load`의 적재 속도(rows/s)가 곧 측정값이고, 읽기는 [docker/rwbench-read.py](docker/rwbench-read.py)(운영 형태 3패턴 — 태그 최신값 / 단건 / 100행 시간창)와 번들 `cassandra-stress`(서버 한계 확인용)로 잽니다. **실행 결과: [읽기/쓰기 처리량 벤치마크](doc/timeseries/rw-throughput-benchmark.md)** — 24코어 단일 노드에서 쓰기 145k rows/s(100행 배치)·82.5k ops/s(단건), 단건 읽기 포화점 ~66k ops/s, 100행 윈도우 읽기 285k rows/s. 재현 명령 전체가 리포트에 있습니다.
 
 ## CI 및 릴리스
 
