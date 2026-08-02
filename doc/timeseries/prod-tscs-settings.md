@@ -52,6 +52,23 @@
 **컴팩션 전략 옵션 변경은 해당 테이블 전체 재컴팩션을 유발합니다.** 측정으로 뒷받침되지 않는
 재컴팩션은 하지 마십시오.
 
+### 오프힙(다이렉트) 메모리 — `file_cache_size` < `MaxDirectMemorySize`
+
+노드 수준 불변식입니다. 현재 값: `MaxDirectMemorySize=6G`(jvm 옵션),
+`file_cache_size: 2GiB`(cassandra.yaml).
+
+- 읽기 버퍼 풀(청크캐시 BufferPool)은 `file_cache_size`까지 자유 청크를 **반납하지 않고
+  보유**합니다. **`file_cache_enabled: false`는 LRU 캐시 층만 끄고 이 풀의 상한은 그대로**이므로,
+  상한이 다이렉트 한도보다 크면 읽기 트래픽에 비례해 자라다 JVM 벽에 먼저 부딪힙니다.
+- 벽에 닿으면 컴팩션·flush writer가 버퍼를 못 얻어 생성 즉시 죽습니다 — `pending tasks`가
+  고정된 채 처리량이 0으로 보이고, 클라이언트 읽기가 타임아웃됩니다.
+- 증상 식별: 로그의 `Cannot reserve … direct buffer memory`. `JVMStabilityInspector`의
+  `Force heap space OutOfMemoryError` 문구는 **힙이 아니라 다이렉트 고갈에서도** 나옵니다 —
+  스택을 먼저 확인하십시오.
+- 감시: `java.nio:type=BufferPool,name=direct`(총량)과
+  `org.apache.cassandra.metrics:type=BufferPool,scope=chunk-cache,name=Size`(풀 자체).
+  강제 GC(`jcmd <pid> GC.run`)로 줄지 않는 다이렉트 총량은 라이브 참조입니다.
+
 ## 2. 파킹된 창 진단
 
 > **이 노드에서는 해결된 문제입니다 (2026-08-02).** 원인이던 오염 데이터를 걷어낸 뒤 파킹·버퍼
