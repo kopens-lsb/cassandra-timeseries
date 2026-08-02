@@ -97,18 +97,21 @@ public class TimeSeriesMemtableOffheapReadPathTest extends CQLTester
     }
 
     /**
-     * A DESC clustering declines the bare-long clustering store, so every stored clustering is a
-     * {@code NativeClustering} — the shape the production tag table hit. Before the fix, page two
-     * of the plain paged read threw {@code UnsupportedOperationException} out of the pruning probe.
+     * A compound clustering declines the bare-long clustering store, so every stored clustering is
+     * a {@code NativeClustering} — the shape the production outage hit. (A single DESC timestamp
+     * clustering used to be the declining shape, but it now takes the long store with negated
+     * comparisons, so this test pins the native-clustering path through a shape the long store
+     * structurally cannot take.) Before the fix, page two of the plain paged read threw
+     * {@code UnsupportedOperationException} out of the pruning probe.
      */
     @Test
     public void pagedReadsSurviveNativeClusteringsOnDescTable() throws Throwable
     {
-        createTable("CREATE TABLE %s (series text, ts timestamp, v double, PRIMARY KEY (series, ts)) " +
-                    "WITH CLUSTERING ORDER BY (ts DESC) AND compaction = " + TSCS + " AND memtable = 'timeseries'");
+        createTable("CREATE TABLE %s (series text, ts timestamp, seq int, v double, PRIMARY KEY (series, ts, seq)) " +
+                    "WITH CLUSTERING ORDER BY (ts DESC, seq DESC) AND compaction = " + TSCS + " AND memtable = 'timeseries'");
         for (int i = 0; i < 40; i++)
-            execute("INSERT INTO %s (series, ts, v) VALUES (?, ?, ?) USING TIMESTAMP ?",
-                    "S1", BASE_MS + i * 1000L, i * 1.0, at(i < 20 ? 0 : 1) + i);
+            execute("INSERT INTO %s (series, ts, seq, v) VALUES (?, ?, ?, ?) USING TIMESTAMP ?",
+                    "S1", BASE_MS + i * 1000L, 0, i * 1.0, at(i < 20 ? 0 : 1) + i);
         assertOffheapTimeSeriesMemtable();
 
         assertEquals(40, count(executeNetWithPaging("SELECT * FROM %s WHERE series = 'S1'", 7)));
@@ -148,32 +151,34 @@ public class TimeSeriesMemtableOffheapReadPathTest extends CQLTester
 
     /**
      * The unit-level pin of the outage: the bounds probe of a native partition, fed the pager's
-     * rewritten slices directly. Before the fix every covering probe here threw
-     * {@code UnsupportedOperationException}; after it, covering shapes keep the shard and
-     * exhausted shapes prune it.
+     * rewritten slices directly. A DESC <b>text</b> clustering keeps every stored clustering a
+     * {@code NativeClustering} — a single DESC timestamp no longer does (it takes the long store
+     * with negated comparisons), so the probe is pinned through a shape the long store cannot
+     * take. Before the fix every covering probe here threw {@code UnsupportedOperationException};
+     * after it, covering shapes keep the shard and exhausted shapes prune it.
      */
     @Test
     public void nativeBoundsProbeHandlesPagerSlices() throws Throwable
     {
-        createTable("CREATE TABLE %s (series text, ts timestamp, v double, PRIMARY KEY (series, ts)) " +
-                    "WITH CLUSTERING ORDER BY (ts DESC) AND compaction = " + TSCS + " AND memtable = 'timeseries'");
+        createTable("CREATE TABLE %s (series text, name text, v double, PRIMARY KEY (series, name)) " +
+                    "WITH CLUSTERING ORDER BY (name DESC) AND compaction = " + TSCS + " AND memtable = 'timeseries'");
         for (int i = 0; i < 10; i++)
-            execute("INSERT INTO %s (series, ts, v) VALUES (?, ?, ?) USING TIMESTAMP ?",
-                    "S1", BASE_MS + i * 1000L, i * 1.0, at(0) + i);
+            execute("INSERT INTO %s (series, name, v) VALUES (?, ?, ?) USING TIMESTAMP ?",
+                    "S1", String.format("k%02d", i), i * 1.0, at(0) + i);
         assertOffheapTimeSeriesMemtable();
 
         TimeSeriesMemtable memtable = (TimeSeriesMemtable) getCurrentColumnFamilyStore().getCurrentMemtable();
         TimeSeriesMemtable.ShardPartition partition = solePartition(memtable);
         ClusteringComparator comparator = getCurrentColumnFamilyStore().metadata().comparator;
 
-        Clustering<?> mid = Clustering.make(ByteBufferUtil.bytes(BASE_MS + 5000L));
+        Clustering<?> mid = Clustering.make(ByteBufferUtil.bytes("k05"));
         assertTrue(partition.mayContainRowsIn(Slices.ALL.forPaging(comparator, mid, false, false)));
         assertTrue(partition.mayContainRowsIn(Slices.ALL.forPaging(comparator, mid, false, true)));
         assertTrue(partition.mayContainRowsIn(Slices.with(comparator, Slice.make(mid))));
 
-        // Pruning must still prune: past the comparator-last row (ts BASE_MS on DESC) is nothing.
+        // Pruning must still prune: past the comparator-last row ("k00" on DESC) is nothing.
         assertFalse(partition.mayContainRowsIn(Slices.ALL.forPaging(comparator,
-                                                                    Clustering.make(ByteBufferUtil.bytes(BASE_MS)),
+                                                                    Clustering.make(ByteBufferUtil.bytes("k00")),
                                                                     false, false)));
         assertFalse(partition.mayContainRowsIn(Slices.NONE));
         assertTrue(partition.mayContainRowsIn(Slices.ALL));

@@ -22,6 +22,7 @@ import java.nio.ByteBuffer;
 import java.util.ArrayList;
 import java.util.Arrays;
 import java.util.Collections;
+import java.util.HashMap;
 import java.util.Iterator;
 import java.util.List;
 import java.util.NavigableSet;
@@ -53,8 +54,8 @@ import org.apache.cassandra.db.marshal.TimestampType;
 import org.apache.cassandra.db.partitions.ImmutableBTreePartition;
 import org.apache.cassandra.db.partitions.Partition;
 import org.apache.cassandra.db.partitions.PartitionUpdate;
+import org.apache.cassandra.db.rows.ArrayCell;
 import org.apache.cassandra.db.rows.BTreeRow;
-import org.apache.cassandra.db.rows.BufferCell;
 import org.apache.cassandra.db.rows.Cell;
 import org.apache.cassandra.db.rows.ColumnData;
 import org.apache.cassandra.db.rows.EncodingStats;
@@ -65,8 +66,11 @@ import org.apache.cassandra.index.transactions.UpdateTransaction;
 import org.apache.cassandra.schema.ColumnMetadata;
 import org.apache.cassandra.schema.TableMetadata;
 import org.apache.cassandra.schema.TableMetadataRef;
+import org.apache.cassandra.utils.BulkIterator;
+import org.apache.cassandra.utils.ByteArrayUtil;
 import org.apache.cassandra.utils.ByteBufferUtil;
 import org.apache.cassandra.utils.btree.BTree;
+import org.apache.cassandra.utils.btree.UpdateFunction;
 import org.apache.cassandra.utils.concurrent.OpOrder;
 import org.apache.cassandra.utils.memory.Cloner;
 import org.apache.cassandra.utils.memory.HeapCloner;
@@ -157,8 +161,16 @@ public final class TimeSeriesColumnarPartition implements TimeSeriesMemtable.Sha
     private final MemtableAllocator allocator;
     private final DecoratedKey key;
 
-    /** Whether the clustering is a single (non-reversed) timestamp/bigint column, stored as a bare {@code long}. */
+    /** Whether the clustering is a single timestamp/bigint column, stored as a bare {@code long}. */
     private final boolean longClusterings;
+
+    /**
+     * Whether that column is DESC ({@code ReversedType}-wrapped). {@code ReversedType} wraps
+     * comparison only — the serialized form stays the base type's 8 bytes — so the raw value is
+     * stored unchanged and every long comparison is negated instead. Storing a transformed key
+     * would demand an inverse at every materialization site, where a miss corrupts silently.
+     */
+    private final boolean reversedLongKeys;
 
     // ---- row-major parallel arrays; all mutation is guarded by 'this' ----
     private int capacity;
@@ -176,6 +188,19 @@ public final class TimeSeriesColumnarPartition implements TimeSeriesMemtable.Sha
 
     /** Slots carrying {@link #FLAG_SUPERSEDED}; feeds the degradation valve. Guarded by 'this'. */
     private int supersededCount;
+
+    /** Appends admitted by the certainly-new bounds shortcut, i.e. without a slot search. Guarded by 'this'. */
+    private long certainNewAppends;
+
+    /**
+     * Index of the unsorted tail for long-keyed clusterings: clustering key → the newest slot
+     * holding it, so the duplicate probe a write performs is one map lookup instead of a linear
+     * scan of up to {@link #MAX_UNSORTED_TAIL} slots inside the lock. Writer-only state, guarded
+     * by 'this' like every array mutation; readers never see it. Cleared whenever
+     * {@link #consolidate()} folds the tail into the sorted prefix (slot indices change there).
+     * Bounded by the tail bound, so at most ~{@value #MAX_UNSORTED_TAIL} entries.
+     */
+    private HashMap<Long, Integer> tailIndex;
 
     /** Greatest clustering held by the arrays, so in-order ingest can append without searching. */
     private long maxClusteringKey;
@@ -216,9 +241,10 @@ public final class TimeSeriesColumnarPartition implements TimeSeriesMemtable.Sha
         this.key = key;
         this.allocator = allocator;
         ClusteringComparator comparator = metadata.get().comparator;
-        this.longClusterings = comparator.size() == 1
-                               && (comparator.subtype(0) == TimestampType.instance
-                                   || comparator.subtype(0) == LongType.instance);
+        AbstractType<?> subtype = comparator.size() == 1 ? comparator.subtype(0) : null;
+        AbstractType<?> base = subtype == null ? null : subtype.unwrap();
+        this.longClusterings = base == TimestampType.instance || base == LongType.instance;
+        this.reversedLongKeys = longClusterings && subtype.isReversed();
     }
 
     /**
@@ -361,11 +387,16 @@ public final class TimeSeriesColumnarPartition implements TimeSeriesMemtable.Sha
         }
         boolean arrayable = shape != null && representable;
 
-        // In-order fast path: strictly above everything the arrays hold, and nothing in overflow that
-        // could collide, means the clustering is certainly new — append without any lookup.
+        // In-order fast path: strictly outside everything the arrays hold — above max or below min,
+        // both bounds cover superseded slots too — and nothing in overflow that could collide, means
+        // the clustering is certainly new: append without any lookup. The min side is what ascending
+        // ingest into a DESC table (the production tm_tag_point pattern) takes on every row; without
+        // it each such row pays a findSlot scan of the unsorted tail inside the partition lock.
         boolean overflowEmpty = overflow == null || overflow.isEmpty();
-        if (arrayable && overflowEmpty && (size == 0 || compareToMax(clustering, longKey) > 0))
+        if (arrayable && overflowEmpty
+            && (size == 0 || compareToMax(clustering, longKey) > 0 || compareToMin(clustering, longKey) < 0))
         {
+            certainNewAppends++;
             append(row, shape, longKey, null, put);
             put.indexer.onInserted(row);
             put.dataDelta += row.dataSize();
@@ -499,9 +530,23 @@ public final class TimeSeriesColumnarPartition implements TimeSeriesMemtable.Sha
                           && (slot == 0 || compareSlotTo(slot - 1, row.clustering(), longKey) <= 0);
         size++;
         if (inOrder)
+        {
             sortedCount = size;
-        else if (size - sortedCount > MAX_UNSORTED_TAIL)
-            consolidate();
+        }
+        else
+        {
+            // Index the out-of-order slot so findSlot never scans the tail: newest slot wins the
+            // entry (a re-append overwrites it just before the older slot is superseded), and the
+            // whole index dies with the tail in consolidate().
+            if (longClusterings)
+            {
+                if (tailIndex == null)
+                    tailIndex = new HashMap<>();
+                tailIndex.put(longKey, slot);
+            }
+            if (size - sortedCount > MAX_UNSORTED_TAIL)
+                consolidate();
+        }
 
         if (size == 1 || compareToMax(row.clustering(), longKey) > 0)
         {
@@ -613,31 +658,38 @@ public final class TimeSeriesColumnarPartition implements TimeSeriesMemtable.Sha
 
     // ------------------------------------------------------------------------------------ ordering
 
+    /** {@code Long.compare} in comparator order: negated when the clustering column is DESC. */
+    private int compareKeys(long a, long b)
+    {
+        int cmp = Long.compare(a, b);
+        return reversedLongKeys ? -cmp : cmp;
+    }
+
     private int compareToMax(Clustering<?> clustering, long longKey)
     {
         return longClusterings
-               ? Long.compare(longKey, maxClusteringKey)
+               ? compareKeys(longKey, maxClusteringKey)
                : metadata.get().comparator.compare(clustering, (Clustering<?>) maxClusteringObject);
     }
 
     private int compareToMin(Clustering<?> clustering, long longKey)
     {
         return longClusterings
-               ? Long.compare(longKey, minClusteringKey)
+               ? compareKeys(longKey, minClusteringKey)
                : metadata.get().comparator.compare(clustering, (Clustering<?>) minClusteringObject);
     }
 
     private int compareSlotTo(int slot, Clustering<?> clustering, long longKey)
     {
         return longClusterings
-               ? Long.compare(clusteringKeys[slot], longKey)
+               ? compareKeys(clusteringKeys[slot], longKey)
                : metadata.get().comparator.compare((Clustering<?>) clusteringObjects[slot], clustering);
     }
 
     private int compareSlots(int a, int b)
     {
         return longClusterings
-               ? Long.compare(clusteringKeys[a], clusteringKeys[b])
+               ? compareKeys(clusteringKeys[a], clusteringKeys[b])
                : metadata.get().comparator.compare((Clustering<?>) clusteringObjects[a], (Clustering<?>) clusteringObjects[b]);
     }
 
@@ -648,6 +700,17 @@ public final class TimeSeriesColumnarPartition implements TimeSeriesMemtable.Sha
      */
     private int findSlot(Clustering<?> clustering, long longKey)
     {
+        // Long-keyed tails are fully indexed: a live hit is the answer (at most one slot per
+        // clustering is ever live), and a superseded or missing entry falls through to the sorted
+        // prefix — the tail cannot hold a live slot the index does not know about, so the linear
+        // tail scan below is skipped entirely for this path.
+        if (longClusterings && tailIndex != null)
+        {
+            Integer tailSlot = tailIndex.get(longKey);
+            if (tailSlot != null && (flags[tailSlot] & FLAG_SUPERSEDED) == 0)
+                return tailSlot;
+        }
+
         int lo = 0;
         int hi = sortedCount - 1;
         int hit = -1;
@@ -678,10 +741,13 @@ public final class TimeSeriesColumnarPartition implements TimeSeriesMemtable.Sha
                     return i;
             }
         }
-        for (int i = sortedCount; i < size; i++)
+        if (!longClusterings)
         {
-            if (compareSlotTo(i, clustering, longKey) == 0 && (flags[i] & FLAG_SUPERSEDED) == 0)
-                return i;
+            for (int i = sortedCount; i < size; i++)
+            {
+                if (compareSlotTo(i, clustering, longKey) == 0 && (flags[i] & FLAG_SUPERSEDED) == 0)
+                    return i;
+            }
         }
         return -1;
     }
@@ -748,6 +814,10 @@ public final class TimeSeriesColumnarPartition implements TimeSeriesMemtable.Sha
             store.applyPermutation(permutation, size, capacity);
 
         sortedCount = size;
+        // Every former tail slot now lives in the sorted prefix under a new index; the map's slot
+        // numbers are stale and the prefix is the binary search's job, so the index empties here.
+        if (tailIndex != null)
+            tailIndex.clear();
     }
 
     // ------------------------------------------------------------------------------------- reads
@@ -1061,6 +1131,13 @@ public final class TimeSeriesColumnarPartition implements TimeSeriesMemtable.Sha
         return size - supersededCount;
     }
 
+    /** Appends that proved the clustering new by a bounds check alone, skipping {@link #findSlot}. */
+    @VisibleForTesting
+    public synchronized long certainNewAppends()
+    {
+        return certainNewAppends;
+    }
+
     /** Rows in the object-tier overflow map — promoted rows plus rows the arrays never fit. */
     @VisibleForTesting
     public synchronized int overflowRowCount()
@@ -1248,23 +1325,20 @@ public final class TimeSeriesColumnarPartition implements TimeSeriesMemtable.Sha
 
         Cell<?> cellAt(int slot, long timestamp, int ttl, long localDeletionTime)
         {
+            // ArrayCell over a bare byte[] rather than BufferCell over a ByteBuffer: the value is
+            // rebuilt from the primitive arrays either way, and the ByteBuffer wrapper was ~50
+            // bytes of pure overhead per assembled cell on the read and flush paths.
             switch (width)
             {
                 case 8:
-                {
-                    ByteBuffer value = ByteBuffer.allocate(8);
-                    value.putLong(0, longs[slot]);
-                    return new BufferCell(column, timestamp, ttl, localDeletionTime, value, null);
-                }
+                    return new ArrayCell(column, timestamp, ttl, localDeletionTime,
+                                         ByteArrayUtil.bytes(longs[slot]), null);
                 case 4:
-                {
-                    ByteBuffer value = ByteBuffer.allocate(4);
-                    value.putInt(0, ints[slot]);
-                    return new BufferCell(column, timestamp, ttl, localDeletionTime, value, null);
-                }
+                    return new ArrayCell(column, timestamp, ttl, localDeletionTime,
+                                         ByteArrayUtil.bytes(ints[slot]), null);
                 case 1:
-                    return new BufferCell(column, timestamp, ttl, localDeletionTime,
-                                          ByteBuffer.wrap(new byte[]{ bytes[slot] }), null);
+                    return new ArrayCell(column, timestamp, ttl, localDeletionTime,
+                                         new byte[]{ bytes[slot] }, null);
                 default:
                     return (Cell<?>) cells[slot];
             }
@@ -1364,22 +1438,42 @@ public final class TimeSeriesColumnarPartition implements TimeSeriesMemtable.Sha
             int ttl = ttls[slot];
             long ldt = localDeletionTimes[slot];
 
-            List<ColumnData> cellData = null;
+            Object[] scratch = null;
+            int n = 0;
             for (int s = 0; s < stores.length; s++)
             {
                 ColumnWalk store = stores[s];
                 if (store.present[slot] == 0)
                     continue;
-                if (cellData == null)
-                    cellData = new ArrayList<>(stores.length);
-                cellData.add(store.cellAt(slot, ts, ttl, ldt));
+                if (scratch == null)
+                    scratch = new Object[stores.length];
+                scratch[n++] = store.cellAt(slot, ts, ttl, ldt);
             }
 
             LivenessInfo liveness = (flags[slot] & FLAG_HAS_LIVENESS) != 0
                                     ? LivenessInfo.withExpirationTime(ts, ttl, ldt)
                                     : LivenessInfo.EMPTY;
-            Object[] tree = cellData == null ? BTree.empty() : BTree.build(cellData);
-            return BTreeRow.create(clusteringAt(slot), liveness, Row.Deletion.LIVE, tree);
+
+            // Stores are kept in column order, so the scratch prefix is already BTree input order.
+            // The BulkIterator is pooled and must be closed, or its thread-local slot leaks.
+            Object[] tree;
+            if (n == 0)
+                tree = BTree.empty();
+            else if (n == 1)
+                tree = BTree.singleton(scratch[0]);
+            else
+                try (BulkIterator<Object> bulk = BulkIterator.of(scratch, 0))
+                {
+                    tree = BTree.build(bulk, n, UpdateFunction.noOp());
+                }
+
+            // O(1) by construction: classify() admits a slot only with Deletion.LIVE, no cell
+            // tombstone, and one shared (ts, ttl, ldt) across the liveness and every cell — so the
+            // 4-arg create's per-cell accumulate over the tree would always fold to exactly this.
+            long minDeletionTime = ttl == LivenessInfo.NO_TTL
+                                   ? Cell.MAX_DELETION_TIME
+                                   : Math.min(Cell.MAX_DELETION_TIME, ldt);
+            return BTreeRow.create(clusteringAt(slot), liveness, Row.Deletion.LIVE, tree, minDeletionTime);
         }
     }
 

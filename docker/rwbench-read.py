@@ -46,12 +46,24 @@ QUERIES = {
 }
 
 
-def connect():
-    from cassandra.cluster import Cluster
-    cluster = Cluster(['127.0.0.1'], connect_timeout=60)
-    session = cluster.connect()
-    session.default_timeout = 120
-    return cluster, session
+def connect(attempts=3):
+    """A node that just finished a bulk operation (retier, major compaction) can stall the burst
+    of concurrent control connections a worker pool opens; one refused handshake must not kill a
+    60-second benchmark, so connection setup retries with a short backoff."""
+    from cassandra.cluster import Cluster, NoHostAvailable
+    for attempt in range(attempts):
+        try:
+            # control_connection_timeout: the driver default of 2s dies on a cold node whose
+            # first system/schema reads come from disk — the failure mode is NoHostAvailable
+            # at connect while cqlsh (5s/10s timeouts) works fine against the same node.
+            cluster = Cluster(['127.0.0.1'], connect_timeout=60, control_connection_timeout=30)
+            session = cluster.connect()
+            session.default_timeout = 120
+            return cluster, session
+        except NoHostAvailable:
+            if attempt == attempts - 1:
+                raise
+            time.sleep(5 * (attempt + 1))
 
 
 def bind_args(pattern, rnd, series, rows_per_series):
@@ -69,6 +81,9 @@ def bind_args(pattern, rnd, series, rows_per_series):
 
 def worker(args):
     wid, a = args
+    # Staggered connect: N simultaneous control connections against a cold or just-busy node
+    # time out as a group; spreading them ~300ms apart keeps the burst under what it can absorb.
+    time.sleep(wid * 0.3)
     cluster, session = connect()
     stmt = session.prepare(QUERIES[a.pattern] % (KEYSPACE, a.table))
     rnd = random.Random(0xBEEF ^ (wid * 2654435761))

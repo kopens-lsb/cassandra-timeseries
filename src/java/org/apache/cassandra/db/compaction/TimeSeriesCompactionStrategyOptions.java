@@ -79,7 +79,23 @@ public final class TimeSeriesCompactionStrategyOptions
 
     public long windowStartFor(long timestampMillis)
     {
-        return TimeWindowCompactionStrategy.getWindowBoundsInMillis(windowUnit, windowSizeInUnits, timestampMillis).left;
+        // Mirrors TimeWindowCompactionStrategy.getWindowBoundsInMillis without materialising its
+        // Pair<Long, Long> — the memtable calls this on the write path, where the pair and its two
+        // boxed longs were measurable garbage. The truncate-toward-zero % is deliberate
+        // bug-compatibility (windows around t=0 span (-W, +W) there too); "fixing" it here would
+        // desynchronise write-time routing from the strategy's freeze classifier. Equality with
+        // the TWCS pair's lower bound is pinned by TimeSeriesCompactionStrategyOptionsTest.
+        long timestampInSeconds = TimeUnit.SECONDS.convert(timestampMillis, TimeUnit.MILLISECONDS);
+        long unitSeconds;
+        switch (windowUnit)
+        {
+            case MINUTES: unitSeconds = 60L; break;
+            case HOURS:   unitSeconds = 3600L; break;
+            case DAYS:
+            default:      unitSeconds = 86400L; break;
+        }
+        long lowerTimestamp = timestampInSeconds - (timestampInSeconds % (unitSeconds * windowSizeInUnits));
+        return TimeUnit.MILLISECONDS.convert(lowerTimestamp, TimeUnit.SECONDS);
     }
 
     /**

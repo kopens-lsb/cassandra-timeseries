@@ -66,9 +66,6 @@ import org.apache.cassandra.db.partitions.Partition;
 import org.apache.cassandra.db.partitions.PartitionUpdate;
 import org.apache.cassandra.db.partitions.UnfilteredPartitionIterator;
 import org.apache.cassandra.db.partitions.UnfilteredPartitionIterators;
-import org.apache.cassandra.db.rows.Cell;
-import org.apache.cassandra.db.rows.ColumnData;
-import org.apache.cassandra.db.rows.ComplexColumnData;
 import org.apache.cassandra.db.rows.EncodingStats;
 import org.apache.cassandra.db.rows.Row;
 import org.apache.cassandra.db.rows.Unfiltered;
@@ -288,8 +285,8 @@ public class TimeSeriesMemtable extends AbstractAllocatorMemtable
         indexer.start();
         try
         {
-            Long window = singleWindowOf(update, opts);
-            colUpdateTimeDelta = window != null
+            long window = singleWindowOf(update, opts);
+            colUpdateTimeDelta = window != NO_SINGLE_WINDOW
                                  ? shardFor(window).put(key, update, scoped, cloner, opGroup, assumeMissing, liveDataSize)
                                  : putSplitByWindow(key, update, scoped, cloner, opGroup, opts);
         }
@@ -394,60 +391,72 @@ public class TimeSeriesMemtable extends AbstractAllocatorMemtable
     }
 
     /**
-     * @return the one window every element of {@code update} routes to, or {@code null} if they do not
-     *         all agree and the update has to be split. The common case — a single row, or a batch of
-     *         rows written at the same time — takes the non-null answer and is then applied whole, with
-     *         no per-row wrapping at all.
+     * The "no single window" sentinel. Not {@code Long.MIN_VALUE}: every real window start is a
+     * multiple of 1000 or a saturation output ({@code Long.MIN_VALUE}/{@code MAX_VALUE}) of the
+     * {@code TimeUnit} conversions, so {@code MIN_VALUE + 1} is provably unreachable. Even a
+     * collision would be benign, not wrong: a false split sends the update down
+     * {@link #putSplitByWindow}, which re-derives the same window per element.
      */
-    private @Nullable Long singleWindowOf(PartitionUpdate update, TimeSeriesCompactionStrategyOptions opts)
+    private static final long NO_SINGLE_WINDOW = Long.MIN_VALUE + 1;
+
+    /**
+     * @return the one window every element of {@code update} routes to, or {@link #NO_SINGLE_WINDOW}
+     *         if they do not all agree and the update has to be split. The common case — a single
+     *         row, or a batch of rows written at the same time — takes the single-window answer and
+     *         is then applied whole, with no per-row wrapping at all.
+     *
+     * <p>Folds the elements' routing timestamps to a [min, max] and computes only two windows.
+     * Exact, not approximate: {@code windowOf} is monotone non-decreasing (truncating division and
+     * saturating {@code TimeUnit} conversions), so every element's timestamp lies in [lo, hi] and
+     * {@code windowOf(lo) == windowOf(hi)} holds if and only if all element windows are equal.
+     */
+    private static long singleWindowOf(PartitionUpdate update, TimeSeriesCompactionStrategyOptions opts)
     {
-        long window = 0;
-        boolean seen = false;
+        long lo = Long.MAX_VALUE;
+        long hi = Long.MIN_VALUE;
 
         DeletionInfo deletionInfo = update.deletionInfo();
         DeletionTime partitionDeletion = deletionInfo.getPartitionDeletion();
         if (!partitionDeletion.isLive())
         {
-            window = windowOf(partitionDeletion.markedForDeleteAt(), opts);
-            seen = true;
+            long t = partitionDeletion.markedForDeleteAt();
+            lo = Math.min(lo, t);
+            hi = Math.max(hi, t);
         }
 
         if (deletionInfo.hasRanges())
         {
             for (Iterator<RangeTombstone> it = deletionInfo.rangeIterator(false); it.hasNext(); )
             {
-                long candidate = windowOf(it.next().deletionTime().markedForDeleteAt(), opts);
-                if (seen && candidate != window)
-                    return null;
-                window = candidate;
-                seen = true;
+                long t = it.next().deletionTime().markedForDeleteAt();
+                lo = Math.min(lo, t);
+                hi = Math.max(hi, t);
             }
         }
 
         Row staticRow = update.staticRow();
         if (!staticRow.isEmpty())
         {
-            long candidate = windowOf(maxTimestamp(staticRow), opts);
-            if (seen && candidate != window)
-                return null;
-            window = candidate;
-            seen = true;
+            long t = maxTimestamp(staticRow);
+            lo = Math.min(lo, t);
+            hi = Math.max(hi, t);
         }
 
         for (Row row : update)
         {
             if (row.isEmpty())
                 continue;
-            long candidate = windowOf(maxTimestamp(row), opts);
-            if (seen && candidate != window)
-                return null;
-            window = candidate;
-            seen = true;
+            long t = maxTimestamp(row);
+            lo = Math.min(lo, t);
+            hi = Math.max(hi, t);
         }
 
         // An update with nothing timestamped in it stores nothing; the window it nominally lands in is
         // arbitrary, so use the epoch one rather than reading a clock.
-        return seen ? window : windowOf(0L, opts);
+        if (lo > hi)
+            return windowOf(0L, opts);
+        long low = windowOf(lo, opts);
+        return low == windowOf(hi, opts) ? low : NO_SINGLE_WINDOW;
     }
 
     /**
@@ -469,22 +478,10 @@ public class TimeSeriesMemtable extends AbstractAllocatorMemtable
         if (!row.deletion().isLive())
             max = Math.max(max, row.deletion().time().markedForDeleteAt());
 
-        for (ColumnData data : row)
-        {
-            if (data.column().isSimple())
-            {
-                max = Math.max(max, ((Cell<?>) data).timestamp());
-            }
-            else
-            {
-                ComplexColumnData complex = (ComplexColumnData) data;
-                if (!complex.complexDeletion().isLive())
-                    max = Math.max(max, complex.complexDeletion().markedForDeleteAt());
-                for (Cell<?> cell : complex)
-                    max = Math.max(max, cell.timestamp());
-            }
-        }
-        return max;
+        // ColumnData.maxTimestamp() folds a simple cell's timestamp, or a complex column's cells
+        // plus its complex deletion — exactly the hand-rolled loop this replaces, minus the
+        // per-row iterator allocation (accumulate walks the BTree in place).
+        return row.accumulate((data, v) -> Math.max(v, data.maxTimestamp()), max);
     }
 
     /**
@@ -515,15 +512,30 @@ public class TimeSeriesMemtable extends AbstractAllocatorMemtable
         return cloned;
     }
 
+    /**
+     * The shard the last write used. A single volatile reference, never a (window, shard) field
+     * pair: two fields can be read torn, and a torn read routes rows into the wrong window's
+     * shard. The shard carries its own final {@code windowStart}, so one volatile read plus a
+     * final-field compare is self-consistent by construction. Benignly racy: shards are never
+     * removed from {@link #shards}, so a stale hit is impossible — a miss just pays the map probe.
+     */
+    private volatile WindowShard lastShard;
+
     private WindowShard shardFor(long windowStart)
     {
-        WindowShard shard = shards.get(windowStart);
-        if (shard != null)
-            return shard;
+        WindowShard cached = lastShard;
+        if (cached != null && cached.windowStart() == windowStart)
+            return cached;
 
-        WindowShard created = new WindowShard(windowStart, metadata, allocator, columnarStorage);
-        WindowShard raced = shards.putIfAbsent(windowStart, created);
-        return raced != null ? raced : created;
+        WindowShard shard = shards.get(windowStart);
+        if (shard == null)
+        {
+            WindowShard created = new WindowShard(windowStart, metadata, allocator, columnarStorage);
+            WindowShard raced = shards.putIfAbsent(windowStart, created);
+            shard = raced != null ? raced : created;
+        }
+        lastShard = shard;
+        return shard;
     }
 
     // -------------------------------------------------------------------------------------- reads

@@ -278,12 +278,66 @@ public class TimeSeriesMemtableColumnarTest extends CQLTester
                               memtable -> {
                                   for (TimeSeriesMemtable.WindowShard shard : memtable.shards().values())
                                       for (TimeSeriesMemtable.ShardPartition partition : shard.partitions.values())
-                                          assertTrue("reversed clusterings must not use the long store",
-                                                     !((TimeSeriesColumnarPartition) partition).usesLongClusterings());
+                                          assertTrue("a reversed timestamp clustering must use the long store " +
+                                                     "(raw value stored, comparisons negated)",
+                                                     ((TimeSeriesColumnarPartition) partition).usesLongClusterings());
                                   assertEquals(1, columnarCounts(memtable)[1]);
                               },
                               "SELECT * FROM %s WHERE series = 'S1'",
                               "SELECT * FROM %s WHERE series = 'S1' ORDER BY ts ASC");
+    }
+
+    /**
+     * Ascending-time ingest into a DESC-clustered table — the production {@code tm_tag_point} write
+     * pattern. In comparator order every new sample lands strictly below everything the arrays hold,
+     * so the certainly-new bounds shortcut must admit it without a slot search. A rewrite of the
+     * newest sample (equal to the comparator minimum, not below it) and a rewrite of an older sample
+     * must still merge through the slot search, and appends made while a promoted row occupies the
+     * overflow must not take the shortcut at all. The counter assertion is what fails if the
+     * min-side guard is lost — the differential dump alone would stay green, because the shortcut is
+     * a pure duplicate-detection optimisation.
+     */
+    @Test
+    public void ascendingIngestIntoReversedClusteringTakesCertainNewShortcut() throws Throwable
+    {
+        assertSameAsReference("CREATE TABLE %s (series text, ts timestamp, v double, q int, " +
+                              "PRIMARY KEY (series, ts)) WITH CLUSTERING ORDER BY (ts DESC) AND compaction = " + TSCS,
+                              () -> {
+                                  // 50 samples in ascending time order: below the comparator minimum every time.
+                                  for (int i = 0; i < 50; i++)
+                                      execute("INSERT INTO %s (series, ts, v, q) VALUES (?, ?, ?, ?) USING TIMESTAMP ?",
+                                              "S1", BASE_MS + i * 1000L, i * 1.0, i, at(0) + i);
+                                  // Rewrite of the newest sample: EQUAL to the comparator minimum — must
+                                  // merge through the slot search, never shortcut-append a duplicate. The
+                                  // later write time in the same window promotes the row to overflow.
+                                  execute("UPDATE %s USING TIMESTAMP ? SET q = ? WHERE series = ? AND ts = ?",
+                                          at(0) + 60_000_000L, 999, "S1", BASE_MS + 49_000L);
+                                  // Rewrite of an old sample while overflow is non-empty: slot-search path.
+                                  execute("UPDATE %s USING TIMESTAMP ? SET q = ? WHERE series = ? AND ts = ?",
+                                          at(0) + 61_000_000L, 888, "S1", BASE_MS + 10_000L);
+                                  // More ascending samples with the overflow occupied: correct, but the
+                                  // shortcut must decline (a colliding clustering could live there).
+                                  for (int i = 50; i < 60; i++)
+                                      execute("INSERT INTO %s (series, ts, v, q) VALUES (?, ?, ?, ?) USING TIMESTAMP ?",
+                                              "S1", BASE_MS + i * 1000L, i * 1.0, i, at(0) + i + 100);
+                                  // A second write-time window, so the sequence is really sharded.
+                                  execute("INSERT INTO %s (series, ts, v) VALUES (?, ?, ?) USING TIMESTAMP ?",
+                                          "S1", BASE_MS + 100_000L, 100.0, at(1));
+                              },
+                              memtable -> {
+                                  long shortcuts = 0;
+                                  for (TimeSeriesMemtable.WindowShard shard : memtable.shards().values())
+                                      for (TimeSeriesMemtable.ShardPartition partition : shard.partitions.values())
+                                          shortcuts += ((TimeSeriesColumnarPartition) partition).certainNewAppends();
+                                  // Window 0: the 50 ascending samples (one first-row admit + 49 by the
+                                  // min-side bound); the ten written while the overflow was occupied do
+                                  // not count. Window 1: its single first row.
+                                  assertEquals(51, shortcuts);
+                              },
+                              "SELECT * FROM %s WHERE series = 'S1'",
+                              "SELECT * FROM %s WHERE series = 'S1' ORDER BY ts ASC",
+                              "SELECT q FROM %s WHERE series = 'S1' AND ts = " + (BASE_MS + 49_000L),
+                              "SELECT q FROM %s WHERE series = 'S1' AND ts = " + (BASE_MS + 10_000L));
     }
 
     // ------------------------------------------------------------------------- storage-tier gates
