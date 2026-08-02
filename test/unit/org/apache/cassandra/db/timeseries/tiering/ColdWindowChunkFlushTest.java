@@ -320,6 +320,42 @@ public class ColdWindowChunkFlushTest extends CQLTester
         assertNull(Schema.instance.getTableMetadata(KEYSPACE, ChunkTables.chunkTableName(table)));
     }
 
+    /**
+     * Regression: an sstable holding only static rows covers an EMPTY clustering range, and that
+     * range's bounds are neither BOTTOM nor TOP yet have no clustering component. The encoder's
+     * intersection guard read {@code bufferAt(0)} from one and threw AIOOBE, which sent the whole
+     * flush down the row fallback -- production hit this on 2026-08-02 at the first cold flush of a
+     * table whose seed writes were static-only. The chunk flush must survive the static-only
+     * sstable and still chunk the cold window.
+     */
+    @Test
+    public void staticOnlySSTableDoesNotBreakTheColdFlush() throws Throwable
+    {
+        String table = createTable("CREATE TABLE %s (tag text, ts timestamp, unit text static, " +
+                                   "value double, PRIMARY KEY (tag, ts)) " +
+                                   "WITH compaction = " + TSCS_1H + " AND memtable = 'timeseries'");
+        setPolicy("{\"hot_window\":\"2h\",\"chunk_window\":\"1h\"}");
+        ChunkTables.ensureChunkTable(Schema.instance.getTableMetadata(KEYSPACE, table));
+        ChunkCoverage.invalidateAll();
+
+        // A static-only write, flushed alone: its sstable covers an empty clustering range.
+        execute("INSERT INTO " + qualified(table) + " (tag, unit) VALUES ('t1', 'kPa')");
+        flush();
+
+        // Now a cold window. Before the fix this flush logged
+        // "Cold-window chunk flush failed ... AIOOBE" and fell back to rows.
+        insertRow(table, 10 * 60_000L, 1.0, 101);
+        insertRow(table, 20 * 60_000L, 2.0, 102);
+        flush();
+
+        assertFalse("the cold window must reach the chunk table despite the static-only sstable",
+                    execute("SELECT * FROM " + chunkTable(table) + " WHERE tag = 't1'").isEmpty());
+        // And the data stays correct through the transparent read, statics included.
+        assertEquals(2, execute("SELECT ts, value FROM " + qualified(table) + " WHERE tag = 't1'").size());
+        assertEquals("kPa", execute("SELECT unit FROM " + qualified(table) + " WHERE tag = 't1' LIMIT 1")
+                            .one().getString("unit"));
+    }
+
     // ------------------------------------------------------------------------------------ helpers
 
     /** A TSCS table on the time-series memtable with a tiering policy and its chunk table in place. */
