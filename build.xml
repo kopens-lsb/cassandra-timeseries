@@ -133,7 +133,11 @@
 
     <property name="test.timeout" value="480000" />
     <property name="test.memory.timeout" value="480000" />
-    <property name="test.long.timeout" value="600000" />
+    <!-- Raised from 600000 for TimeSeriesMemtableHeapSoakTest: a soak that must sustain >=8
+         minutes of interleaved load cannot live under a 10-minute kill ceiling, and a timeout
+         verdict eats the sample table that makes a failure diagnosable. This is only the hang
+         ceiling per long-test JVM; passing tests are unaffected. -->
+    <property name="test.long.timeout" value="3600000" />
     <property name="test.burn.timeout" value="60000000" />
     <property name="test.distributed.timeout" value="900000" />
     <property name="test.simulation.timeout" value="1800000" />
