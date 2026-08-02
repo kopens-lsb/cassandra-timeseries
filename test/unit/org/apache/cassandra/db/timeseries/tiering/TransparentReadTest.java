@@ -20,6 +20,7 @@ package org.apache.cassandra.db.timeseries.tiering;
 
 import java.util.Collections;
 import java.util.Date;
+import java.util.Iterator;
 
 import org.junit.Test;
 
@@ -38,6 +39,7 @@ import org.apache.cassandra.utils.ByteBufferUtil;
 import org.apache.cassandra.utils.FBUtilities;
 
 import static org.junit.Assert.assertEquals;
+import static org.junit.Assert.assertFalse;
 import static org.junit.Assert.assertNull;
 import static org.junit.Assert.assertSame;
 import static org.junit.Assert.assertTrue;
@@ -570,6 +572,124 @@ public class TransparentReadTest extends CQLTester
                                         new Date(HOUR), new Date(3 * HOUR)));
         assertEquals(6, execute("SELECT value FROM %s WHERE tag = 't1' AND ts >= ? AND ts < ?",
                                 new Date(HOUR), new Date(3 * HOUR)).size());
+    }
+
+    /**
+     * The strongest form of "laziness must be invisible": every query shape the lazy path changes the
+     * work of -- both directions, limited and not, sliced and not -- against a <b>non-tiered table
+     * holding the same data</b>, compared cell-by-cell on the raw bytes. The hard-coded expectations
+     * elsewhere in this class pin specific rows; this pins the whole contract to the one oracle that
+     * cannot drift out of sync with Cassandra's own semantics.
+     */
+    @Test
+    public void lazyReadsMatchANonTieredControlTable() throws Throwable
+    {
+        String control = KEYSPACE + "." + createTable(
+            "CREATE TABLE %s (tag text, ts timestamp, value double, PRIMARY KEY (tag, ts))");
+        loadSixWindowsAndReencode();                      // creates the tiered table; %s targets it
+
+        // The exact inserts loadSixWindowsAndReencode made, replayed against the control table.
+        long writetime = 100L;
+        for (int window = 0; window < 6; window++)
+            for (int sample = 0; sample < 3; sample++)
+                execute("INSERT INTO " + control + " (tag, ts, value) VALUES ('t1', ?, ?) USING TIMESTAMP ?",
+                        new Date(window * HOUR + sample * 10 * 60_000L), window * 10.0 + sample, writetime++);
+        execute("INSERT INTO " + control + " (tag, ts, value) VALUES ('t1', ?, 99.0) USING TIMESTAMP 200",
+                new Date(7 * HOUR + 10 * 60_000L));
+
+        // Timestamps inline as epoch-millis literals so one string serves both tables: the slice
+        // [1h, 4h) spans three chunked windows and starts mid-coverage, so its LIMIT terminates
+        // mid-window on the tiered side.
+        String[] shapes = {
+            " WHERE tag = 't1' ORDER BY ts DESC LIMIT 5",                          // DESC LIMIT n
+            " WHERE tag = 't1' LIMIT 5",                                           // ASC LIMIT n
+            " WHERE tag = 't1'",                                                   // full scan
+            " WHERE tag = 't1' AND ts >= 3600000 AND ts < 14400000 LIMIT 4",       // slice + LIMIT
+            " WHERE tag = 't1' AND ts >= 3600000 AND ts < 14400000 ORDER BY ts DESC LIMIT 4",
+        };
+        for (String shape : shapes)
+            assertIdenticalRows(shape,
+                                execute("SELECT ts, value FROM " + control + shape),
+                                execute("SELECT ts, value FROM %s" + shape));
+    }
+
+    /** Byte-identical, row for row: same count, same order, same serialized cells. */
+    private static void assertIdenticalRows(String label, UntypedResultSet expected, UntypedResultSet actual)
+    {
+        Iterator<UntypedResultSet.Row> control = expected.iterator();
+        Iterator<UntypedResultSet.Row> tiered = actual.iterator();
+        int i = 0;
+        while (control.hasNext() && tiered.hasNext())
+        {
+            UntypedResultSet.Row expectedRow = control.next();
+            UntypedResultSet.Row actualRow = tiered.next();
+            assertEquals(label + ": ts of row " + i, expectedRow.getBytes("ts"), actualRow.getBytes("ts"));
+            assertEquals(label + ": value of row " + i, expectedRow.getBytes("value"), actualRow.getBytes("value"));
+            i++;
+        }
+        assertFalse(label + ": tiered read returned fewer rows than the control table (" + i + " matched)",
+                    control.hasNext());
+        assertFalse(label + ": tiered read returned more rows than the control table (" + i + " matched)",
+                    tiered.hasNext());
+    }
+
+    /**
+     * Slices compose with the limit's early termination: the window listing is already bounded by the
+     * slice (windows outside {@code [startMs - lookback, endMsExcl)} are never even listed, see
+     * {@code boundedReadStillReadsExactlyTheWindowsItsRangeCanReach}), and within that bound a
+     * {@code LIMIT} stops the walk. The slice [1h, 4h) admits windows 0-3 (window 0 via the
+     * look-back); ascending must decode window 0 just to learn all its rows sit below 1h, so the
+     * counts differ by direction -- and both are smaller than the 4 a full slice scan pays.
+     */
+    @Test
+    public void sliceWithLimitDecodesOnlyTheWindowsItNeeds() throws Throwable
+    {
+        loadSixWindowsAndReencode();
+
+        assertEquals("DESC: the newest in-slice window satisfies LIMIT 1 by itself",
+                     1, payloadReadsFor("SELECT value FROM %s WHERE tag = 't1' AND ts >= ? AND ts < ? " +
+                                        "ORDER BY ts DESC LIMIT 1", new Date(HOUR), new Date(4 * HOUR)));
+        assertEquals("ASC: the look-back window decodes empty, then the first in-slice window serves",
+                     2, payloadReadsFor("SELECT value FROM %s WHERE tag = 't1' AND ts >= ? AND ts < ? LIMIT 1",
+                                        new Date(HOUR), new Date(4 * HOUR)));
+        assertEquals("the un-limited slice still reads every window its range can reach",
+                     4, payloadReadsFor("SELECT value FROM %s WHERE tag = 't1' AND ts >= ? AND ts < ?",
+                                        new Date(HOUR), new Date(4 * HOUR)));
+    }
+
+    /**
+     * The benchmark's worst case (tiering-benchmark.md, "시간 범위를 걸지 않은 질의"): a static-only
+     * probe -- {@code SELECT static_col} with no clustering restriction -- used to scan every chunk in
+     * the partition for an answer that lives in the base table's static row. Statics are never
+     * chunked, but the probe still returns one result row per <em>clustering</em> row, so the merge
+     * must produce regular rows -- with {@code LIMIT 1} the first window's first row satisfies it and
+     * laziness prunes the other five. Without a {@code LIMIT} it is still a full scan (18 result
+     * rows), asserted as the control so the 1 above is early termination, not a skipped merge.
+     */
+    @Test
+    public void staticOnlyProbeDecodesAtMostOneWindow() throws Throwable
+    {
+        createTable("CREATE TABLE %s (tag text, ts timestamp, value double, meta text static, PRIMARY KEY (tag, ts))");
+        setPolicy("{\"hot_window\":\"2h\",\"chunk_window\":\"1h\"}");
+        execute("INSERT INTO %s (tag, meta) VALUES ('t1', 'pump-4') USING TIMESTAMP 99");
+        long writetime = 100L;
+        for (int window = 0; window < 6; window++)
+            for (int sample = 0; sample < 3; sample++)
+                execute("INSERT INTO %s (tag, ts, value) VALUES ('t1', ?, ?) USING TIMESTAMP ?",
+                        new Date(window * HOUR + sample * 10 * 60_000L), window * 10.0 + sample, writetime++);
+        assertEquals(6L, new TieredStorageService().runOnce(KEYSPACE, currentTable(), 9 * HOUR).windowsEncoded);
+
+        long before = ChunkRowSource.payloadReads.get();
+        UntypedResultSet probe = execute("SELECT meta FROM %s WHERE tag = 't1' LIMIT 1");
+        long windowsDecoded = ChunkRowSource.payloadReads.get() - before;
+        assertEquals(1, probe.size());
+        assertEquals("pump-4", probe.one().getString("meta"));
+        assertEquals("a static-only LIMIT 1 probe must not pay for the partition's chunks", 1, windowsDecoded);
+
+        // The control: without a LIMIT the same probe is a full scan -- one result row per clustering
+        // row -- so the merge demonstrably runs on this query shape and the 1 above is termination.
+        assertEquals(6, payloadReadsFor("SELECT meta FROM %s WHERE tag = 't1'"));
+        assertEquals(18, execute("SELECT meta FROM %s WHERE tag = 't1'").size());
     }
 
     /** @return what {@link TransparentReads#maybeWrap} does to {@code hot} for a full-partition read of 't1'. */
