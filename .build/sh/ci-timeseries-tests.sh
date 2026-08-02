@@ -72,6 +72,7 @@ TESTS=(
   "testsome|org.apache.cassandra.db.memtable.TimeSeriesMemtableColumnarTest"
   "testsome|org.apache.cassandra.db.memtable.TimeSeriesMemtableHeapTest"
   "testsome|org.apache.cassandra.db.memtable.TimeSeriesMemtableReadPathTest"
+  "testsome|org.apache.cassandra.db.memtable.TimeSeriesMemtableOffheapReadPathTest"
   "testsome|org.apache.cassandra.db.timeseries.tiering.ColdWindowChunkFlushTest"
 )
 
