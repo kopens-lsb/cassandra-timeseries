@@ -1,0 +1,429 @@
+/*
+ * Licensed to the Apache Software Foundation (ASF) under one
+ * or more contributor license agreements.  See the NOTICE file
+ * distributed with this work for additional information
+ * regarding copyright ownership.  The ASF licenses this file
+ * to you under the Apache License, Version 2.0 (the
+ * "License"); you may not use this file except in compliance
+ * with the License.  You may obtain a copy of the License at
+ *
+ *     http://www.apache.org/licenses/LICENSE-2.0
+ *
+ * Unless required by applicable law or agreed to in writing, software
+ * distributed under the License is distributed on an "AS IS" BASIS,
+ * WITHOUT WARRANTIES OR CONDITIONS OF ANY KIND, either express or implied.
+ * See the License for the specific language governing permissions and
+ * limitations under the License.
+ */
+
+package org.apache.cassandra.db.memtable;
+
+import java.nio.ByteBuffer;
+
+import org.junit.Test;
+
+import org.apache.cassandra.cql3.CQLTester;
+import org.apache.cassandra.cql3.ColumnSpecification;
+import org.apache.cassandra.cql3.UntypedResultSet;
+import org.apache.cassandra.utils.ByteBufferUtil;
+
+import static org.junit.Assert.assertEquals;
+import static org.junit.Assert.assertTrue;
+
+/**
+ * The read-path optimisations of {@link TimeSeriesMemtable}: the incrementally extended snapshot of
+ * {@link TimeSeriesColumnarPartition}, and the clustering-bounds shard pruning in
+ * {@code rowIterator}.
+ *
+ * <p><b>Why the reads are interleaved with the writes.</b> The production symptom motivating the
+ * snapshot work was a tag ingesting one row per second: every write invalidated the cached snapshot
+ * just before the next read, so each read rebuilt O(partition). The fix extends the last snapshot
+ * when nothing but appends happened — which means the dangerous state is precisely
+ * write→read→write→read, where a read caches a view and the following write decides whether that
+ * cache may be extended or must be discarded. Every differential case here therefore reads
+ * <em>between</em> writes, and the whole transcript of reads — not just the final state — must be
+ * byte-identical to {@code memtable = 'skiplist'}. A stale-cache bug shows up as a mid-sequence
+ * read returning yesterday's row and cannot hide behind a correct final read.
+ *
+ * <p><b>Why the backfill case exists.</b> Shard pruning must use the CLUSTERING values a shard
+ * partition holds, never the shard's write-time window: clustering time and write time are
+ * independent, and a backfilled row (old clustering, current write timestamp) lives in the current
+ * window's shard. Pruning by window silently drops it — a confusion hit in production once already,
+ * which {@link #backfilledRowsStayVisibleToSlicedReads} pins.
+ */
+public class TimeSeriesMemtableReadPathTest extends CQLTester
+{
+    private static final long HOUR_MS = 3_600_000L;
+
+    /** 2026-08-02T00:00:00Z — exactly on an hour boundary, so {@code +k hours} is window {@code k}. */
+    private static final long BASE_MS = 1785628800000L;
+
+    private static final String TSCS =
+        "{'class':'TimeSeriesCompactionStrategy','window_size':'1h','freeze_after':'2h'}";
+
+    /** Microsecond write timestamp {@code hours} windows after {@link #BASE_MS}. */
+    private static long at(int hours)
+    {
+        return (BASE_MS + hours * HOUR_MS) * 1000L;
+    }
+
+    /** The reads a workload performs are appended here, forming the transcript the harness compares. */
+    private StringBuilder transcript;
+
+    @FunctionalInterface
+    private interface Workload
+    {
+        void run() throws Throwable;
+    }
+
+    @FunctionalInterface
+    private interface StructuralCheck
+    {
+        void check(TimeSeriesMemtable memtable) throws Throwable;
+    }
+
+    // -------------------------------------------------------- problem 1: the incremental snapshot
+
+    /** Pure appends with a read after every write, across three windows: the extension path, live throughout. */
+    @Test
+    public void matchesReferenceOnInterleavedAppendsAndReads() throws Throwable
+    {
+        assertSameAsReference("CREATE TABLE %s (series text, ts timestamp, v double, PRIMARY KEY (series, ts)) " +
+                              "WITH compaction = " + TSCS,
+                              () -> {
+                                  for (int i = 0; i < 24; i++)
+                                  {
+                                      execute("INSERT INTO %s (series, ts, v) VALUES (?, ?, ?) USING TIMESTAMP ?",
+                                              "S1", BASE_MS + i * 1000L, i * 1.5, at(i % 3) + i);
+                                      observe("SELECT * FROM %s WHERE series = 'S1'");
+                                  }
+                              },
+                              memtable -> assertTrue("the workload was meant to span several windows",
+                                                     memtable.shards().size() > 1));
+    }
+
+    /**
+     * Read, promote, read again: the first read caches a snapshot; the later-timestamp UPDATE of an
+     * existing row in the <b>same</b> window promotes that row to the overflow tier without changing
+     * the array row count, so an incremental path that skipped the promotion invalidation would keep
+     * serving the cached, pre-update row. The mid-sequence reads pin exactly that.
+     */
+    @Test
+    public void matchesReferenceOnReadsAroundPromotion() throws Throwable
+    {
+        assertSameAsReference("CREATE TABLE %s (series text, ts timestamp, v double, q int, " +
+                              "PRIMARY KEY (series, ts)) WITH compaction = " + TSCS,
+                              () -> {
+                                  for (int i = 0; i < 5; i++)
+                                      execute("INSERT INTO %s (series, ts, v, q) VALUES (?, ?, ?, ?) USING TIMESTAMP ?",
+                                              "S1", BASE_MS + i * 1000L, i * 1.0, i, at(0) + i);
+                                  observe("SELECT * FROM %s WHERE series = 'S1'",
+                                          "SELECT q FROM %s WHERE series = 'S1' AND ts = " + (BASE_MS + 2000L));
+                                  // 60 s later in write time — same window, different timestamp: promotion.
+                                  execute("UPDATE %s USING TIMESTAMP ? SET q = ? WHERE series = ? AND ts = ?",
+                                          at(0) + 60_000_000L, 222, "S1", BASE_MS + 2000L);
+                                  observe("SELECT * FROM %s WHERE series = 'S1'",
+                                          "SELECT q FROM %s WHERE series = 'S1' AND ts = " + (BASE_MS + 2000L),
+                                          "SELECT writetime(v), writetime(q) FROM %s WHERE series = 'S1' AND ts = "
+                                          + (BASE_MS + 2000L));
+                                  // Appends after the promotion must read back cleanly too.
+                                  execute("INSERT INTO %s (series, ts, v, q) VALUES (?, ?, ?, ?) USING TIMESTAMP ?",
+                                          "S1", BASE_MS + 9000L, 9.0, 9, at(1));
+                                  observe("SELECT * FROM %s WHERE series = 'S1'");
+                              },
+                              memtable -> {
+                                  assertTrue(memtable.shards().size() > 1);
+                                  assertEquals("exactly the updated row should have been promoted",
+                                               1, overflowRows(memtable));
+                              });
+    }
+
+    /** Read, overwrite an existing row in place (same write timestamp, so no promotion), read again. */
+    @Test
+    public void matchesReferenceOnReadsAroundInPlaceOverwrite() throws Throwable
+    {
+        assertSameAsReference("CREATE TABLE %s (series text, ts timestamp, v double, PRIMARY KEY (series, ts)) " +
+                              "WITH compaction = " + TSCS,
+                              () -> {
+                                  execute("INSERT INTO %s (series, ts, v) VALUES (?, ?, ?) USING TIMESTAMP ?",
+                                          "S1", BASE_MS, 1.0, at(0));
+                                  observe("SELECT * FROM %s WHERE series = 'S1'");
+                                  // Same clustering, same write timestamp: reconciled in place, no promotion —
+                                  // but the cached snapshot must still not be extended past it.
+                                  execute("INSERT INTO %s (series, ts, v) VALUES (?, ?, ?) USING TIMESTAMP ?",
+                                          "S1", BASE_MS, 2.0, at(0));
+                                  observe("SELECT * FROM %s WHERE series = 'S1'");
+                                  // An older-timestamp overwrite must lose, and reads must show that too.
+                                  execute("INSERT INTO %s (series, ts, v) VALUES (?, ?, ?) USING TIMESTAMP ?",
+                                          "S1", BASE_MS, 3.0, at(0) - 1_000_000L);
+                                  observe("SELECT * FROM %s WHERE series = 'S1'");
+                                  execute("INSERT INTO %s (series, ts, v) VALUES (?, ?, ?) USING TIMESTAMP ?",
+                                          "S1", BASE_MS + 1000L, 4.0, at(1));
+                                  observe("SELECT * FROM %s WHERE series = 'S1'");
+                              },
+                              memtable -> assertTrue(memtable.shards().size() > 1));
+    }
+
+    /** Reads interleaved with a row deletion, a delete of a clustering never written, and a re-insert. */
+    @Test
+    public void matchesReferenceOnReadsAroundRowDeletion() throws Throwable
+    {
+        assertSameAsReference("CREATE TABLE %s (series text, ts timestamp, v double, PRIMARY KEY (series, ts)) " +
+                              "WITH compaction = " + TSCS,
+                              () -> {
+                                  for (int i = 0; i < 5; i++)
+                                      execute("INSERT INTO %s (series, ts, v) VALUES (?, ?, ?) USING TIMESTAMP ?",
+                                              "S1", BASE_MS + i * 1000L, i * 1.0, at(0) + i);
+                                  observe("SELECT * FROM %s WHERE series = 'S1'");
+                                  // Same window (50 s later), so the tombstone lands in the same shard
+                                  // partition that holds the row and must invalidate its snapshot.
+                                  execute("DELETE FROM %s USING TIMESTAMP ? WHERE series = ? AND ts = ?",
+                                          at(0) + 50_000_000L, "S1", BASE_MS + 1000L);
+                                  observe("SELECT * FROM %s WHERE series = 'S1'");
+                                  // A tombstone for a clustering the arrays never held.
+                                  execute("DELETE FROM %s USING TIMESTAMP ? WHERE series = ? AND ts = ?",
+                                          at(0) + 51_000_000L, "S1", BASE_MS + 777_000L);
+                                  observe("SELECT * FROM %s WHERE series = 'S1'");
+                                  // Re-insert over the tombstone, then read again.
+                                  execute("INSERT INTO %s (series, ts, v) VALUES (?, ?, ?) USING TIMESTAMP ?",
+                                          "S1", BASE_MS + 1000L, 99.0, at(0) + 55_000_000L);
+                                  observe("SELECT * FROM %s WHERE series = 'S1'",
+                                          "SELECT * FROM %s WHERE series = 'S1' AND ts = " + (BASE_MS + 1000L));
+                                  execute("INSERT INTO %s (series, ts, v) VALUES (?, ?, ?) USING TIMESTAMP ?",
+                                          "S1", BASE_MS + 8000L, 8.0, at(1));
+                                  observe("SELECT * FROM %s WHERE series = 'S1'");
+                              },
+                              memtable -> {
+                                  assertTrue(memtable.shards().size() > 1);
+                                  assertEquals("the deleted row and the never-written tombstone should both " +
+                                               "sit in the overflow tier", 2, overflowRows(memtable));
+                              });
+    }
+
+    /** Descending arrival: every append lands in the unsorted tail, and reads interleave with the sorting. */
+    @Test
+    public void matchesReferenceOnInterleavedOutOfOrderArrival() throws Throwable
+    {
+        assertSameAsReference("CREATE TABLE %s (series text, ts timestamp, v double, PRIMARY KEY (series, ts)) " +
+                              "WITH compaction = " + TSCS,
+                              () -> {
+                                  for (int i = 30; i >= 0; i--)
+                                  {
+                                      execute("INSERT INTO %s (series, ts, v) VALUES (?, ?, ?) USING TIMESTAMP ?",
+                                              "S1", BASE_MS + i * 1000L, i * 1.0, at(0) + (30 - i));
+                                      if (i % 5 == 0)
+                                          observe("SELECT * FROM %s WHERE series = 'S1'",
+                                                  "SELECT * FROM %s WHERE series = 'S1' AND ts >= " + (BASE_MS + 10_000L)
+                                                  + " AND ts <= " + (BASE_MS + 20_000L));
+                                  }
+                                  execute("INSERT INTO %s (series, ts, v) VALUES (?, ?, ?) USING TIMESTAMP ?",
+                                          "S1", BASE_MS + 40_000L, 40.0, at(1));
+                                  observe("SELECT * FROM %s WHERE series = 'S1'");
+                              },
+                              memtable -> assertTrue(memtable.shards().size() > 1));
+    }
+
+    /** The same interleavings on a DESC table: the merged view must respect the reversed comparator exactly. */
+    @Test
+    public void matchesReferenceOnDescClusteringInterleaved() throws Throwable
+    {
+        assertSameAsReference("CREATE TABLE %s (series text, ts timestamp, v double, q int, " +
+                              "PRIMARY KEY (series, ts)) WITH CLUSTERING ORDER BY (ts DESC) AND compaction = " + TSCS,
+                              () -> {
+                                  // Ascending ts is comparator-descending on a DESC table: the tail path.
+                                  for (int i = 0; i < 10; i++)
+                                  {
+                                      execute("INSERT INTO %s (series, ts, v, q) VALUES (?, ?, ?, ?) USING TIMESTAMP ?",
+                                              "S1", BASE_MS + i * 1000L, i * 1.0, i, at(0) + i);
+                                      if (i % 3 == 0)
+                                          observe("SELECT * FROM %s WHERE series = 'S1'");
+                                  }
+                                  // Descending ts is comparator-ascending: the in-order append path.
+                                  for (int i = 30; i > 20; i--)
+                                  {
+                                      execute("INSERT INTO %s (series, ts, v, q) VALUES (?, ?, ?, ?) USING TIMESTAMP ?",
+                                              "S1", BASE_MS + i * 1000L, i * 1.0, i, at(0) + 100 + i);
+                                      observe("SELECT * FROM %s WHERE series = 'S1'");
+                                  }
+                                  // A promotion mid-sequence, then reads in both directions and a slice.
+                                  execute("UPDATE %s USING TIMESTAMP ? SET q = ? WHERE series = ? AND ts = ?",
+                                          at(0) + 60_000_000L, 555, "S1", BASE_MS + 5000L);
+                                  observe("SELECT * FROM %s WHERE series = 'S1'",
+                                          "SELECT * FROM %s WHERE series = 'S1' ORDER BY ts ASC",
+                                          "SELECT * FROM %s WHERE series = 'S1' AND ts >= " + (BASE_MS + 3000L)
+                                          + " AND ts <= " + (BASE_MS + 25_000L));
+                                  execute("INSERT INTO %s (series, ts, v, q) VALUES (?, ?, ?, ?) USING TIMESTAMP ?",
+                                          "S1", BASE_MS + 50_000L, 50.0, 50, at(1));
+                                  observe("SELECT * FROM %s WHERE series = 'S1'");
+                              },
+                              memtable -> {
+                                  assertTrue(memtable.shards().size() > 1);
+                                  assertEquals(1, overflowRows(memtable));
+                              });
+    }
+
+    // ------------------------------------------------------------ problem 2: shard pruning bounds
+
+    /**
+     * ⚠ Pins the write-window/clustering-time confusion: rows written NOW whose clusterings lie
+     * several windows in the past live in the CURRENT write window's shard, and the inverse holds
+     * too. Sliced reads over either clustering range must return them; pruning shards by their
+     * write-time window silently drops them. A slice over a clustering range nothing covers must
+     * still come back empty — that is the pruning actually working.
+     */
+    @Test
+    public void backfilledRowsStayVisibleToSlicedReads() throws Throwable
+    {
+        String oldRange = "SELECT * FROM %s WHERE series = 'S1' AND ts >= " + BASE_MS +
+                          " AND ts < " + (BASE_MS + HOUR_MS);
+        String newRange = "SELECT * FROM %s WHERE series = 'S1' AND ts >= " + (BASE_MS + 5 * HOUR_MS);
+        String emptyRange = "SELECT * FROM %s WHERE series = 'S1' AND ts >= " + (BASE_MS + 2 * HOUR_MS) +
+                            " AND ts < " + (BASE_MS + 3 * HOUR_MS);
+
+        assertSameAsReference("CREATE TABLE %s (series text, ts timestamp, v double, PRIMARY KEY (series, ts)) " +
+                              "WITH compaction = " + TSCS,
+                              () -> {
+                                  // The backfill: written in window 5, clusterings from window 0's time range.
+                                  for (int i = 0; i < 10; i++)
+                                      execute("INSERT INTO %s (series, ts, v) VALUES (?, ?, ?) USING TIMESTAMP ?",
+                                              "S1", BASE_MS + i * 60_000L, i * 1.0, at(5) + i);
+                                  // The inverse: written in window 0, clusterings from window 5's time range.
+                                  for (int i = 0; i < 10; i++)
+                                      execute("INSERT INTO %s (series, ts, v) VALUES (?, ?, ?) USING TIMESTAMP ?",
+                                              "S1", BASE_MS + 5 * HOUR_MS + i * 60_000L, 100.0 + i, at(0) + i);
+                                  observe(oldRange, newRange, emptyRange);
+                              },
+                              memtable -> {
+                                  assertTrue(memtable.shards().size() > 1);
+                                  // Independent of the reference, so this cannot pass vacuously.
+                                  assertEquals("the backfilled rows must be found in the old clustering range",
+                                               10, execute(oldRange).size());
+                                  assertEquals("the forward-filled rows must be found in the new clustering range",
+                                               10, execute(newRange).size());
+                                  assertEquals("a range nothing covers must come back empty",
+                                               0, execute(emptyRange).size());
+                              });
+    }
+
+    // --------------------------------------------------------------------------------- perf guard
+
+    /**
+     * The production regression: one appended row per read used to force an O(partition) snapshot
+     * rebuild before nearly every read (7.5 ms local reads against 0.88 ms on the trie memtable).
+     * Wall clock is not assertable in CI, so pin the mechanism instead: across N write→read cycles
+     * the partition must take the incremental path — full rebuilds stay a small constant, they do
+     * not scale with the number of reads.
+     */
+    @Test
+    public void interleavedAppendsAndReadsExtendTheSnapshotIncrementally() throws Throwable
+    {
+        createTable("CREATE TABLE %s (series text, ts timestamp, v double, PRIMARY KEY (series, ts)) " +
+                    "WITH compaction = " + TSCS + " AND memtable = 'timeseries'");
+
+        int cycles = 128;
+        for (int i = 0; i < cycles; i++)
+        {
+            execute("INSERT INTO %s (series, ts, v) VALUES (?, ?, ?) USING TIMESTAMP ?",
+                    "S1", BASE_MS + i * 1000L, i * 1.0, at(0) + i);
+            // Every cycle also checks the extended snapshot is complete, not just fast.
+            assertEquals(i + 1, execute("SELECT * FROM %s WHERE series = 'S1'").size());
+        }
+
+        Memtable current = getCurrentColumnFamilyStore().getCurrentMemtable();
+        assertTrue("expected a TimeSeriesMemtable, got " + current.getClass().getName(),
+                   current instanceof TimeSeriesMemtable);
+        long fullBuilds = fullSnapshotBuilds((TimeSeriesMemtable) current);
+        assertTrue("the read view must have been built at least once", fullBuilds >= 1);
+        assertTrue(cycles + " interleaved write->read cycles must extend the snapshot incrementally, " +
+                   "not rebuild it per read, but it was fully rebuilt " + fullBuilds + " times",
+                   fullBuilds <= 3);
+    }
+
+    // ------------------------------------------------------------------------------------ harness
+
+    /**
+     * Applies {@code work} to a fresh table on the reference memtable and to a fresh table on
+     * {@link TimeSeriesMemtable}. Every {@link #observe} the workload performs — i.e. every read
+     * interleaved between its writes — is appended to a transcript, and the two transcripts must be
+     * byte-identical, before and after a flush. {@code structural} runs against the live
+     * {@code TimeSeriesMemtable} only, so a test also fails when the bytes were right but the
+     * storage did not do what the scenario was built to make it do.
+     */
+    private void assertSameAsReference(String schema, Workload work, StructuralCheck structural) throws Throwable
+    {
+        String reference = runTranscribed(schema, "skiplist", work, null);
+        String sharded = runTranscribed(schema, "timeseries", work, structural);
+        assertEquals(reference, sharded);
+    }
+
+    private String runTranscribed(String schema, String memtableConfig, Workload work, StructuralCheck structural)
+    throws Throwable
+    {
+        createTable(schema + " AND memtable = '" + memtableConfig + "'");
+        transcript = new StringBuilder();
+        work.run();
+
+        if (structural != null)
+        {
+            Memtable current = getCurrentColumnFamilyStore().getCurrentMemtable();
+            assertTrue("expected a TimeSeriesMemtable, got " + current.getClass().getName(),
+                       current instanceof TimeSeriesMemtable);
+            structural.check((TimeSeriesMemtable) current);
+        }
+
+        observe("SELECT * FROM %s");
+        flush();
+        transcript.append("== flushed\n");
+        observe("SELECT * FROM %s");
+        return transcript.toString();
+    }
+
+    /** Runs {@code selects} now and appends their hex dumps to the transcript. */
+    private void observe(String... selects) throws Throwable
+    {
+        for (String select : selects)
+        {
+            transcript.append("-- ").append(select).append('\n');
+            transcript.append(dump(execute(select)));
+        }
+    }
+
+    /** Rows in the object-tier overflow maps over every columnar partition of every shard. */
+    private static int overflowRows(TimeSeriesMemtable memtable)
+    {
+        int rows = 0;
+        for (TimeSeriesMemtable.WindowShard shard : memtable.shards().values())
+            for (TimeSeriesMemtable.ShardPartition partition : shard.partitions.values())
+                rows += ((TimeSeriesColumnarPartition) partition).overflowRowCount();
+        return rows;
+    }
+
+    /** Full (from-scratch) snapshot builds over every columnar partition of every shard. */
+    private static long fullSnapshotBuilds(TimeSeriesMemtable memtable)
+    {
+        long builds = 0;
+        for (TimeSeriesMemtable.WindowShard shard : memtable.shards().values())
+            for (TimeSeriesMemtable.ShardPartition partition : shard.partitions.values())
+                builds += ((TimeSeriesColumnarPartition) partition).fullSnapshotBuilds();
+        return builds;
+    }
+
+    /** Hex, column by column, so nothing a typed accessor would normalise away can hide a difference. */
+    private static String dump(UntypedResultSet resultSet)
+    {
+        StringBuilder out = new StringBuilder();
+        for (UntypedResultSet.Row row : resultSet)
+        {
+            for (ColumnSpecification column : row.getColumns())
+            {
+                String name = column.name.toString();
+                ByteBuffer value = row.has(name) ? row.getBlob(name) : null;
+                out.append(name).append('=')
+                   .append(value == null ? "null" : ByteBufferUtil.bytesToHex(value))
+                   .append(' ');
+            }
+            out.append('\n');
+        }
+        return out.toString();
+    }
+}
