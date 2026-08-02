@@ -617,6 +617,48 @@ public class TimeSeriesMemtable extends AbstractAllocatorMemtable
         }
     }
 
+    /**
+     * Whether any of {@code slices} intersects the inclusive clustering range [{@code min},
+     * {@code max}], decided by comparing the slices' <b>existing</b> bounds against the two
+     * clusterings with the table's comparator — so it is exact on reversed (DESC) clusterings,
+     * whose min/max are maintained in comparator order throughout this memtable.
+     *
+     * <p>No {@code ClusteringBound} is ever fabricated from {@code min}/{@code max}: they are
+     * memtable-owned clusterings, and building bounds from them ({@code Slice.make} →
+     * {@code ClusteringBound.create}) goes through the value accessor's object factory, which the
+     * native (offheap_objects) accessor refuses with {@code UnsupportedOperationException}. That is
+     * how shard pruning took down production paged reads on 2026-08-02: page one of a paged read
+     * carries {@code Slices.ALL} and skips pruning, but every later page carries the pager's
+     * {@code Slices.forPaging} rewrite — never {@code ALL} — so every page after the first
+     * fabricated bounds from native clusterings and threw. Iterating the slices allocates nothing
+     * and works for every accessor and every {@code Slices} shape, including {@code Slices.NONE}
+     * (empty iteration, correctly pruned).
+     */
+    static boolean intersectsBounds(Slices slices, ClusteringComparator comparator, Clustering<?> min, Clustering<?> max)
+    {
+        for (Slice slice : slices)
+        {
+            // A bound never ties with a clustering (the bound kind breaks value ties), so these two
+            // comparisons decide inclusive and exclusive slice bounds alike.
+            if (comparator.compare(slice.start(), max) <= 0 && comparator.compare(min, slice.end()) <= 0)
+                return true;
+        }
+        return false;
+    }
+
+    /**
+     * The answer when a pruning probe fails unexpectedly: read the shard. Pruning is an
+     * optimisation, and an exception on this path is a read outage — fail open, but loudly enough
+     * (rate-limited, with the stack) that the swallowed defect stays visible.
+     */
+    static boolean pruneFailedOpen(RuntimeException e)
+    {
+        NoSpamLogger.log(logger, NoSpamLogger.Level.WARN, "timeseries-memtable-prune-fail-open",
+                         1, TimeUnit.MINUTES,
+                         "Time-series shard-pruning probe failed; reading the shard instead", e);
+        return true;
+    }
+
     // --------------------------------------------------------------------------------- statistics
 
     @Override
@@ -869,8 +911,10 @@ public class TimeSeriesMemtable extends AbstractAllocatorMemtable
          * from the <b>clustering</b> values actually present (plus any deletion or static row, which
          * every slice must see) — never from the shard's write-time window, because clustering time
          * and write time are independent: a backfilled row carries an old clustering but lives in
-         * the current write window's shard. Any doubt must answer {@code true}; skipping is only an
-         * optimisation, and this default declines it.
+         * the current write window's shard. Any doubt must answer {@code true} and no
+         * implementation may throw — every {@code Slices} shape a read can carry (including the
+         * pager's {@code forPaging} rewrites and {@code Slices.NONE}) must get a boolean; skipping
+         * is only an optimisation, and this default declines it.
          */
         default boolean mayContainRowsIn(Slices slices)
         {
@@ -920,25 +964,35 @@ public class TimeSeriesMemtable extends AbstractAllocatorMemtable
                 maxClustering = HeapCloner.instance.clone(last.clustering());
         }
 
-        /** Same contract as the columnar override: prune by held clusterings only, fail open otherwise. */
+        /**
+         * Same contract as the columnar override: prune by held clusterings only, compared against
+         * the slices' existing bounds (never fabricated ones), and fail open on anything else.
+         */
         @Override
         public boolean mayContainRowsIn(Slices slices)
         {
-            if (!partition.deletionInfo().isLive() || !partition.staticRow().isEmpty())
-                return true;
-
-            ClusteringComparator comparator = partition.metadata().comparator;
-            if (comparator.size() == 0)
-                return true;
-
-            Clustering<?> min;
-            Clustering<?> max;
-            synchronized (this)
+            try
             {
-                min = minClustering;
-                max = maxClustering;
+                if (!partition.deletionInfo().isLive() || !partition.staticRow().isEmpty())
+                    return true;
+
+                ClusteringComparator comparator = partition.metadata().comparator;
+                if (comparator.size() == 0)
+                    return true;
+
+                Clustering<?> min;
+                Clustering<?> max;
+                synchronized (this)
+                {
+                    min = minClustering;
+                    max = maxClustering;
+                }
+                return min == null || intersectsBounds(slices, comparator, min, max);
             }
-            return min == null || slices.intersects(Slice.make(min, max));
+            catch (RuntimeException e)
+            {
+                return pruneFailedOpen(e);
+            }
         }
 
         @Override

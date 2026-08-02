@@ -19,15 +19,23 @@
 package org.apache.cassandra.db.memtable;
 
 import java.nio.ByteBuffer;
+import java.util.ArrayList;
+import java.util.List;
 
 import org.junit.Test;
 
 import org.apache.cassandra.cql3.CQLTester;
 import org.apache.cassandra.cql3.ColumnSpecification;
 import org.apache.cassandra.cql3.UntypedResultSet;
+import org.apache.cassandra.db.Clustering;
+import org.apache.cassandra.db.ClusteringComparator;
+import org.apache.cassandra.db.Slice;
+import org.apache.cassandra.db.Slices;
 import org.apache.cassandra.utils.ByteBufferUtil;
 
 import static org.junit.Assert.assertEquals;
+import static org.junit.Assert.assertFalse;
+import static org.junit.Assert.assertSame;
 import static org.junit.Assert.assertTrue;
 
 /**
@@ -303,6 +311,123 @@ public class TimeSeriesMemtableReadPathTest extends CQLTester
                                   assertEquals("a range nothing covers must come back empty",
                                                0, execute(emptyRange).size());
                               });
+    }
+
+    // -------------------------------------------------- every Slices shape a real read can produce
+
+    /**
+     * {@code mayContainRowsIn} is fed by real reads, and real reads do not only produce the shapes
+     * a plain {@code SELECT} does: a <b>paged</b> read rewrites its slices per page via
+     * {@code Slices.forPaging}, producing rewritten {@code ArrayBackedSlices} and, once a page
+     * exhausts the query's range, {@code Slices.NONE}. The 2026-08-02 production outage was this
+     * method throwing on a paged read's page-two slices — page one is {@code Slices.ALL} and skips
+     * pruning entirely, which is exactly why unpaged testing missed it. This probes every shape,
+     * on an ASC and a DESC table: never throw, prune only what really cannot match.
+     */
+    @Test
+    public void mayContainRowsInHandlesEverySlicesShapeAPagerCanProduce() throws Throwable
+    {
+        probeSlicesShapes(false);
+        probeSlicesShapes(true);
+    }
+
+    private void probeSlicesShapes(boolean desc) throws Throwable
+    {
+        createTable("CREATE TABLE %s (series text, ts timestamp, v double, PRIMARY KEY (series, ts)) " +
+                    "WITH CLUSTERING ORDER BY (ts " + (desc ? "DESC" : "ASC") + ") " +
+                    "AND compaction = " + TSCS + " AND memtable = 'timeseries'");
+        for (int i = 0; i < 10; i++)
+            execute("INSERT INTO %s (series, ts, v) VALUES (?, ?, ?) USING TIMESTAMP ?",
+                    "S1", BASE_MS + i * 1000L, i * 1.0, at(0) + i);
+
+        TimeSeriesMemtable memtable = (TimeSeriesMemtable) getCurrentColumnFamilyStore().getCurrentMemtable();
+        TimeSeriesMemtable.ShardPartition partition = solePartition(memtable);
+        ClusteringComparator comparator = getCurrentColumnFamilyStore().metadata().comparator;
+
+        // The trivial shapes.
+        assertTrue(partition.mayContainRowsIn(Slices.ALL));
+        assertFalse("NONE selects nothing; pruning it is correct", partition.mayContainRowsIn(Slices.NONE));
+
+        // Plain ranges, built in comparator order. On DESC the comparator-lesser end is the LATER
+        // time, so a bounds probe accidentally built in time order fails exactly this case.
+        assertTrue("a slice covering held rows must not be pruned (desc=" + desc + ')',
+                   partition.mayContainRowsIn(rangeSlices(comparator, BASE_MS + 3000L, BASE_MS + 7000L)));
+        assertFalse("a slice above every held clustering must be pruned (desc=" + desc + ')',
+                    partition.mayContainRowsIn(rangeSlices(comparator, BASE_MS + 60_000L, BASE_MS + 90_000L)));
+        assertFalse("a slice below every held clustering must be pruned (desc=" + desc + ')',
+                    partition.mayContainRowsIn(rangeSlices(comparator, BASE_MS - 90_000L, BASE_MS - 60_000L)));
+
+        // What the pager actually feeds this method: forPaging rewrites from a mid-partition row,
+        // in both paging directions, inclusive and not.
+        Clustering<?> mid = Clustering.make(ByteBufferUtil.bytes(BASE_MS + 5000L));
+        assertTrue(partition.mayContainRowsIn(Slices.ALL.forPaging(comparator, mid, false, false)));
+        assertTrue(partition.mayContainRowsIn(Slices.ALL.forPaging(comparator, mid, true, false)));
+        assertTrue(partition.mayContainRowsIn(Slices.ALL.forPaging(comparator, mid, false, true)));
+
+        // Paging past the comparator-last row leaves nothing: prune, never throw.
+        long comparatorLastTs = desc ? BASE_MS : BASE_MS + 9000L;
+        Clustering<?> comparatorLast = Clustering.make(ByteBufferUtil.bytes(comparatorLastTs));
+        assertFalse("paging past the final row leaves nothing to read (desc=" + desc + ')',
+                    partition.mayContainRowsIn(Slices.ALL.forPaging(comparator, comparatorLast, false, false)));
+
+        // A single-slice query paged past its slice collapses to Slices.NONE — the selects-nothing
+        // implementation whose get(int) throws; the probe must neither call it nor keep the shard.
+        Slices exhausted = Slices.with(comparator, Slice.make(mid)).forPaging(comparator, mid, false, false);
+        assertSame(Slices.NONE, exhausted);
+        assertFalse(partition.mayContainRowsIn(exhausted));
+    }
+
+    /** A single [tsA, tsB] slice with start/end put in COMPARATOR order, whichever order that is. */
+    private static Slices rangeSlices(ClusteringComparator comparator, long tsA, long tsB)
+    {
+        Clustering<?> a = Clustering.make(ByteBufferUtil.bytes(tsA));
+        Clustering<?> b = Clustering.make(ByteBufferUtil.bytes(tsB));
+        boolean aFirst = comparator.compare(a, b) <= 0;
+        return Slices.with(comparator, Slice.make(aFirst ? a : b, aFirst ? b : a));
+    }
+
+    private static TimeSeriesMemtable.ShardPartition solePartition(TimeSeriesMemtable memtable)
+    {
+        List<TimeSeriesMemtable.ShardPartition> partitions = new ArrayList<>();
+        for (TimeSeriesMemtable.WindowShard shard : memtable.shards().values())
+            partitions.addAll(shard.partitions.values());
+        assertEquals(1, partitions.size());
+        return partitions.get(0);
+    }
+
+    /**
+     * Paged native-protocol reads over multi-page partitions, against the unpaged answer. The
+     * in-process {@code execute()} path never pages, so without this the pager's slice rewrites
+     * reach {@code mayContainRowsIn} for the first time in production.
+     */
+    @Test
+    public void pagedNativeReadsMatchUnpagedReads() throws Throwable
+    {
+        for (boolean desc : new boolean[]{ false, true })
+        {
+            createTable("CREATE TABLE %s (series text, ts timestamp, v double, PRIMARY KEY (series, ts)) " +
+                        "WITH CLUSTERING ORDER BY (ts " + (desc ? "DESC" : "ASC") + ") " +
+                        "AND compaction = " + TSCS + " AND memtable = 'timeseries'");
+            for (int i = 0; i < 40; i++)
+                execute("INSERT INTO %s (series, ts, v) VALUES (?, ?, ?) USING TIMESTAMP ?",
+                        "S1", BASE_MS + i * 1000L, i * 1.0, at(i % 2) + i);
+
+            assertEquals(40, execute("SELECT * FROM %s WHERE series = 'S1'").size());
+            assertEquals(40, count(executeNetWithPaging("SELECT * FROM %s WHERE series = 'S1'", 7)));
+            assertEquals(40, count(executeNetWithPaging("SELECT * FROM %s WHERE series = 'S1' ORDER BY ts " +
+                                                        (desc ? "ASC" : "DESC"), 7)));
+            assertEquals(20, count(executeNetWithPaging("SELECT * FROM %s WHERE series = 'S1' AND ts >= " +
+                                                        (BASE_MS + 20_000L), 7)));
+            assertEquals(15, count(executeNetWithPaging("SELECT * FROM %s WHERE series = 'S1' LIMIT 15", 4)));
+        }
+    }
+
+    private static int count(com.datastax.driver.core.ResultSet resultSet)
+    {
+        int rows = 0;
+        for (com.datastax.driver.core.Row ignored : resultSet)
+            rows++;
+        return rows;
     }
 
     // --------------------------------------------------------------------------------- perf guard
