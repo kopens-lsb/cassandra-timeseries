@@ -1,5 +1,9 @@
 # GC comparison: Generational ZGC vs G1
 
+> 측정 시점: 2026-07-30, 구형 24코어 컨테이너(X5670급), v3 청크 시절. **GC 간 상대 비교**로는
+> 여전히 유효하지만 절대 수치는 현재 기준이 아니다 — 현행 수치는
+> [tiering-benchmark.md](tiering-benchmark.md) 참조. 결론(Generational ZGC 채택)은 현행 설정이다.
+
 Same node, same data set (100,000,000 rows in 1,000 partitions), same queries; each side ran a warm-up pass first and the numbers below are the second, warm pass.
 
 ## Write throughput

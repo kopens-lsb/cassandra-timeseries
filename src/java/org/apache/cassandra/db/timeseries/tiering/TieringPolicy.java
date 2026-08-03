@@ -62,9 +62,10 @@ import static java.lang.String.format;
  * </ul>
  * Durations use the grammar {@code <positive int><m|h|d>} (minutes/hours/days).
  *
- * <p>{@code codec} was removed when chimp128 became the only chunk codec. A policy still carrying
- * it is rejected by name (see {@link #REMOVED_KEYS}) rather than silently ignored, so an operator
- * who set it learns that the setting no longer does anything.
+ * <p>{@code codec} was removed when the chunk codec stopped being a choice; the format (currently
+ * chunk format v4, ALP-only for doubles) is decided by the build, not per policy. A policy still
+ * carrying the key is rejected by name (see {@link #REMOVED_KEYS}) rather than silently ignored,
+ * so an operator who set it learns that the setting no longer does anything.
  */
 public final class TieringPolicy
 {
@@ -90,7 +91,7 @@ public final class TieringPolicy
      * an operator keep believing the option is in effect.
      */
     private static final Map<String, String> REMOVED_KEYS = ImmutableMap.of(
-        "codec", "chimp128 is now the only chunk codec, so there is nothing to choose; remove the key");
+        "codec", "the chunk format is fixed by the build (currently v4), so there is nothing to choose; remove the key");
 
     /**
      * Consistency levels weaker than a quorum are rejected: at e.g. {@code ONE}, the re-encoder's

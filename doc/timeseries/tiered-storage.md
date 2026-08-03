@@ -22,8 +22,9 @@
 `<테이블>__chunks`로 옮기고, 원본 행은 삭제하는 서버 내장 계층화 엔진입니다. 최근 데이터(핫 구간)는
 행 단위로 그대로 남아 쓰기·조회 모두 기존과 동일하고, 오래된 데이터는 행당 수 바이트 수준으로
 압축된 청크로 보관됩니다. 청크 1개는 한 창의 타임스탬프 축 하나에 **일반 컬럼 전부**를 컬럼별 독립
-섹션으로 담습니다(§3.1.2). `double` 컬럼에 쓰이는 ALP의 압축 특성은
-[bake-off 결과](codec-bakeoff.md)를 참고하세요.
+섹션으로 담습니다(§3.1.2). 페이로드 포맷은 **청크 포맷 v4** 하나이며, 바이트 레이아웃·블록
+인코딩·결정성 규칙은 [chunk-format-v4.md](chunk-format-v4.md)가 규범입니다. `double` 컬럼에 쓰이는
+ALP의 압축 특성은 [bake-off 결과](codec-bakeoff.md)를 참고하세요.
 
 > **투명 읽기(SP3) 포함**: 베이스 테이블 `SELECT`가 핫 로우와 청크 디코드 로우를 **자동 병합**해
 > 돌려줍니다 — 애플리케이션은 압축의 존재를 모릅니다. 파티션(태그) + 시간 범위/포인트 질의,
@@ -32,7 +33,8 @@
 > 페이징도 그대로 동작합니다 — 한 페이지를 넘는 병합 질의는 (예전과 달리) 실패하지 않고, `LIMIT`과
 > short-read protection이 병합된 결과에 적용되어 모든 행을 돌려줍니다.
 > 제한: ① 디코드 로우의 `writetime(value)`은 청크의 `max_row_writetime` 근사값입니다.
-> ② 손상 청크는 경고와 함께 건너뛰고 나머지 데이터를 제공합니다.
+> ② 손상 청크는 경고와 함께 건너뛰고 나머지 데이터를 제공합니다 — 반면 제거된 포맷 버전
+> (v1/v2/v3)의 청크는 건너뛰지 않고 쿼리를 실패시킵니다(§2.2).
 
 ## 1. 대상 스키마 — 시간으로 클러스터링된 아무 테이블
 
@@ -76,7 +78,7 @@ CREATE TABLE pp.tm_tag_point (
     opc_id     text static, site_id  text static, tag_name text static, type text static,
     attribute     frozen<map<text,text>>,        -- 항상 {} → CONSTANT
     error_code    int,                           -- 항상 0 → CONSTANT
-    latency       int,                           -- 고엔트로피 작은 정수 → zigzag varint 델타
+    latency       int,                           -- 고엔트로피 작은 정수 → 블록 비트패킹
     quality       int,                           -- 항상 192 → CONSTANT
     value         text,                          -- 판독값의 문자열 사본 (사전/raw)
     value_boolean boolean,                       -- type=boolean 태그에서만 채워짐 (1비트 팩)
@@ -213,19 +215,22 @@ ALTER TABLE pp.tm_tag_point WITH extensions = {
 
 ### 2.2 코덱
 
-고를 것이 없습니다. 컬럼 타입이 인코딩을 결정하고(§3.1.2), `double` 컬럼의 값 코덱은 **ALP
-하나뿐**입니다 — 양자화된 워크/주기 신호(소수점이 잘린 실제 산업 센서값)에서 0.75~1.4 B/샘플이며,
-값이 전혀 변하지 않는 컬럼은 코덱을 타기 전에 CONSTANT 플래그가 행 수와 무관하게 O(1) 바이트로
-처리합니다. 페이로드에는 여전히 버전 바이트가 있어 디코딩은 자동입니다.
+고를 것이 없습니다. 컬럼 타입이 인코딩을 결정하고(§3.1.2), `double` 컬럼의 값 코덱은
+**ALP/ALP-RD 하나뿐**입니다 — 양자화된 워크/주기 신호(소수점이 잘린 실제 산업 센서값)에서
+0.75~1.4 B/샘플이며, 값이 전혀 변하지 않는 컬럼은 코덱을 타기 전에 CONSTANT 플래그가 행 수와
+무관하게 O(1) 바이트로 처리합니다. 페이로드에는 버전 바이트가 있어 디코딩은 자동입니다.
 
-> 예전에는 `codec`(`auto`/`gorilla`/`chimp128`) 정책 필드가 있었지만 **제거**됐습니다. 정책 JSON에
-> 아직 `codec`이 남아 있으면 `ALTER TABLE`이 그 키를 지목해 거부하므로, 조용히 무시되는 일은
-> 없습니다. 선택의 근거와 Gorilla를 뺀 이유는 [코덱 bake-off](codec-bakeoff.md) 참고.
+> `codec` 정책 필드는 존재하지 않습니다. 정책 JSON에 `codec` 키가 들어 있으면 `ALTER TABLE`이
+> 그 키를 지목해 거부하므로, 조용히 무시되는 일은 없습니다. 코덱 선택의 근거는
+> [코덱 bake-off](codec-bakeoff.md) 참고.
 
-> **통합 이전 청크는 읽을 수 없습니다.** 그런 청크를 만나면 `SELECT`는 조용히 건너뛰지 않고
-> **실패합니다**(손상 청크와 달리 전 청크에 해당하므로, 건너뛰면 쿼리가 성공하면서 과거 데이터만
-> 빠진 결과를 계속 돌려주게 됩니다). `<테이블>__chunks`를 `DROP`하고 계층화를 다시 돌리세요 —
-> 인코딩 시점에 베이스 행이 이미 삭제됐으므로 **그 데이터는 복구되지 않습니다.**
+> **페이로드 포맷은 v4 하나입니다** ([chunk-format-v4.md](chunk-format-v4.md)). 제거된 포맷
+> (v1 Gorilla, v2 Chimp128, v3 컬럼 지향)의 페이로드를 만나면 `SELECT`는 조용히 건너뛰지 않고
+> `UnsupportedChunkFormatException`으로 **실패합니다** — 손상 청크와 달리 전 청크에 해당하는
+> 계통적 문제라, 건너뛰면 쿼리가 성공하면서 과거 데이터만 빠진 결과를 계속 돌려주게 됩니다.
+> 그런 청크 테이블은 `DROP`하고 계층화를 다시 돌리는 것 외에 방법이 없습니다 — 인코딩 시점에
+> 베이스 행이 이미 삭제됐으므로 **그 데이터는 복구되지 않습니다.** (v3→v4 변환 도구는 의도적으로
+> 만들지 않았습니다 — [chunk-format-v4.md §10](chunk-format-v4.md).)
 
 ## 3. 청크 직접 조회 — 운영·디버그 용도
 
@@ -243,7 +248,7 @@ ALTER TABLE pp.tm_tag_point WITH extensions = {
 | --- | --- | --- |
 | *(베이스 파티션 키 전체)* | 동일 | 베이스 테이블의 파티션 키 컬럼 **전부**를 이름·타입·순서 그대로 복제 (예: `tag_id text`, 또는 복합 키면 `(asset_id text, date text, hour int)` 세 컬럼 모두) |
 | `window_start` | `timestamp` | 청크가 덮는 창의 시작 (클러스터링 키; 창 길이 = `chunk_window`) |
-| `codec` | `tinyint` | 페이로드의 **첫 바이트(포맷 버전)를 그대로 복사한 값**. 현재 쓰이는 값은 `3`(컬럼 지향)뿐입니다 — 인코딩 후 페이로드에서 읽어 넣으므로 항상 실제 저장된 포맷을 가리킵니다. `1`(제거된 Gorilla)·`2`(제거된 단일 컬럼 Chimp128)는 더 이상 쓰이지도 읽히지도 않습니다 |
+| `codec` | `tinyint` | 페이로드의 **첫 바이트(포맷 버전)를 그대로 복사한 값**. 현재 쓰이는 값은 `4`(청크 포맷 v4)뿐입니다 — 인코딩 후 페이로드에서 읽어 넣으므로 항상 실제 저장된 포맷을 가리킵니다. `1`·`2`·`3`은 제거된 포맷이며, 그런 페이로드를 읽으면 `UnsupportedChunkFormatException`이 전파됩니다(§2.2) |
 | `samples` | `int` | 청크에 인코딩된 **행 수** (값 개수가 아닙니다 — 행 1개가 컬럼 N개를 가집니다) |
 | `max_row_writetime` | `bigint` | 청크에 포함된 원본 행들의 **모든 컬럼**을 통틀어 최대 writetime (원본 삭제 타임스탬프이자 지각 병합 판정 기준) |
 | `payload` | `blob` | 창 1개의 인코딩 결과: 공유 타임스탬프 축 + 베이스 테이블 **일반 컬럼별 독립 섹션** |
@@ -270,16 +275,19 @@ ALTER TABLE pp.tm_tag_point WITH extensions = {
 #### 3.1.2 컬럼 타입별 인코딩
 
 타입 코드는 **직렬화된 바이트를 어떤 방식으로 압축할지**만 고릅니다 — 바이트 자체는 바꾸지 않으므로
-디코딩 결과는 원본 셀과 바이트 단위로 동일합니다.
+디코딩 결과는 원본 셀과 바이트 단위로 동일합니다. 블록 단위 인코딩(FOR/델타 비트패킹, ALP/ALP-RD,
+사전 등)과 통계·presence의 세부는 [chunk-format-v4.md](chunk-format-v4.md)가 규범이고, 여기서는
+타입 → 타입 코드 매핑만 요약합니다:
 
-| 베이스 컬럼 타입 | 청크 인코딩 |
+| 베이스 컬럼 타입 | 청크 타입 코드 |
 | --- | --- |
-| `double` | ALP (십진 ALP 또는 ALP-RD, 섹션 첫 바이트가 지목) |
-| `boolean` | 1비트 팩 |
-| `int`, `date` | 4바이트 고정폭 + zigzag varint 델타 (`date`는 부호 없는 일수지만 4바이트 그대로 왕복) |
-| `bigint`, `timestamp`, `time` | 8바이트 고정폭 + zigzag varint 델타 (정규화 없음: 각각 원값·epoch millis·자정 이후 나노초) |
-| `text`, `varchar`, `ascii` | 사전(서로 다른 값 256개 이하) / 아니면 길이 접두 raw |
-| **그 외 전부** | **불투명 바이트**(직렬화 그대로) + 사전/RLE — `blob`, `uuid`, `timeuuid`, `decimal`, `varint`, `inet`, `smallint`, `tinyint`, `float`, `duration`, frozen 컬렉션·UDT·튜플 |
+| `double` | `DOUBLE` — 블록별 ALP 또는 ALP-RD |
+| `boolean` | `BOOLEAN` — 1비트 팩 |
+| `int` | `INT32` — 블록별 FOR/델타 비트패킹 |
+| `date` | `DATE32` — 부호 없는 일수 (v4에서 `INT32`와 분리: 통계 비교 순서가 다릅니다) |
+| `bigint`, `timestamp`, `time` | `INT64` (정규화 없음: 각각 원값·epoch millis·자정 이후 나노초) |
+| `text`, `varchar`, `ascii` | `TEXT` — 사전 / 길이 접두 raw |
+| **그 외 전부** | `OPAQUE` — **불투명 바이트**(직렬화 그대로) + 사전 — `blob`, `uuid`, `timeuuid`, `decimal`, `varint`, `inet`, `smallint`, `tinyint`, `float`, `duration`, frozen 컬렉션·UDT·튜플 |
 
 `smallint`(2바이트)·`tinyint`(1바이트)·`float`(4바이트)를 굳이 불투명으로 두는 이유는, 고정폭 코드가
 자기 폭으로 다시 직렬화하기 때문에(그리고 `boolean` 코드는 값을 0/1 비트로 접기 때문에) 폭이 다르면
@@ -409,6 +417,11 @@ JMX `org.apache.cassandra.db:type=TieredStorage` — `retier(keyspace, table)`,
 > 않습니다**. 커버리지는 테이블당 캐시되며 최대 60초마다 갱신되고, 청크 테이블이 아직 없는
 > 테이블(= 정책을 걸었지만 첫 사이클 전, 그리고 모든 비계층화 테이블)은 캐시 조회 한 번으로
 > 끝납니다.
+
+> 병합이 필요한 질의에서도 디코드는 창 단위로 게으릅니다: 창 목록은 payload 없이 나열해 두고,
+> 방출 순서대로(DESC면 최신 창부터) 한 창씩 payload를 페치·디코드하므로 `LIMIT`이 차면 나머지
+> 창은 읽지 않습니다. 청크 **하나**의 디코드는 즉시(eager) 전체를 캡처합니다 — 손상·미지원 포맷을
+> 행을 방출하기 **전에** 판정하기 위해서입니다. 행 **조립**은 당겨질 때 한 행씩 일어납니다.
 
 > 청크 읽기가 **실패**하면(타임아웃, 복제본 부족, 톰스톤 과다) 쿼리는 핫 행만 담아 성공하는 대신
 > **실패합니다**. 원본 행이 삭제된 구간을 "성공했지만 콜드가 빠진" 결과로 돌려주는 것은 느린 것이
@@ -609,9 +622,16 @@ static 컬럼(`site_id`, `tag_name`, …)에 대한 쓰기·삭제는 이 규칙
 
 - `org.apache.cassandra.db.timeseries.tiering.TieringPolicyTest` — 정책 파싱/검증 규칙
 - `org.apache.cassandra.db.timeseries.tiering.TieredStorageServiceTest` — 재인코딩 사이클 전체
-  (인코딩·삭제, 핫 구간 보존, 지각 병합, 멱등 수렴, cold 만료, auto 코덱, 스위프 격리, 재진입 가드,
+  (인코딩·삭제, 핫 구간 보존, 지각 병합, 멱등 수렴, cold 만료, 스위프 격리, 재진입 가드,
   가상 테이블)
+- `org.apache.cassandra.db.timeseries.ChunkV4CodecTest` 등 `db/timeseries`의 포맷 테스트 —
+  레이아웃 골든 벡터, 바이트 결정성(JIT 티어 간 동일성 `encoderIsDeterministicAcrossJitTiers`
+  포함), 통계 건전성, 블록 독립 디코드
 - `org.apache.cassandra.tools.nodetool.mock.TieredStorageMockTest` — nodetool 두 명령의 JMX
   패스스루/오류 표면화
+- `org.apache.cassandra.distributed.test.timeseries.TieredStorageDistributedTest` ·
+  `ChunkTableSchemaPropagationTest` — 3노드 jvm-dtest (프라이머리 레인지 분할, 코디네이터 독립
+  투명 읽기, 스키마 전파, 노드 재시작)
 - [docker/integration-test.sh](../../docker/integration-test.sh) — 실제 이미지에서 정책 설정 →
-  retier → 청크 검증 → 지각 병합 → 상태 표까지 (릴리스 게이트)
+  retier → 청크 검증 → 지각 병합 → 상태 표까지 (릴리스 게이트),
+  [docker/cluster-test.sh](../../docker/cluster-test.sh) — 3노드 실컨테이너 검증

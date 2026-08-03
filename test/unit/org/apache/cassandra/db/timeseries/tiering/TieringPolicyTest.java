@@ -226,12 +226,12 @@ public class TieringPolicyTest
     @Test
     public void testRemovedCodecKeyRejectedByName()
     {
-        // `codec` was removed when chimp128 became the only codec. A stored policy that still sets
+        // `codec` was removed when the chunk format stopped being a per-policy choice. A stored policy that still sets
         // it must fail loudly and name the key -- silently ignoring it would leave an operator
         // believing a codec choice is still in force.
         assertConfigurationException("{\"hot_window\":\"7d\", \"codec\":\"auto\"}", "codec");
         assertConfigurationException("{\"hot_window\":\"7d\", \"codec\":\"gorilla\"}", "no longer supported");
-        assertConfigurationException("{\"hot_window\":\"7d\", \"codec\":\"chimp128\"}", "chimp128 is now the only chunk codec");
+        assertConfigurationException("{\"hot_window\":\"7d\", \"codec\":\"chimp128\"}", "the chunk format is fixed by the build");
     }
 
     @Test
