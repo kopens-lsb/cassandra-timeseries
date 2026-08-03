@@ -17,30 +17,29 @@
  */
 package org.apache.cassandra.db.timeseries;
 
-import java.io.ByteArrayOutputStream;
-import java.nio.BufferUnderflowException;
-import java.nio.ByteBuffer;
 import java.util.Arrays;
 
 /**
- * ALP -- Adaptive Lossless floating-Point (Afroozeh, Kuffo, Boncz, SIGMOD 2024) -- the only double
- * encoding of the columnar chunk format ({@link ColumnarChunkCodec}, type code
- * {@link ColumnarChunkCodec#TYPE_DOUBLE_ALP}). It replaced chimp128, which is retained only as the
- * version-2 single-column format ({@link Chimp128Codec}) and as this codec's size baseline in tests.
+ * ALP -- Adaptive Lossless floating-Point (Afroozeh, Kuffo, Boncz, SIGMOD 2024) -- the planning and
+ * value math behind the chunk format's only double encodings, v4's {@code 0x20 ALP} and
+ * {@code 0x21 ALP_RD} blocks. {@link AlpBlockCodec} owns the v4 byte layout and calls in here for
+ * every decision that two replicas must make identically; this class's own v3 container framing
+ * (sub-format byte, LEB128 varints, gap-coded exceptions, MSB-first bitstream) was deleted with the
+ * rest of the v3 read/write path.
  *
- * <p><b>Two variants, one type code.</b> A section's first byte says which:
+ * <p><b>Two variants.</b>
  * <ul>
- *   <li>{@link #SUBFORMAT_ALP} -- <i>decimal</i> ALP. Most doubles produced by measurement are
- *       decimals of few digits ({@code 20.76}, {@code 157.0}). Each is re-expressed as the integer
+ *   <li><i>Decimal</i> ALP. Most doubles produced by measurement are decimals of few digits
+ *       ({@code 20.76}, {@code 157.0}). Each is re-expressed as the integer
  *       {@code i = round(v * 10^e * 10^-f)}, which decodes back as {@code i * 10^f * 10^-e}; the
  *       integers are frame-of-reference'd against the block minimum and bit-packed at the width the
  *       block needs. Any value that does not survive that round trip <em>bit for bit</em> is an
  *       exception, stored verbatim as its 64-bit pattern next to its row position.</li>
- *   <li>{@link #SUBFORMAT_ALP_RD} -- ALP <i>Real Double</i>, for values that are not decimal-like.
- *       Each 64-bit pattern is cut into a {@code leftBitWidth}-bit high part and a
- *       {@code 64 - leftBitWidth}-bit low part. The high parts of a real column take few distinct
- *       values (same sign, same or adjacent binades), so they are dictionary-coded; the low part is
- *       stored verbatim. Rows whose high part missed the dictionary carry it explicitly.</li>
+ *   <li>ALP <i>Real Double</i>, for values that are not decimal-like. Each 64-bit pattern is cut
+ *       into a {@code leftBitWidth}-bit high part and a {@code 64 - leftBitWidth}-bit low part. The
+ *       high parts of a real column take few distinct values (same sign, same or adjacent binades),
+ *       so they are dictionary-coded; the low part is stored verbatim. Rows whose high part missed
+ *       the dictionary carry it explicitly.</li>
  * </ul>
  *
  * <p><b>Losslessness is structural, not statistical.</b> Neither variant can lose a bit:
@@ -54,19 +53,16 @@ import java.util.Arrays;
  * exists only inside the decimal arithmetic, whose result is checked against the original bits.
  *
  * <p><b>Determinism.</b> Two replicas encoding the same window must produce byte-identical payloads
- * -- {@code TieredStorageService.chunkUnchanged} compares payload bytes -- so every choice this
- * codec makes is a pure function of the input array:
+ * -- {@code TieredStorageService.chunkUnchanged} compares payload bytes -- so every choice made
+ * here is a pure function of the input array:
  * <ul>
  *   <li>The {@code (e, f)} search samples with a <b>fixed integer stride</b> (never an RNG), scores
  *       all {@code 0 <= f <= e <= 18} pairs, and keeps the best {@link #CANDIDATE_LIMIT} under the
  *       strict total order (estimated bits asc, {@code e} asc, {@code f} asc). Those candidates are
- *       then measured exactly over the whole block and ranked by (exact bytes asc, {@code e} asc,
- *       {@code f} asc).</li>
+ *       then measured exactly over the whole block by the caller.</li>
  *   <li>The ALP-RD dictionary is the top {@link #RD_MAX_DICTIONARY} high parts under (frequency
  *       desc, value asc) -- a total order over a histogram held in an <b>array</b>, never a
  *       {@code HashMap} whose iteration order is unspecified.</li>
- *   <li>The variant choice is "ALP-RD iff strictly fewer bytes", so an exact tie always resolves to
- *       decimal ALP. There is no comparison that can go either way.</li>
  *   <li>The only floating-point operations are {@code *} and {@link Math#rint}. Java multiplication
  *       is IEEE-754 correctly rounded and (since Java 17) unconditionally strict -- no x87 extended
  *       precision, and Java never contracts {@code a*b+c} into an FMA -- while {@code Math.rint}'s
@@ -82,22 +78,12 @@ import java.util.Arrays;
  * guarantee true if this arithmetic is ever moved to a class or a baseline where it is not free.
  * The value math -- {@link #tryEncode} and {@link #decodeOne} -- lives here and nowhere else, so
  * this is the class the modifier has to be on.
- *
- * <p>Corruption surfaces as {@link IllegalArgumentException}, matching
- * {@link ColumnarChunkCodec}'s uniform policy: every length and index read out of the payload is
- * bounds-checked before it sizes an allocation, and a body that runs off the end of the section is
- * rewrapped rather than escaping as {@link IndexOutOfBoundsException}.
  */
 // The modifier is redundant from Java 17 and javac says so; §5 rule 8 asks for it anyway, so the
 // note is suppressed rather than the rule dropped. See the class javadoc.
 @SuppressWarnings("strictfp")
 final strictfp class AlpCodec
 {
-    /** Decimal ALP: scaled integers, frame-of-reference'd and bit-packed, plus verbatim exceptions. */
-    static final byte SUBFORMAT_ALP = 0x00;
-    /** ALP-RD: dictionary-coded high bits + verbatim low bits. Lossless for every bit pattern. */
-    static final byte SUBFORMAT_ALP_RD = 0x01;
-
     /**
      * Largest {@code e}/{@code f} considered. 10^18 is the largest power of ten below
      * {@code Long.MAX_VALUE} and the bound the ALP paper uses; 10^e is also exactly representable as
@@ -155,51 +141,6 @@ final strictfp class AlpCodec
     {
     }
 
-    // ---------------------------------------------------------------------------------------
-    // Encoding
-    // ---------------------------------------------------------------------------------------
-
-    /**
-     * Encodes one double column section from raw IEEE-754 bit patterns (not {@code double}s -- see
-     * the class javadoc on why the pipeline never round-trips a pattern through a {@code double}).
-     *
-     * @param rawBits {@code Double.doubleToRawLongBits} of each present value, in row order
-     * @param count   how many entries of {@code rawBits} are in play
-     */
-    static byte[] encode(long[] rawBits, int count)
-    {
-        return choose(rawBits, count).encode(rawBits, count);
-    }
-
-    /**
-     * The variant this codec will use for {@code rawBits}, chosen by a strict total order: ALP-RD
-     * wins only when it is <b>strictly</b> smaller, so an exact tie always goes to decimal ALP.
-     * Both plans carry the exact byte length they will produce, so nothing is encoded twice.
-     */
-    static Plan choose(long[] rawBits, int count)
-    {
-        Plan alp = planAlp(rawBits, count);
-        Plan rd = planRd(rawBits, count);
-        return rd.sizeInBytes < alp.sizeInBytes ? rd : alp;
-    }
-
-    /** One encoding decision for a block, plus the exact size it will occupy. */
-    abstract static class Plan
-    {
-        final int sizeInBytes;
-
-        Plan(int sizeInBytes)
-        {
-            this.sizeInBytes = sizeInBytes;
-        }
-
-        abstract byte subFormat();
-
-        abstract byte[] encode(long[] rawBits, int count);
-    }
-
-    // ---- decimal ALP -----------------------------------------------------------------------
-
     /**
      * The scaled integer representing {@code raw} under {@code (e, f)}, or {@link #NOT_ENCODABLE}
      * when it cannot be represented exactly.
@@ -228,39 +169,19 @@ final strictfp class AlpCodec
         return encoded * POW10[f] * INV_POW10[e];
     }
 
-    static AlpPlan planAlp(long[] rawBits, int count)
-    {
-        // Stage 1: the shared (e, f) search, below.
-        int[] candidateE = new int[CANDIDATE_LIMIT];
-        int[] candidateF = new int[CANDIDATE_LIMIT];
-        int candidates = exponentCandidates(rawBits, count, candidateE, candidateF);
-
-        // Stage 2: measure each surviving candidate exactly over the whole block. Ranked by
-        // (bytes asc, e asc, f asc) -- candidates are already in (score, e, f) order, so a strict
-        // `<` on size keeps the first of any tie, which is the (e, f)-smallest.
-        AlpPlan best = null;
-        for (int c = 0; c < candidates; c++)
-        {
-            AlpPlan plan = measureAlp(rawBits, count, candidateE[c], candidateF[c]);
-            if (best == null || plan.sizeInBytes < best.sizeInBytes)
-                best = plan;
-        }
-        return best;
-    }
-
     /**
      * Stage 1 of the {@code (e, f)} search: score every {@code 0 <= f <= e <= 18} pair on a
      * fixed-stride sample and return the best {@link #CANDIDATE_LIMIT} under the strict total order
      * (estimated bits asc, {@code e} asc, {@code f} asc), written into {@code candidateE}/
      * {@code candidateF} in that order.
      *
-     * <p><b>This is the only implementation of the search, on purpose.</b> Two callers measure its
-     * candidates under two different exact cost functions -- {@link #measureAlp} for the v3 section
-     * layout, {@code AlpBlockCodec} for the v4 block layout -- but the candidate set itself is the
-     * delicate part: it is where the sampling rule, the fixed stride and the tie-break live, and §12
-     * names an unspecified {@code (e, f)} tie-break as a concrete determinism risk. A second copy of
-     * this loop is how two replicas start disagreeing about which exponent pair a block uses, which
-     * is a byte difference, which is every chunk rewritten every cycle.
+     * <p><b>This is the only implementation of the search, on purpose.</b> {@code AlpBlockCodec}
+     * measures these candidates exactly under the v4 block layout's cost function, but the candidate
+     * set itself is the delicate part: it is where the sampling rule, the fixed stride and the
+     * tie-break live, and §12 names an unspecified {@code (e, f)} tie-break as a concrete
+     * determinism risk. A second copy of this loop is how two replicas start disagreeing about
+     * which exponent pair a block uses, which is a byte difference, which is every chunk rewritten
+     * every cycle.
      *
      * @return the number of candidates written, always at least one
      */
@@ -329,168 +250,20 @@ final strictfp class AlpCodec
         return Math.min(size + 1, CANDIDATE_LIMIT);
     }
 
-    /** Exact whole-block cost of encoding under {@code (e, f)}. */
-    private static AlpPlan measureAlp(long[] rawBits, int count, int e, int f)
-    {
-        long minimum = Long.MAX_VALUE;
-        long maximum = Long.MIN_VALUE;
-        int exceptions = 0;
-        int exceptionBytes = 0;
-        int previousPosition = -1;
-        for (int i = 0; i < count; i++)
-        {
-            long encoded = tryEncode(rawBits[i], e, f);
-            if (encoded == NOT_ENCODABLE)
-            {
-                exceptions++;
-                exceptionBytes += varLen(i - previousPosition - 1) + Long.BYTES;
-                previousPosition = i;
-            }
-            else
-            {
-                minimum = Math.min(minimum, encoded);
-                maximum = Math.max(maximum, encoded);
-            }
-        }
-
-        long reference = exceptions == count ? 0L : minimum;
-        int bitWidth = exceptions == count ? 0 : bitWidthOf(maximum - minimum);
-        int size = 4                                                        // subFormat, e, f, bitWidth
-                   + varLen(ColumnarChunkCodec.zigzagEncode(reference))
-                   + varLen(exceptions)
-                   + exceptionBytes
-                   + packedBytes((long) (count - exceptions) * bitWidth);
-        return new AlpPlan(size, e, f, bitWidth, reference, exceptions);
-    }
-
-    static final class AlpPlan extends Plan
-    {
-        final int exponent;
-        final int factor;
-        final int bitWidth;
-        final long reference;
-        final int exceptionCount;
-
-        AlpPlan(int sizeInBytes, int exponent, int factor, int bitWidth, long reference, int exceptionCount)
-        {
-            super(sizeInBytes);
-            this.exponent = exponent;
-            this.factor = factor;
-            this.bitWidth = bitWidth;
-            this.reference = reference;
-            this.exceptionCount = exceptionCount;
-        }
-
-        @Override
-        byte subFormat()
-        {
-            return SUBFORMAT_ALP;
-        }
-
-        @Override
-        byte[] encode(long[] rawBits, int count)
-        {
-            ByteArrayOutputStream head = new ByteArrayOutputStream();
-            head.write(SUBFORMAT_ALP);
-            head.write(exponent);
-            head.write(factor);
-            head.write(bitWidth);
-            ColumnarChunkCodec.writeVarLong(head, ColumnarChunkCodec.zigzagEncode(reference));
-            ColumnarChunkCodec.writeVarLong(head, exceptionCount);
-
-            int previousPosition = -1;
-            for (int i = 0; i < count; i++)
-            {
-                if (tryEncode(rawBits[i], exponent, factor) != NOT_ENCODABLE)
-                    continue;
-                ColumnarChunkCodec.writeVarLong(head, i - previousPosition - 1);
-                writeLongBigEndian(head, rawBits[i]);
-                previousPosition = i;
-            }
-
-            BitWriter body = new BitWriter();
-            if (bitWidth > 0)
-            {
-                for (int i = 0; i < count; i++)
-                {
-                    long encoded = tryEncode(rawBits[i], exponent, factor);
-                    if (encoded != NOT_ENCODABLE)
-                        body.writeBits(encoded - reference, bitWidth);
-                }
-            }
-            return assemble(head, body);
-        }
-    }
-
-    // ---- ALP-RD ----------------------------------------------------------------------------
-
-    static RdPlan planRd(long[] rawBits, int count)
-    {
-        // Scratch shared by every candidate width: the largest left part is 16 bits, and only the
-        // first (1 << leftBits) entries are ever touched for a given width, so one pair of arrays
-        // cleared per width beats sixteen allocations.
-        int[] histogram = new int[1 << RD_MAX_LEFT_BITS];
-        int[] codeOf = new int[1 << RD_MAX_LEFT_BITS];
-
-        RdPlan best = null;
-        // leftBits ascending, and the winner is taken on a strict `<`, so ties go to the narrowest
-        // cut. leftBits >= 1 keeps rightBitWidth <= 63, so the low-part mask never shifts by 64.
-        for (int leftBits = 1; leftBits <= RD_MAX_LEFT_BITS; leftBits++)
-        {
-            RdPlan plan = measureRd(rawBits, count, leftBits, histogram, codeOf);
-            if (best == null || plan.sizeInBytes < best.sizeInBytes)
-                best = plan;
-        }
-        return best;
-    }
-
-    private static RdPlan measureRd(long[] rawBits, int count, int leftBits, int[] histogram, int[] codeOf)
-    {
-        int rightBitWidth = Long.SIZE - leftBits;
-        int slots = 1 << leftBits;
-        Arrays.fill(codeOf, 0, slots, -1);
-
-        int[] dictionary = new int[RD_MAX_DICTIONARY];
-        int dictionarySize = selectRdDictionary(rawBits, count, leftBits, histogram, dictionary);
-        // count >= 1 guarantees at least one non-zero bucket, so dictionarySize >= 1 and codeBits is
-        // well defined (0 when the whole block shares one left part -- then no code is stored at all).
-        for (int code = 0; code < dictionarySize; code++)
-            codeOf[dictionary[code]] = code;
-        int codeBits = codeBitsFor(dictionarySize);
-
-        int exceptions = 0;
-        int exceptionBytes = 0;
-        int previousPosition = -1;
-        for (int i = 0; i < count; i++)
-        {
-            if (codeOf[(int) (rawBits[i] >>> rightBitWidth)] >= 0)
-                continue;
-            exceptions++;
-            exceptionBytes += varLen(i - previousPosition - 1) + Short.BYTES;
-            previousPosition = i;
-        }
-
-        int size = 3                                                    // subFormat, leftBits, dictionarySize
-                   + dictionarySize * Short.BYTES
-                   + varLen(exceptions)
-                   + exceptionBytes
-                   + packedBytes((long) count * (codeBits + rightBitWidth));
-        return new RdPlan(size, leftBits, Arrays.copyOf(dictionary, dictionarySize), exceptions);
-    }
-
     /**
      * The ALP-RD dictionary for one {@code leftBits} cut: the top {@link #RD_MAX_DICTIONARY} left
      * parts under (frequency desc, value asc), written into {@code dictionary} in <b>that</b> order,
-     * i.e. code order, most frequent first.
+     * i.e. most frequent first.
      *
      * <p>Selection scans the histogram array in ascending value order and only displaces an
      * incumbent on a STRICTLY greater frequency, which realises that total order exactly -- and,
      * being an array scan, cannot inherit a hash table's unspecified iteration order (§5 rule 7).
      *
      * <p><b>This is the only implementation of the dictionary, on purpose</b>, for the reason given
-     * on {@link #exponentCandidates}: the v3 section and the v4 block frame these bytes differently
-     * and cost them differently, but they must agree on <em>which</em> left parts are in the
-     * dictionary, or two replicas encoding the same block disagree byte for byte.
+     * on {@link #exponentCandidates}: the v4 block layer frames and costs these bytes itself
+     * ({@code AlpBlockCodec} re-sorts the entries into ascending value order for §5 rule 2), but
+     * <em>which</em> left parts are in the dictionary must be decided in exactly one place, or two
+     * replicas encoding the same block disagree byte for byte.
      *
      * @param histogram scratch of at least {@code 1 << leftBits} entries; zeroed here, not by the
      *                  caller, so a reused buffer cannot leak a previous cut's counts into this one
@@ -534,297 +307,9 @@ final strictfp class AlpCodec
         return dictionarySize <= 1 ? 0 : Integer.SIZE - Integer.numberOfLeadingZeros(dictionarySize - 1);
     }
 
-    static final class RdPlan extends Plan
-    {
-        final int leftBits;
-        final int[] dictionary;
-        final int exceptionCount;
-
-        RdPlan(int sizeInBytes, int leftBits, int[] dictionary, int exceptionCount)
-        {
-            super(sizeInBytes);
-            this.leftBits = leftBits;
-            this.dictionary = dictionary;
-            this.exceptionCount = exceptionCount;
-        }
-
-        @Override
-        byte subFormat()
-        {
-            return SUBFORMAT_ALP_RD;
-        }
-
-        @Override
-        byte[] encode(long[] rawBits, int count)
-        {
-            int rightBitWidth = Long.SIZE - leftBits;
-            long rightMask = (1L << rightBitWidth) - 1;   // rightBitWidth <= 63, so this cannot shift by 64
-            int codeBits = codeBitsFor(dictionary.length);
-
-            ByteArrayOutputStream head = new ByteArrayOutputStream();
-            head.write(SUBFORMAT_ALP_RD);
-            head.write(leftBits);
-            head.write(dictionary.length);
-            for (int entry : dictionary)
-            {
-                head.write((entry >>> 8) & 0xFF);
-                head.write(entry & 0xFF);
-            }
-            ColumnarChunkCodec.writeVarLong(head, exceptionCount);
-
-            int previousPosition = -1;
-            for (int i = 0; i < count; i++)
-            {
-                int left = (int) (rawBits[i] >>> rightBitWidth);
-                if (codeFor(left) >= 0)
-                    continue;
-                ColumnarChunkCodec.writeVarLong(head, i - previousPosition - 1);
-                head.write((left >>> 8) & 0xFF);
-                head.write(left & 0xFF);
-                previousPosition = i;
-            }
-
-            BitWriter body = new BitWriter();
-            for (int i = 0; i < count; i++)
-            {
-                if (codeBits > 0)
-                {
-                    // An exception row still spends its code slot, written as a fixed 0 and ignored
-                    // on read. Uniform stride costs at most 3 bits per exception and keeps both
-                    // loops position-independent -- and a FIXED filler is what makes it deterministic.
-                    int code = codeFor((int) (rawBits[i] >>> rightBitWidth));
-                    body.writeBits(code < 0 ? 0 : code, codeBits);
-                }
-                body.writeBits(rawBits[i] & rightMask, rightBitWidth);
-            }
-            return assemble(head, body);
-        }
-
-        private int codeFor(int left)
-        {
-            for (int code = 0; code < dictionary.length; code++)
-                if (dictionary[code] == left)
-                    return code;
-            return -1;
-        }
-    }
-
-    // ---------------------------------------------------------------------------------------
-    // Decoding
-    // ---------------------------------------------------------------------------------------
-
-    /**
-     * Decodes {@code count} values out of one section, as raw IEEE-754 bit patterns.
-     *
-     * @param section positioned at the section's first byte and limited to its last, exactly as
-     *                {@link ColumnarChunkCodec} slices a column's data section
-     */
-    static long[] decode(ByteBuffer section, int count)
-    {
-        try
-        {
-            byte subFormat = section.get();
-            switch (subFormat)
-            {
-                case SUBFORMAT_ALP:
-                    return decodeAlp(section, count);
-                case SUBFORMAT_ALP_RD:
-                    return decodeRd(section, count);
-                default:
-                    throw new IllegalArgumentException("Corrupt columnar chunk: unknown ALP sub-format " + subFormat);
-            }
-        }
-        catch (IndexOutOfBoundsException | BufferUnderflowException e)
-        {
-            // Every bit-level read goes through BitReader's absolute gets, which report a section
-            // that stops short as an index error. Rewrapped so the read path's single "corruption is
-            // an IllegalArgumentException, skip this chunk" rule covers a truncated body too.
-            throw new IllegalArgumentException("Corrupt columnar chunk: truncated ALP double section", e);
-        }
-    }
-
-    private static long[] decodeAlp(ByteBuffer section, int count)
-    {
-        int exponent = section.get() & 0xFF;
-        int factor = section.get() & 0xFF;
-        int bitWidth = section.get() & 0xFF;
-        if (exponent > MAX_EXPONENT || factor > exponent)
-            throw new IllegalArgumentException("Corrupt columnar chunk: ALP exponent pair (" + exponent + ", " +
-                                               factor + ") outside 0 <= f <= e <= " + MAX_EXPONENT);
-        // MAX_BIT_WIDTH is a property of the format, not of this implementation: a frame of
-        // reference over integers bounded by ENCODED_LIMIT spans at most 2^54.
-        if (bitWidth > MAX_BIT_WIDTH)
-            throw new IllegalArgumentException("Corrupt columnar chunk: ALP bit width " + bitWidth + " exceeds " +
-                                               MAX_BIT_WIDTH);
-        long reference = ColumnarChunkCodec.zigzagDecode(ColumnarChunkCodec.readVarLong(section));
-        if (reference < -ENCODED_LIMIT || reference > ENCODED_LIMIT)
-            throw new IllegalArgumentException("Corrupt columnar chunk: ALP frame of reference " + reference +
-                                               " outside +/-2^53");
-
-        int[] positions = new int[0];
-        long[] values = new long[0];
-        int exceptionCount = readExceptionCount(section, count);
-        if (exceptionCount > 0)
-        {
-            positions = new int[exceptionCount];
-            values = new long[exceptionCount];
-            int previousPosition = -1;
-            for (int k = 0; k < exceptionCount; k++)
-            {
-                previousPosition = readExceptionPosition(section, previousPosition, count);
-                positions[k] = previousPosition;
-                values[k] = readLongBigEndian(section);
-            }
-        }
-
-        long[] out = new long[count];
-        BitReader bits = new BitReader(section);
-        int next = 0;
-        for (int i = 0; i < count; i++)
-        {
-            if (next < exceptionCount && positions[next] == i)
-            {
-                out[i] = values[next++];
-            }
-            else
-            {
-                long encoded = bitWidth == 0 ? reference : reference + bits.readBits(bitWidth);
-                out[i] = Double.doubleToRawLongBits(decodeOne(encoded, exponent, factor));
-            }
-        }
-        return out;
-    }
-
-    private static long[] decodeRd(ByteBuffer section, int count)
-    {
-        int leftBits = section.get() & 0xFF;
-        int dictionarySize = section.get() & 0xFF;
-        if (leftBits < 1 || leftBits > RD_MAX_LEFT_BITS)
-            throw new IllegalArgumentException("Corrupt columnar chunk: ALP-RD left bit width " + leftBits +
-                                               " outside [1, " + RD_MAX_LEFT_BITS + ']');
-        if (dictionarySize < 1 || dictionarySize > RD_MAX_DICTIONARY)
-            throw new IllegalArgumentException("Corrupt columnar chunk: ALP-RD dictionary size " + dictionarySize +
-                                               " outside [1, " + RD_MAX_DICTIONARY + ']');
-        int rightBitWidth = Long.SIZE - leftBits;
-        int codeBits = codeBitsFor(dictionarySize);
-
-        long[] dictionary = new long[dictionarySize];
-        for (int i = 0; i < dictionarySize; i++)
-            dictionary[i] = ((section.get() & 0xFFL) << 8) | (section.get() & 0xFFL);
-
-        int exceptionCount = readExceptionCount(section, count);
-        int[] positions = new int[exceptionCount];
-        long[] lefts = new long[exceptionCount];
-        int previousPosition = -1;
-        for (int k = 0; k < exceptionCount; k++)
-        {
-            previousPosition = readExceptionPosition(section, previousPosition, count);
-            positions[k] = previousPosition;
-            lefts[k] = ((section.get() & 0xFFL) << 8) | (section.get() & 0xFFL);
-        }
-
-        long[] out = new long[count];
-        BitReader bits = new BitReader(section);
-        int next = 0;
-        for (int i = 0; i < count; i++)
-        {
-            long left;
-            if (next < exceptionCount && positions[next] == i)
-            {
-                // The code slot is still present in the stream (the encoder writes a fixed 0 there),
-                // so it must be consumed even though the dictionary is not consulted.
-                if (codeBits > 0)
-                    bits.readBits(codeBits);
-                left = lefts[next++];
-            }
-            else if (codeBits == 0)
-            {
-                left = dictionary[0];
-            }
-            else
-            {
-                int code = (int) bits.readBits(codeBits);
-                // codeBits rounds up to a power of two, so a dictionary of, say, 5 entries leaves
-                // codes 5..7 expressible: a corrupt body could name one, and must not index past.
-                if (code >= dictionarySize)
-                    throw new IllegalArgumentException("Corrupt columnar chunk: ALP-RD code " + code +
-                                                       " >= dictionary size " + dictionarySize);
-                left = dictionary[code];
-            }
-            out[i] = (left << rightBitWidth) | bits.readBits(rightBitWidth);
-        }
-        return out;
-    }
-
-    /**
-     * Reads the exception count and rejects anything a section of {@code count} rows could not
-     * legitimately carry -- before it sizes the position/value arrays, so a corrupt varint is a
-     * clean reject rather than an {@link OutOfMemoryError}.
-     */
-    private static int readExceptionCount(ByteBuffer section, int count)
-    {
-        long exceptionCount = ColumnarChunkCodec.readVarLong(section);
-        if (exceptionCount < 0 || exceptionCount > count)
-            throw new IllegalArgumentException("Corrupt columnar chunk: ALP exception count " + exceptionCount +
-                                               " outside [0, " + count + ']');
-        return (int) exceptionCount;
-    }
-
-    /** Reads one gap-coded exception position, enforcing strict ascent and the row bound. */
-    private static int readExceptionPosition(ByteBuffer section, int previousPosition, int count)
-    {
-        long gap = ColumnarChunkCodec.readVarLong(section);
-        long position = previousPosition + 1 + gap;
-        if (gap < 0 || position >= count)
-            throw new IllegalArgumentException("Corrupt columnar chunk: ALP exception position " + position +
-                                               " outside [0, " + count + ')');
-        return (int) position;
-    }
-
-    // ---------------------------------------------------------------------------------------
-    // Small shared helpers
-    // ---------------------------------------------------------------------------------------
-
-    private static byte[] assemble(ByteArrayOutputStream head, BitWriter body)
-    {
-        byte[] header = head.toByteArray();
-        ByteBuffer out = ByteBuffer.allocate(header.length + body.sizeInBytes());
-        out.put(header);
-        body.writeTo(out);
-        return out.array();
-    }
-
-    private static void writeLongBigEndian(ByteArrayOutputStream out, long value)
-    {
-        for (int shift = Long.SIZE - Byte.SIZE; shift >= 0; shift -= Byte.SIZE)
-            out.write((int) (value >>> shift) & 0xFF);
-    }
-
-    private static long readLongBigEndian(ByteBuffer buffer)
-    {
-        long value = 0;
-        for (int i = 0; i < Long.BYTES; i++)
-            value = (value << 8) | (buffer.get() & 0xFFL);
-        return value;
-    }
-
     /** Bits needed to hold {@code span} as an unsigned value; 0 when the span is 0. */
     static int bitWidthOf(long span)
     {
         return Long.SIZE - Long.numberOfLeadingZeros(span);
-    }
-
-    private static int packedBytes(long bits)
-    {
-        return (int) ((bits + 7) >>> 3);
-    }
-
-    /** Bytes an unsigned LEB128 varint of {@code value} occupies -- see ColumnarChunkCodec.writeVarLong. */
-    private static int varLen(long value)
-    {
-        int length = 1;
-        while ((value >>>= 7) != 0)
-            length++;
-        return length;
     }
 }

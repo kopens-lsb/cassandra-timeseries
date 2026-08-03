@@ -588,9 +588,9 @@ public class TieredStorageServiceTest extends CQLTester
     @Test
     public void oversizedWindowAbortsThatTagOnlyWithError() throws Throwable
     {
-        // Regression for a final-review finding: a window holding more samples than the codec can
-        // encode (ChunkCodecs.MAX_SAMPLES in production; shrunk to 3 here via the maxSamplesPerWindow
-        // seam) must be detected while paging -- never fully materialized -- and abort that tag's walk
+        // Regression for a final-review finding: a window holding more samples than the service will
+        // encode (TieredStorageService.maxSamplesPerWindow in production; shrunk to 3 here via that
+        // same seam) must be detected while paging -- never fully materialized -- and abort that tag's walk
         // with an actionable ERROR, instead of blowing up in encode and re-reading the giant window
         // every cycle forever. Other tags in the same run must still encode.
         createTable("CREATE TABLE %s (tag text, ts timestamp, value double, PRIMARY KEY (tag, ts))");

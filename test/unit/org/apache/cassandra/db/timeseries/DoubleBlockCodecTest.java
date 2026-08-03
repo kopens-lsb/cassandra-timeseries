@@ -38,8 +38,8 @@ import static org.junit.Assert.fail;
  * {@code 0x21 ALP_RD}.
  *
  * <p>The load-bearing test is {@link #everyEdgeCaseBitPatternRoundTripsExactly}, for the reason
- * {@code AlpCodecTest} gives about the v3 container and which v4 inherits: <b>doubles have no
- * fallback codec</b>. If decimal ALP's exception path and ALP-RD do not between them carry every
+ * the retired v3 container's suite ({@code AlpCodecTest}, deleted with the v3 framing it tested)
+ * established and which v4 inherits: <b>doubles have no fallback codec</b>. If decimal ALP's exception path and ALP-RD do not between them carry every
  * 64-bit pattern exactly, a double column is silently corrupted at rest with nothing to catch it.
  * Everything else here -- sizes, framing, the variant choice -- is secondary to that.
  *
@@ -157,7 +157,7 @@ public class DoubleBlockCodecTest
      *
      * <p>The dictionary is written in <b>ascending</b> order, so {@code 0x7FF8} takes code 0 and
      * {@code 0xFFF8} code 1 -- not the frequency order {@link AlpCodec#selectRdDictionary} selects
-     * in, which is what v3 writes. The codes are then {@code 0,1,0,1,0,1,0,1} at one bit, LSB-first,
+     * in, which is what v3 wrote. The codes are then {@code 0,1,0,1,0,1,0,1} at one bit, LSB-first,
      * which is {@code 0xAA}. {@code 8 + 8 + 8 + 48 = 72} bytes.
      */
     private static final String GOLDEN_ALP_RD_DICT2_HEX =
@@ -513,7 +513,7 @@ public class DoubleBlockCodecTest
 
     /**
      * The tie-break <em>inside</em> ALP-RD: two {@code leftBits} cuts that cost exactly the same, in
-     * which case the narrowest wins -- the rule {@link AlpCodec#planRd} applies for v3.
+     * which case the narrowest wins -- the rule v3's {@code AlpCodec.planRd} applied.
      *
      * <p>This one needs constructing rather than finding, and it is worth the trouble because no
      * size or round-trip test can reach it: both cuts decode to the same values and differ only in
@@ -572,8 +572,8 @@ public class DoubleBlockCodecTest
      * ALP's bytes against {@code RAW}'s on the production distributions, printed and bounded.
      *
      * <p>{@code RAW} is the right baseline because it is what the argmin picks for a double block
-     * with no codec installed -- it is the encoding this class replaces, exactly as
-     * {@code AlpCodecTest} measures v3's ALP against the chimp128 it replaced. The bounds have
+     * with no codec installed -- it is the encoding this class replaces, exactly as the retired
+     * {@code AlpCodecTest} measured v3's ALP against the chimp128 it replaced. The bounds have
      * headroom over the measured values on purpose: this test exists so that a regression shows up
      * as a number in the log, not so that an improvement fails the build.
      */
@@ -1007,7 +1007,7 @@ public class DoubleBlockCodecTest
                : nanPayloads(8);
     }
 
-    // -- distributions, shared with AlpCodecTest's vocabulary so the two report the same shapes ----
+    // -- distributions, keeping the retired AlpCodecTest's vocabulary so reports stay comparable --
 
     private static Map<String, long[]> distributions(int n)
     {

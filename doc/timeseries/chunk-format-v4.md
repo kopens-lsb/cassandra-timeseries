@@ -25,6 +25,15 @@
 수치는 전부 **빅엔디안**. 팩된 레인 내부 비트 순서는 **LSB-first**(§6) — v3의 `BitWriter`
 (MSB-first)와 의도적으로 다르며, v4는 그 클래스들을 청크 경로에서 쓰지 않는다.
 
+**v3 구현 삭제 완료.** v4 배선 커밋은 v3 구현을 도달-불가 상태로 남겨 두었고, 후속 정리
+커밋(`feature/v3-cleanup`)이 그 삭제를 마무리해 대체를 완결했다: `ColumnarChunkCodec`의 v3
+인코더/디코더 본체, `BitWriter`/`BitReader`(MSB-first), `TimestampCodec`(DoD),
+`Chimp128Codec`(v2)과 그 `ChunkCodecs` 위임, `AlpCodec`의 v3 컨테이너 프레이밍이 모두 제거됐다.
+남는 것은 버전 바이트 정책뿐이다 — v1/v2/v3는 `ChunkCodecs.unsupportedVersion`이
+`UnsupportedChunkFormatException`으로 거부하는 제거된 포맷이며(§9, §10), `AlpCodec`의 계획
+함수(`exponentCandidates`, `selectRdDictionary`)와 값 산술은 v4의 `AlpBlockCodec`이 호출하므로
+그대로 산다.
+
 ## 1. 목표와 명시적 비목표
 
 목표(우선순위 순): ① 블록 기반 독립 인코딩 ② **가지치기(pruning)에 충분한** 통계 ③ 정렬·SIMD 친화

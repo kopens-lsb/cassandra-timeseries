@@ -590,19 +590,20 @@ public class ColumnarChunkCodecTest
     }
 
     @Test
-    public void foreignVersionPayloadsAreRejectedByBothEntryPoints()
+    public void foreignVersionPayloadsAreRejectedAsUnsupported()
     {
-        ByteBuffer chimpPayload = Chimp128Codec.encode(new long[]{ 1L, 2L, 3L }, new double[]{ 1.0, 2.0, 3.0 }, 3);
-        ByteBuffer gorillaPayload = chimpPayload.duplicate();
-        gorillaPayload.put(gorillaPayload.position(), (byte) 1);   // the removed v1 version byte
+        // Hand-built: the v1 (gorilla) and v2 (chimp128) encoders are deleted, so a bare version
+        // byte plus padding is all a payload in those formats can be here -- which is also the
+        // point: rejection must happen on the version byte alone, before any other byte is read.
+        byte[] bytes = new byte[32];
+        bytes[0] = 2;                                               // chimp128, the removed v2
+        ByteBuffer chimpPayload = ByteBuffer.wrap(bytes.clone());
+        bytes[0] = 1;                                               // gorilla, the removed v1
+        ByteBuffer gorillaPayload = ByteBuffer.wrap(bytes);
 
         assertThatThrownBy(() -> ColumnarChunkCodec.cursor(gorillaPayload, null))
             .isInstanceOf(UnsupportedChunkFormatException.class);
         assertThatThrownBy(() -> ColumnarChunkCodec.cursor(chimpPayload, null))
-            .isInstanceOf(UnsupportedChunkFormatException.class);
-
-        ByteBuffer columnarPayload = simpleTwoColumnPayload();
-        assertThatThrownBy(() -> ChunkCodecs.cursor(columnarPayload))
             .isInstanceOf(UnsupportedChunkFormatException.class);
     }
 
@@ -610,8 +611,7 @@ public class ColumnarChunkCodecTest
      * §10 of the v4 spec, from the entry points the read path actually uses: a well-formed v3
      * payload names a real-but-removed format, so it must propagate as
      * {@link UnsupportedChunkFormatException} -- systematic, never swallowed, never skipped as one
-     * corrupt chunk -- from the cursor, from the header peeks, and from the single-column
-     * dispatcher alike.
+     * corrupt chunk -- from the cursor and from every header peek alike.
      */
     @Test
     public void goldenV3PayloadIsRejectedAsUnsupportedNotCorrupt()
@@ -626,8 +626,6 @@ public class ColumnarChunkCodecTest
         assertThatThrownBy(() -> ColumnarChunkCodec.firstTimestamp(ByteBuffer.wrap(v3)))
             .isInstanceOf(UnsupportedChunkFormatException.class);
         assertThatThrownBy(() -> ColumnarChunkCodec.lastTimestamp(ByteBuffer.wrap(v3)))
-            .isInstanceOf(UnsupportedChunkFormatException.class);
-        assertThatThrownBy(() -> ChunkCodecs.cursor(ByteBuffer.wrap(v3)))
             .isInstanceOf(UnsupportedChunkFormatException.class);
     }
 
