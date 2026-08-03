@@ -410,11 +410,12 @@ public final class BlockPresence
     // -----------------------------------------------------------------------------------------
     //
     // v4 keeps varints only inside block bodies, and only in their canonical minimal-length form.
-    // These deliberately do not reuse ColumnarChunkCodec.readVarLong: that one accepts a
-    // non-minimal encoding, which is harmless in v3 (nothing re-encodes a chunk byte-for-byte) and
-    // fatal here, because a payload that decodes to the same runs but re-encodes to different bytes
-    // makes chunkUnchanged report a difference forever. Package-private so a later phase can lift
-    // them into a shared helper when the directory and dictionary paths need the same rule.
+    // These deliberately did not reuse v3's varint reader (ColumnarChunkCodec.readVarLong, deleted
+    // with the v3 implementation): that one accepted a non-minimal encoding, which was harmless in
+    // v3 (nothing re-encoded a chunk byte-for-byte) and fatal here, because a payload that decodes
+    // to the same runs but re-encodes to different bytes makes chunkUnchanged report a difference
+    // forever. Package-private so a later phase can lift them into a shared helper when the
+    // directory and dictionary paths need the same rule.
 
     /** Bytes the canonical encoding of {@code value} occupies. */
     static int varIntLength(long value)

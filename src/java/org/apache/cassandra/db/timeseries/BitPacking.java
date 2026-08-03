@@ -43,10 +43,11 @@ import java.util.Arrays;
  * code follows them, and the test decodes {@code 0x31} back to {@code [1, 0, 3]} so that a future
  * reader who trusts the doc's literal hits a red test instead of shipping a second bit order.
  *
- * <p>This is deliberately the opposite convention from {@link BitWriter}/{@link BitReader}, which
- * are MSB-first and belong to the version-2/3 chunk paths that v4 replaces outright (§0). The two
- * must never meet: an MSB-first packer and an LSB-first unpacker agree exactly at width 8 and
- * silently disagree at every other width, which is the shape of bug that survives a smoke test.
+ * <p>This is deliberately the opposite convention from {@code BitWriter}/{@code BitReader}, the
+ * MSB-first pair that belonged to the version-2/3 chunk paths v4 replaced outright (§0; both
+ * classes were deleted with those formats). The two conventions must never meet: an MSB-first
+ * packer and an LSB-first unpacker agree exactly at width 8 and silently disagree at every other
+ * width, which is the shape of bug that survives a smoke test.
  *
  * <p><b>No tail case.</b> The lane holds {@code ceil(count*width/64)} words, so the highest bit any
  * value touches is {@code count*width - 1}, which is inside the last word by construction. The

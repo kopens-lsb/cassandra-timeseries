@@ -40,7 +40,6 @@ import org.apache.cassandra.db.marshal.TimestampType;
 import org.apache.cassandra.db.marshal.UTF8Type;
 import org.apache.cassandra.db.rows.Cell;
 import org.apache.cassandra.db.rows.Row;
-import org.apache.cassandra.db.timeseries.Chimp128Codec;
 import org.apache.cassandra.db.timeseries.ChunkV4Codec;
 import org.apache.cassandra.db.timeseries.ChunkV4Directory;
 import org.apache.cassandra.db.timeseries.ColumnarChunkCodec;
@@ -319,7 +318,7 @@ public class ChunkReadSupportTest
     public void anUnsupportedFormatPropagatesFromTheCall()
     {
         ByteBuffer payload = chunk(10, 1000).duplicate();
-        payload.put(0, Chimp128Codec.VERSION);        // a known chunk format, but not this decoder's
+        payload.put(0, (byte) 2);        // chimp128's version byte: a known-but-removed chunk format
 
         for (boolean descending : new boolean[]{ false, true })
             assertFailsFromTheCall(payload, descending, UnsupportedChunkFormatException.class);

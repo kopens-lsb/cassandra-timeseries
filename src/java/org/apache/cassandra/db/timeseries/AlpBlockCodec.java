@@ -60,7 +60,7 @@ import java.util.Arrays;
  * of its five framing choices are things v4 removed on purpose:
  *
  * <ul>
- * <li>Its bitstream is {@link BitWriter}, which is <b>MSB-first</b>. §6 makes v4 lanes LSB-first and
+ * <li>Its bitstream was {@code BitWriter} (deleted with v3), which was <b>MSB-first</b>. §6 makes v4 lanes LSB-first and
  *     {@link BitPacking}'s javadoc states that the two conventions must never meet -- they agree at
  *     width 8 and silently disagree everywhere else.</li>
  * <li>Its exception list is a private gap-coded varint list. §5 gives v4 one exception mechanism,
@@ -93,7 +93,7 @@ import java.util.Arrays;
  *
  * <p><b>The variant choice is not made here.</b> {@link BlockEncodings#chooseFixed} scores
  * {@code 0x20} then {@code 0x21} and displaces the incumbent only on a strictly smaller size, so an
- * exact tie goes to {@code 0x20 ALP} -- the same rule {@link AlpCodec#choose} applies for v3, arrived
+ * exact tie goes to {@code 0x20 ALP} -- the same rule v3's {@code AlpCodec.choose} applied, arrived
  * at by the same lowest-code-wins argmin every other v4 encoding is chosen by.
  *
  * <h2>Two details that look like waste and are not</h2>
@@ -368,7 +368,7 @@ public final strictfp class AlpBlockCodec implements BlockEncodings.DoubleBlockC
     /**
      * The {@code leftBits} cut this block will use, and the bytes it costs. Widths ascend and the
      * incumbent is displaced only on a strictly smaller size, so a tie goes to the narrowest cut --
-     * the same rule {@link AlpCodec#planRd} applies, for the same determinism reason.
+     * the same rule v3's {@code AlpCodec.planRd} applied, for the same determinism reason.
      *
      * <p>{@code leftBits >= 1} keeps the right lane at most 63 bits wide, so its mask never shifts by
      * 64; {@code leftBits <= 16} keeps a left part inside the two bytes

@@ -17,45 +17,36 @@
  */
 package org.apache.cassandra.db.timeseries;
 
-import java.nio.ByteBuffer;
-import java.nio.ByteOrder;
-
 /**
- * Version-checking entry point over the single-column chunk format: peeks the version byte at
- * {@code payload.position()} and routes to {@link Chimp128Codec} (version 2), the only
- * single-column codec. This is the sole entry point the chunk store is meant to consume for that
- * format -- callers should not invoke {@code Chimp128Codec} directly. Unrecognised version bytes
- * throw {@link IllegalArgumentException}, matching the per-codec behaviour these methods delegate
- * to; version 1 (the removed gorilla codec) is just another unrecognised version.
+ * The one place that decides which chunk version bytes name a real format and which name nothing:
+ * {@link #unsupportedVersion} builds the rejection for every version byte the live decoders will
+ * not read, and the columnar codecs ({@link ColumnarChunkCodec}, {@link ChunkV4Codec}) all route
+ * through it so the classification cannot drift between entry points.
  * <p>
- * <b>Nothing in the tiering path uses the single-column format any more</b>: the re-encoder writes
- * and transparent reads decode the columnar format (version 4, {@link ChunkV4Codec} behind
- * {@link ColumnarChunkCodec}'s entry points) exclusively, so the methods below have no production
- * callers left and survive only as the still-tested library the removed path was built on.
- * {@link #unsupportedVersion} is the exception -- the columnar codecs share it so that "which
- * version bytes are a format vs. corruption" is decided in one place.
- * <p>
- * The columnar many-columns-per-chunk format ({@link ColumnarChunkCodec}, version 4) is a different
- * shape entirely -- many named columns instead of one {@link SampleCursor}-style value stream -- so
- * it is out of scope for the methods here, which assume a single value per timestamp. {@link #cursor}
- * rejects it with a clear error pointing at {@link ColumnarChunkCodec#cursor} instead.
- * <p>
- * Payloads must span exactly one chunk (position..limit); corruption surfaces as
- * {@link IllegalArgumentException}, {@link IndexOutOfBoundsException} or
- * {@link java.nio.BufferUnderflowException} — callers must treat all three as a corrupt chunk.
- * Buffers are read big-endian and never mutated.
+ * This class used to be the version-dispatching entry point over the single-column chunk formats
+ * (gorilla v1, then chimp128 v2). Those codecs are gone -- the columnar format (version 4,
+ * {@link ChunkV4Codec} behind {@link ColumnarChunkCodec}'s entry points) is the only one written
+ * and read -- but their version bytes are never reassigned and must keep being recognised
+ * <em>as formats</em>: a payload carrying one is a real chunk this build cannot decode, which is
+ * systematic and must propagate ({@link UnsupportedChunkFormatException}), not be skipped as one
+ * corrupt chunk.
  */
 public final class ChunkCodecs
 {
-    public static final int HEADER_SIZE = 21;
-    public static final int MAX_SAMPLES = Chimp128Codec.MAX_SAMPLES;
-
     /**
      * Version byte 1 was the gorilla single-column format, removed when chimp128 became the only
      * chunk codec. Never reassigned: it is recognised here purely so a chunk written by that build
      * is reported as an unreadable format rather than as random corruption.
      */
     static final byte GORILLA_VERSION_REMOVED = 1;
+
+    /**
+     * Version byte 2 was the chimp128 single-column format, the last codec this class dispatched
+     * to. Its encoder and decoder were deleted together with the v3 columnar implementation (no
+     * production deployment ever wrote a single-column chunk -- tiering was never enabled), but the
+     * byte still names a known format and is never reassigned.
+     */
+    static final byte CHIMP128_V2_VERSION_REMOVED = 2;
 
     /**
      * Version byte 3 was the delta-of-delta/RLE columnar format, replaced outright by the
@@ -70,40 +61,6 @@ public final class ChunkCodecs
 
     private ChunkCodecs()
     {
-    }
-
-    public static ByteBuffer encode(long[] timestamps, double[] values, int count)
-    {
-        return Chimp128Codec.encode(timestamps, values, count);
-    }
-
-    public static SampleCursor cursor(ByteBuffer payload)
-    {
-        switch (versionByte(payload))
-        {
-            case Chimp128Codec.VERSION:
-                return Chimp128Codec.cursor(payload);
-            case ColumnarChunkCodec.VERSION:
-                throw new UnsupportedChunkFormatException("ChunkCodecs.cursor() does not support columnar (v4) " +
-                                                          "payloads -- use ColumnarChunkCodec.cursor() instead");
-            default:
-                throw unsupportedVersion(versionByte(payload), "chunk codec");
-        }
-    }
-
-    public static int sampleCount(ByteBuffer payload)
-    {
-        return Chimp128Codec.sampleCount(payload);
-    }
-
-    public static long firstTimestamp(ByteBuffer payload)
-    {
-        return Chimp128Codec.firstTimestamp(payload);
-    }
-
-    public static long lastTimestamp(ByteBuffer payload)
-    {
-        return Chimp128Codec.lastTimestamp(payload);
     }
 
     /**
@@ -129,19 +86,11 @@ public final class ChunkCodecs
                 "Unsupported " + what + " version: 3 -- version 3 was the columnar chunk format replaced outright " +
                 "by the block-based v4 layout, and no v3 read path was kept (tiering was never enabled in " +
                 "production, so no v3 chunk should exist); chunks written by a v3 build cannot be read by this one");
-        if (version == Chimp128Codec.VERSION || version == ColumnarChunkCodec.VERSION)
+        if (version == CHIMP128_V2_VERSION_REMOVED || version == ColumnarChunkCodec.VERSION)
             return new UnsupportedChunkFormatException(
                 "Unsupported " + what + " version: " + version + " -- that is a known chunk format, but not one " +
                 "this decoder reads");
         return new IllegalArgumentException("Unsupported " + what + " version: " + version +
                                             " -- names no known chunk format (treated as a corrupt payload)");
-    }
-
-    /** Byte-order-independent peek at the version byte, matching each codec's own header peeks. */
-    private static byte versionByte(ByteBuffer payload)
-    {
-        ByteBuffer buffer = payload.duplicate();
-        buffer.order(ByteOrder.BIG_ENDIAN);
-        return buffer.get(buffer.position());
     }
 }
