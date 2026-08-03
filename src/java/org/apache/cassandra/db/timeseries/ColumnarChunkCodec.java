@@ -33,6 +33,8 @@ import java.util.SortedMap;
 import java.util.TreeMap;
 import java.util.TreeSet;
 
+import org.apache.cassandra.utils.ByteArrayUtil;
+
 /**
  * Chunk codec version 3: a columnar format storing many named columns per chunk against one
  * shared timestamp axis, instead of the one-column-per-chunk layout of {@link Chimp128Codec}
@@ -63,12 +65,14 @@ import java.util.TreeSet;
  * not used -- a read-only heap buffer reports {@code hasArray() == false}, which sends Cassandra's
  * {@code FastByteOperations} down its direct-buffer branch and segfaults the JVM on the first
  * comparison). A caller must therefore treat every returned buffer as immutable, because within one
- * cursor <b>backing arrays are shared</b>: a constant column returns duplicates over a single array,
+ * cursor <b>backing arrays are shared</b>: a constant column returns buffers over a single array,
  * and a dictionary-encoded text/opaque column returns one array per distinct value shared by every
  * row that uses it. Sharing rather than copying is the point of those two encodings -- a constant
  * column over 10k rows would otherwise allocate 10k identical arrays, which is exactly the cost the
  * O(1) encoding exists to avoid -- and it is safe because cursors are per-decode and Cassandra never
- * mutates a cell value. (Fixed-width columns happen to allocate per row; do not rely on that.)
+ * mutates a cell value. (Fixed-width columns happen to serialize afresh on every access; do not rely
+ * on that.) The same contract governs {@link ArrayValueCursor#getByteArray}, which is the same value
+ * without the wrapper.
  */
 public final class ColumnarChunkCodec
 {
@@ -77,7 +81,7 @@ public final class ColumnarChunkCodec
 
     /**
      * Hard per-chunk row limit. The format itself would take any positive {@code int}, but a chunk
-     * is decoded whole (every projected column materialises one {@code ByteBuffer[rowCount]}), so an
+     * is decoded whole (every projected column materialises one row-indexed primitive array), so an
      * unbounded row count is an unbounded allocation on the read path. Callers that assemble chunks
      * from live data (the tiering re-encoder) pre-check against this while still paging, so an
      * over-dense window is reported as a configuration problem instead of failing here.
@@ -575,7 +579,7 @@ public final class ColumnarChunkCodec
                 effective.add(meta.name);
         Set<String> columnsView = Collections.unmodifiableSet(effective);
 
-        Map<String, ByteBuffer[]> decoded = new HashMap<>();
+        Map<String, DecodedColumn> decoded = new HashMap<>();
         for (int ci = 0; ci < columnCount; ci++)
         {
             ColumnMeta meta = metas.get(ci);
@@ -638,29 +642,39 @@ public final class ColumnarChunkCodec
         return (int) len;
     }
 
-    private static ByteBuffer[] decodeColumn(ByteBuffer buffer, int offset, ColumnMeta meta, int rowCount)
+    /**
+     * Decodes one column into the primitive form its codec already produces -- {@code double[]},
+     * {@code long[]}, {@code boolean[]}, {@code byte[][]} -- instead of boxing every present value
+     * into a {@code ByteBuffer[rowCount]}.
+     * <p>
+     * The boxing this replaced was the dominant cost of the cold read path: a heap {@link ByteBuffer}
+     * (~48 B) per present value, retained for the whole life of the cursor on top of the value's own
+     * bytes, and then a {@code duplicate()} (another ~48 B) per access in
+     * {@link ColumnarCursorImpl#getBytes}. Materialising a value only when a row asks for it costs
+     * one array element per row here and, for the constant and dictionary encodings, nothing at all
+     * -- storing a value once is the entire point of those two encodings, and boxing per row undid it.
+     * <p>
+     * Arrays are indexed by ROW, not by present-index: a partially-present column scatters its
+     * compactly decoded values into a {@code rowCount}-sized array so a lookup stays a single index
+     * with no second level of indirection. The slack that leaves on absent rows (&lt;= 8 B) is less
+     * than the 4-byte reference the old {@code ByteBuffer[rowCount]} spent on those same rows once
+     * the ~72 B every present row cost on top of it is counted.
+     */
+    private static DecodedColumn decodeColumn(ByteBuffer buffer, int offset, ColumnMeta meta, int rowCount)
     {
-        ByteBuffer[] rowValues = new ByteBuffer[rowCount];
         boolean allPresent = (meta.flags & FLAG_ALL_PRESENT) != 0;
         boolean allNull = (meta.flags & FLAG_ALL_NULL) != 0;
         boolean constant = (meta.flags & FLAG_CONSTANT) != 0;
+        // null means "every row present": the bitmap is only written for columns that are neither
+        // all-present nor all-null (see buildCursor), so this is the same test as `allPresent ||
+        // meta.presence[r]` was, hoisted out of the per-row loops.
+        boolean[] presence = allPresent ? null : meta.presence;
 
         if (allNull)
-            return rowValues;
+            return DecodedColumn.allNull();
 
         if (constant)
-        {
-            // NOT asReadOnlyBuffer(): a read-only HEAP buffer reports hasArray() == false and
-            // isDirect() == false, so Cassandra's FastByteOperations takes its direct-buffer branch
-            // and dereferences the (zero) `address` field -- a JVM-level SIGSEGV the moment anything
-            // compares a decoded value, which ordinary cell reconciliation does. The backing arrays
-            // are private to this decoder and no caller mutates them.
-            ByteBuffer constValue = ByteBuffer.wrap(meta.constBytes);
-            for (int r = 0; r < rowCount; r++)
-                if (allPresent || meta.presence[r])
-                    rowValues[r] = constValue.duplicate();
-            return rowValues;
-        }
+            return DecodedColumn.constant(meta.constBytes, presence);
 
         ByteBuffer section = buffer.duplicate();
         section.position(offset);
@@ -670,72 +684,76 @@ public final class ColumnarChunkCodec
         switch (meta.typeCode)
         {
             case TYPE_DOUBLE_CHIMP:
-            {
-                double[] values = decodeDoubleSection(section, presentCount);
-                int p = 0;
-                for (int r = 0; r < rowCount; r++)
-                    if (allPresent || meta.presence[r])
-                    {
-                        ByteBuffer value = ByteBuffer.allocate(8).order(ByteOrder.BIG_ENDIAN);
-                        value.putDouble(values[p++]);
-                        rowValues[r] = value.flip();
-                    }
-                break;
-            }
+                return DecodedColumn.doubles(scatter(decodeDoubleSection(section, presentCount), presence, rowCount),
+                                             presence);
             case TYPE_BOOLEAN:
-            {
-                boolean[] values = decodeBooleanSection(section, presentCount);
-                int p = 0;
-                for (int r = 0; r < rowCount; r++)
-                    if (allPresent || meta.presence[r])
-                    {
-                        ByteBuffer value = ByteBuffer.allocate(1);
-                        value.put((byte) (values[p++] ? 1 : 0));
-                        rowValues[r] = value.flip();
-                    }
-                break;
-            }
+                return DecodedColumn.booleans(scatter(decodeBooleanSection(section, presentCount), presence, rowCount),
+                                              presence);
             case TYPE_INT32:
-            {
-                long[] values = decodeIntSection(section, presentCount, 4);
-                int p = 0;
-                for (int r = 0; r < rowCount; r++)
-                    if (allPresent || meta.presence[r])
-                    {
-                        ByteBuffer value = ByteBuffer.allocate(4).order(ByteOrder.BIG_ENDIAN);
-                        value.putInt((int) values[p++]);
-                        rowValues[r] = value.flip();
-                    }
-                break;
-            }
+                return DecodedColumn.int32s(scatter(decodeIntSection(section, presentCount, 4), presence, rowCount),
+                                            presence);
             case TYPE_INT64:
-            {
-                long[] values = decodeIntSection(section, presentCount, 8);
-                int p = 0;
-                for (int r = 0; r < rowCount; r++)
-                    if (allPresent || meta.presence[r])
-                    {
-                        ByteBuffer value = ByteBuffer.allocate(8).order(ByteOrder.BIG_ENDIAN);
-                        value.putLong(values[p++]);
-                        rowValues[r] = value.flip();
-                    }
-                break;
-            }
+                return DecodedColumn.int64s(scatter(decodeIntSection(section, presentCount, 8), presence, rowCount),
+                                            presence);
             case TYPE_TEXT:
             case TYPE_OPAQUE:
-            {
-                byte[][] values = decodeDictOrRaw(section, presentCount);
-                int p = 0;
-                for (int r = 0; r < rowCount; r++)
-                    if (allPresent || meta.presence[r])
-                        rowValues[r] = ByteBuffer.wrap(values[p++]);   // writable: see the constant path above
-                break;
-            }
+                return DecodedColumn.blobs(scatter(decodeDictOrRaw(section, presentCount), presence, rowCount),
+                                           presence);
             default:
                 throw new IllegalArgumentException("Corrupt columnar chunk: unknown type code " +
                                                    meta.typeCode + " for column " + meta.name);
         }
-        return rowValues;
+    }
+
+    // Present-index -> row-index expansion. An all-present column is already row-indexed and is
+    // returned untouched, which is the common case and the one worth keeping allocation-free.
+
+    private static double[] scatter(double[] compact, boolean[] presence, int rowCount)
+    {
+        if (presence == null)
+            return compact;
+        double[] out = new double[rowCount];
+        int p = 0;
+        for (int r = 0; r < rowCount; r++)
+            if (presence[r])
+                out[r] = compact[p++];
+        return out;
+    }
+
+    private static long[] scatter(long[] compact, boolean[] presence, int rowCount)
+    {
+        if (presence == null)
+            return compact;
+        long[] out = new long[rowCount];
+        int p = 0;
+        for (int r = 0; r < rowCount; r++)
+            if (presence[r])
+                out[r] = compact[p++];
+        return out;
+    }
+
+    private static boolean[] scatter(boolean[] compact, boolean[] presence, int rowCount)
+    {
+        if (presence == null)
+            return compact;
+        boolean[] out = new boolean[rowCount];
+        int p = 0;
+        for (int r = 0; r < rowCount; r++)
+            if (presence[r])
+                out[r] = compact[p++];
+        return out;
+    }
+
+    private static byte[][] scatter(byte[][] compact, boolean[] presence, int rowCount)
+    {
+        if (presence == null)
+            return compact;
+        byte[][] out = new byte[rowCount][];
+        int p = 0;
+        for (int r = 0; r < rowCount; r++)
+            if (presence[r])
+                out[r] = compact[p++];
+        return out;
     }
 
     private static int countPresent(boolean[] presence)
@@ -960,15 +978,148 @@ public final class ColumnarChunkCodec
         }
     }
 
-    private static final class ColumnarCursorImpl implements ColumnarCursor
+    /**
+     * One column decoded but not yet materialised: the codec's own primitive array plus the per-row
+     * presence mask ({@code null} == every row present). A value becomes bytes only when a row asks
+     * for it -- see {@link ColumnarChunkCodec#decodeColumn} for why that is the whole point.
+     * <p>
+     * Which kinds share their {@code byte[]} and which allocate per access is <b>exactly</b> what it
+     * was when this held boxed buffers, so the sharing scope the class javadoc's buffer contract
+     * promises ("within one cursor") is unchanged: {@link #KIND_CONSTANT} hands back the single
+     * directory array, {@link #KIND_BYTES} hands back the (possibly dictionary-shared) decoded array,
+     * and the fixed-width kinds serialize afresh on every access.
+     */
+    private static final class DecodedColumn
+    {
+        private static final int KIND_ALL_NULL = 0;
+        private static final int KIND_CONSTANT = 1;
+        private static final int KIND_DOUBLE = 2;
+        private static final int KIND_BOOLEAN = 3;
+        private static final int KIND_INT32 = 4;
+        private static final int KIND_INT64 = 5;
+        private static final int KIND_BYTES = 6;
+
+        private static final DecodedColumn ALL_NULL = new DecodedColumn(KIND_ALL_NULL, null, null, null, null, null, null);
+
+        private final int kind;
+        private final boolean[] presence;
+        private final byte[] constant;
+        private final double[] doubles;
+        private final long[] longs;
+        private final boolean[] booleans;
+        private final byte[][] blobs;
+
+        private DecodedColumn(int kind, boolean[] presence, byte[] constant,
+                              double[] doubles, long[] longs, boolean[] booleans, byte[][] blobs)
+        {
+            this.kind = kind;
+            this.presence = presence;
+            this.constant = constant;
+            this.doubles = doubles;
+            this.longs = longs;
+            this.booleans = booleans;
+            this.blobs = blobs;
+        }
+
+        static DecodedColumn allNull()
+        {
+            return ALL_NULL;
+        }
+
+        static DecodedColumn constant(byte[] value, boolean[] presence)
+        {
+            return new DecodedColumn(KIND_CONSTANT, presence, value, null, null, null, null);
+        }
+
+        static DecodedColumn doubles(double[] values, boolean[] presence)
+        {
+            return new DecodedColumn(KIND_DOUBLE, presence, null, values, null, null, null);
+        }
+
+        static DecodedColumn booleans(boolean[] values, boolean[] presence)
+        {
+            return new DecodedColumn(KIND_BOOLEAN, presence, null, null, null, values, null);
+        }
+
+        static DecodedColumn int32s(long[] values, boolean[] presence)
+        {
+            return new DecodedColumn(KIND_INT32, presence, null, null, values, null, null);
+        }
+
+        static DecodedColumn int64s(long[] values, boolean[] presence)
+        {
+            return new DecodedColumn(KIND_INT64, presence, null, null, values, null, null);
+        }
+
+        static DecodedColumn blobs(byte[][] values, boolean[] presence)
+        {
+            return new DecodedColumn(KIND_BYTES, presence, null, null, null, null, values);
+        }
+
+        boolean isPresent(int row)
+        {
+            return kind != KIND_ALL_NULL && (presence == null || presence[row]);
+        }
+
+        /**
+         * The row's serialized value, or {@code null} when the row has none. Byte-for-byte what the
+         * eager boxing produced: {@link ByteArrayUtil} writes big-endian, which is the order the old
+         * {@code ByteBuffer.allocate(n).order(BIG_ENDIAN).putX()} wrote in.
+         */
+        byte[] valueAt(int row)
+        {
+            if (!isPresent(row))
+                return null;
+            switch (kind)
+            {
+                case KIND_CONSTANT: return constant;
+                case KIND_BYTES:    return blobs[row];
+                case KIND_DOUBLE:   return ByteArrayUtil.bytes(doubles[row]);
+                case KIND_BOOLEAN:  return new byte[]{ (byte) (booleans[row] ? 1 : 0) };
+                case KIND_INT32:    return ByteArrayUtil.bytes((int) longs[row]);
+                case KIND_INT64:    return ByteArrayUtil.bytes(longs[row]);
+                // unreachable: readColumnMeta rejects every type code outside TYPE_DOUBLE_CHIMP..
+                // TYPE_OPAQUE before a section is ever decoded, and decodeColumn covers all of them
+                default: throw new IllegalArgumentException("Corrupt columnar chunk: unknown column kind " + kind);
+            }
+        }
+    }
+
+    /**
+     * Zero-copy escape hatch for readers that build {@code byte[]}-backed cells: the value
+     * {@link ColumnarCursor#getBytes} would wrap, handed over bare.
+     * <p>
+     * Deliberately <b>not</b> folded into {@link ColumnarCursor}. That interface's contract is the
+     * {@link ByteBuffer} one documented on this class, and its other callers -- the re-encoders in
+     * {@code TieredStorageService} and {@code ColdWindowChunkFlush} -- feed what they read straight
+     * back into {@link ColumnarChunkCodec#encode}, which takes {@code ByteBuffer}s; wrapping is not
+     * waste for them.
+     * A reader that would only unwrap the buffer again (the transparent-read path in
+     * {@code ChunkReadSupport}, which assembles {@code ArrayCell}s) tests for this interface instead,
+     * so the fast path stays optional and any cursor that does not offer it still works.
+     * <p>
+     * The array carries the same immutability contract as the buffers, and for a constant or a
+     * dictionary-encoded column it <em>is</em> the shared backing array rather than a copy.
+     */
+    public interface ArrayValueCursor
+    {
+        /**
+         * The current row's serialized value for column {@code name}, or {@code null} if the column
+         * is absent (unknown to this cursor, or outside the projection) or null on this row. Same
+         * precondition as {@link ColumnarCursor#getBytes}: {@link ColumnarCursor#advance} first.
+         */
+        byte[] getByteArray(String name);
+    }
+
+    private static final class ColumnarCursorImpl implements ColumnarCursor, ArrayValueCursor
     {
         private final int rowCount;
         private final long[] timestamps;
         private final Set<String> columns;
-        private final Map<String, ByteBuffer[]> decoded;
+        private final Map<String, DecodedColumn> decoded;
         private int row = -1;
 
-        ColumnarCursorImpl(int rowCount, long[] timestamps, Set<String> columns, Map<String, ByteBuffer[]> decoded)
+        ColumnarCursorImpl(int rowCount, long[] timestamps, Set<String> columns, Map<String, DecodedColumn> decoded)
         {
             this.rowCount = rowCount;
             this.timestamps = timestamps;
@@ -1004,19 +1155,29 @@ public final class ColumnarChunkCodec
         {
             if (row < 0)
                 throw new IllegalStateException("advance() not called");
-            ByteBuffer[] values = decoded.get(name);
-            return values == null || values[row] == null;
+            DecodedColumn column = decoded.get(name);
+            return column == null || !column.isPresent(row);
+        }
+
+        @Override
+        public byte[] getByteArray(String name)
+        {
+            if (row < 0)
+                throw new IllegalStateException("advance() not called");
+            DecodedColumn column = decoded.get(name);
+            return column == null ? null : column.valueAt(row);
         }
 
         @Override
         public ByteBuffer getBytes(String name)
         {
-            if (row < 0)
-                throw new IllegalStateException("advance() not called");
-            ByteBuffer[] values = decoded.get(name);
-            if (values == null || values[row] == null)
-                return null;
-            return values[row].duplicate();
+            byte[] value = getByteArray(name);
+            // wrap(), NOT asReadOnlyBuffer(): a read-only HEAP buffer reports hasArray() == false and
+            // isDirect() == false, so Cassandra's FastByteOperations takes its direct-buffer branch
+            // and dereferences the (zero) `address` field -- a JVM-level SIGSEGV the moment anything
+            // compares a decoded value, which ordinary cell reconciliation does. See the buffer
+            // contract in the class javadoc; callers must treat the result as immutable.
+            return value == null ? null : ByteBuffer.wrap(value);
         }
 
         @Override

@@ -112,11 +112,12 @@ import org.apache.cassandra.utils.memory.MemtableAllocator;
  * the concurrent overflow map and then supersedes the slot the same way. Consolidation and growth
  * replace the arrays wholesale instead of mutating them, so a reader that captured the array
  * references and the row count under the lock (see {@link #captureWalk()}) walks a frozen prefix
- * that no later write can tear. Reads therefore <b>retain nothing</b>: there is no snapshot and no
- * cache of any kind; the streaming iterator ({@link TimeSeriesStreamingIterator}) assembles one row
- * per pull and leaves nothing behind when it closes, and the full rebuild
- * ({@link #buildSnapshot()}) — the fail-open fallback and the flush view — builds, is consumed, and
- * is discarded.
+ * that no later write can tear. Reads and flushes therefore <b>retain nothing</b>: there is no
+ * snapshot and no cache of any kind; the streaming iterator ({@link TimeSeriesStreamingIterator})
+ * assembles one row per pull and leaves nothing behind when it closes — which is how the hot read
+ * path and the flush view ({@link #flushView()}) both read the arrays — and the full rebuild
+ * ({@link #buildSnapshot()}), kept as the fail-open fallback and for the shapes streaming does not
+ * serve, builds, is consumed, and is discarded.
  *
  * <p><b>The degradation valve.</b> Superseded slots are dead weight until flush. A pathologically
  * re-written partition would grow its arrays without bound, so when more than half of a partition's
@@ -868,9 +869,16 @@ public final class TimeSeriesColumnarPartition implements TimeSeriesMemtable.Sha
     }
 
     /**
-     * The full rebuild: every live slot plus the overflow, merged in comparator order. The read
-     * path's fail-open fallback and the flush view — built on demand, consumed, discarded; never
-     * retained anywhere. Caller must hold the lock.
+     * The full rebuild: every live slot plus the overflow, merged in comparator order. The fail-open
+     * fallback of both streaming paths (read and flush) and the answer for the shapes streaming does
+     * not serve — built on demand, consumed, discarded; never retained anywhere. Caller must hold
+     * the lock.
+     *
+     * <p>The {@code EncodingStats} collection below is a second walk of every row just built. It is
+     * what a rebuilt {@code Partition} owes its callers, and it is also why the flush path no longer
+     * comes through here: the sstable writer takes its {@code SerializationHeader} from the
+     * memtable-level {@code flushSet.encodingStats()} and {@code SortedTableWriter.append} never
+     * asks the partition or the iterator for stats, so on a flush this pass bought nothing.
      */
     private Snapshot buildSnapshot()
     {
@@ -917,10 +925,10 @@ public final class TimeSeriesColumnarPartition implements TimeSeriesMemtable.Sha
     }
 
     /**
-     * A freshly built, immediately discarded object view for the read paths the streaming iterator
-     * does not serve (point {@code getRow}, names filters, the no-argument iterator) and for the
-     * streaming path's fail-open fallback. When the partition is demoted, the frozen columnar state
-     * and the object-tier sibling are presented as one merged partition.
+     * A freshly built, immediately discarded object view for the paths the streaming iterator does
+     * not serve (point {@code getRow}, names filters, the read path's no-argument iterator) and for
+     * the fail-open fallback of every streaming path, flush included. When the partition is demoted,
+     * the frozen columnar state and the object-tier sibling are presented as one merged partition.
      */
     private Partition readView()
     {
@@ -938,10 +946,27 @@ public final class TimeSeriesColumnarPartition implements TimeSeriesMemtable.Sha
     @Override
     public Partition flushView()
     {
-        // Deliberately built afresh and never retained: the flush set walks every partition, and
-        // pinning each one's materialized object form until the memtable is discarded would recreate
-        // at flush time the very heap footprint the arrays exist to avoid.
-        return readView();
+        // Flush streams off the arrays; it no longer rebuilds them. It is the one caller that reads
+        // every row of every partition exactly once, in order, and then drops it, so the rebuild was
+        // all cost and no reuse: a BTreeRow and a cell per row — ~4.9 GiB allocated and ~19s of CPU
+        // to flush 2.9M rows — plus buildSnapshot's second whole-tree pass to collect EncodingStats
+        // that nothing on this path reads (the writer's SerializationHeader comes from the
+        // memtable-level flushSet.encodingStats(), and SortedTableWriter.append never calls stats()
+        // on the partition or the iterator).
+        //
+        // Nothing is retained, still — the invariant of f70a0a0610 ("Remove the snapshot retention
+        // that OOMed production"), and satisfied a fortiori: the view below caches nothing at all,
+        // and each iterator captures its walk at open and leaves nothing behind at close.
+        //
+        // The guards mirror streamOrRebuild's, and for the same reasons: a demoted partition keeps
+        // the exact merged rebuild it has always had (its rows are split between the frozen arrays
+        // and the object-tier sibling, which only MergedWindowPartition presents as one), and so
+        // does a clustering-less table. Everything else the streaming open cannot reason about is
+        // caught later, by the fail-open inside streamOrRebuild: a flush must never fail because of
+        // an optimisation.
+        if (demotedTo != null || metadata.get().comparator.size() == 0)
+            return readView();
+        return new StreamingFlushView();
     }
 
     // ------------------------------------------------------------------- Partition implementation
@@ -1521,6 +1546,107 @@ public final class TimeSeriesColumnarPartition implements TimeSeriesMemtable.Sha
         @Override
         public void onAllocatedOnHeap(long delta)
         {
+        }
+    }
+
+    /**
+     * The streamed view, handed to the flush path by {@link TimeSeriesColumnarPartition#flushView()}.
+     * Every row-bearing call goes through {@link TimeSeriesColumnarPartition#streamOrRebuild}, so the
+     * arrays are walked and one row assembled per row actually written out, instead of the whole
+     * partition being rebuilt into objects first and walked afterwards. It holds no row state of its
+     * own — the walk is captured per iterator, at open, and dropped at close — so the flush path's
+     * "never retain a materialization" rule is kept by construction rather than by discipline.
+     *
+     * <p><b>Why this and not the outer partition itself.</b> The outer {@code Partition} overrides
+     * are the read path's: they put iterators, rows and the partition key through
+     * {@code allocator.ensureOnHeap()}. Flush never did — it consumed {@link Snapshot} directly,
+     * whose key and rows are the memtable's own buffers — so copying here would change what the
+     * sstable writer is handed and add back a slice of the very allocation this class exists to
+     * remove. Each method below therefore reproduces what {@code Snapshot} answered, not what the
+     * read path answers.
+     *
+     * <p>The shapes streaming does not serve ({@code getRow}, a names filter) fall through to the
+     * rebuild, unwrapped, for the same reason.
+     */
+    private final class StreamingFlushView implements Partition
+    {
+        @Override
+        public TableMetadata metadata()
+        {
+            return TimeSeriesColumnarPartition.this.metadata();
+        }
+
+        @Override
+        public DecoratedKey partitionKey()
+        {
+            // The memtable's own key object, exactly as Snapshot handed it to the writer: see the
+            // note above on ensureOnHeap.
+            return key;
+        }
+
+        @Override
+        public DeletionTime partitionLevelDeletion()
+        {
+            return TimeSeriesColumnarPartition.this.partitionLevelDeletion();
+        }
+
+        @Override
+        public RegularAndStaticColumns columns()
+        {
+            return TimeSeriesColumnarPartition.this.columns();
+        }
+
+        @Override
+        public EncodingStats stats()
+        {
+            // The maintained cumulative stats, not the exact per-row collection the rebuild made:
+            // collecting exactly costs a walk of every row, and no one on the flush path reads this
+            // (see buildSnapshot). It is the same value the streaming read path already publishes on
+            // every iterator it opens.
+            return TimeSeriesColumnarPartition.this.stats();
+        }
+
+        @Override
+        public boolean isEmpty()
+        {
+            return TimeSeriesColumnarPartition.this.isEmpty();
+        }
+
+        @Override
+        public boolean hasRows()
+        {
+            return TimeSeriesColumnarPartition.this.hasRows();
+        }
+
+        @Override
+        public Row getRow(Clustering<?> clustering)
+        {
+            return readView().getRow(clustering);
+        }
+
+        @Override
+        public UnfilteredRowIterator unfilteredIterator()
+        {
+            // ColumnFilter.all(columns()) — the RegularAndStaticColumns overload, Slices.ALL,
+            // forward: the exact arguments AbstractBTreePartition.unfilteredIterator() passes, so
+            // the iterator's columns() and the unfiltereds it yields are what the rebuild yielded.
+            // This is the call the flush path makes (Flushing.writeSortedContents, and the tiering
+            // hook's ColdWindowChunkFlush.encodePartition).
+            return streamOrRebuild(ColumnFilter.all(columns()), Slices.ALL, false);
+        }
+
+        @Override
+        public UnfilteredRowIterator unfilteredIterator(ColumnFilter selection, Slices slices, boolean reversed)
+        {
+            return streamOrRebuild(selection, slices, reversed);
+        }
+
+        @Override
+        public UnfilteredRowIterator unfilteredIterator(ColumnFilter selection,
+                                                        NavigableSet<Clustering<?>> clusteringsInQueryOrder,
+                                                        boolean reversed)
+        {
+            return readView().unfilteredIterator(selection, clusteringsInQueryOrder, reversed);
         }
     }
 

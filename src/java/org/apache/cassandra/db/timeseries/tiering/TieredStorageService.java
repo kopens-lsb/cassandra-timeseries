@@ -23,6 +23,7 @@ import java.util.Arrays;
 import java.util.Collection;
 import java.util.Collections;
 import java.util.HashSet;
+import java.util.Iterator;
 import java.util.LinkedHashSet;
 import java.util.List;
 import java.util.Map;
@@ -70,6 +71,7 @@ import org.apache.cassandra.service.pager.PagingState;
 import org.apache.cassandra.transport.Dispatcher;
 import org.apache.cassandra.transport.ProtocolVersion;
 import org.apache.cassandra.transport.messages.ResultMessage;
+import org.apache.cassandra.utils.AbstractIterator;
 import org.apache.cassandra.utils.Clock;
 import org.apache.cassandra.utils.JVMStabilityInspector;
 import org.apache.cassandra.utils.MBeanWrapper;
@@ -1127,6 +1129,51 @@ public class TieredStorageService implements TieredStorageServiceMBean
     static List<UntypedResultSet.Row> pagedSelect(String query, ConsistencyLevel cl, List<ByteBuffer> values)
     {
         return pagedSelect(query, cl, values, Integer.MAX_VALUE);
+    }
+
+    /**
+     * As {@link #pagedSelect(String, ConsistencyLevel, List)}, but yields rows as it pages instead of
+     * collecting them: the next page is fetched only when the current one is exhausted, so a consumer
+     * that stops early never pays for the rest of the scan. This is the read-path counterpart of the
+     * eager version — see {@code ChunkRowSource.windows}, where materializing every window before the
+     * first payload read was the whole cost of an unbounded {@code LIMIT 1}.
+     *
+     * <p>Exceptions surface from {@code hasNext()}/{@code next()} at the page boundary that failed,
+     * not from this call; the caller wraps them.
+     */
+    static Iterator<UntypedResultSet.Row> pagedSelectLazy(String query, ConsistencyLevel cl, List<ByteBuffer> values)
+    {
+        QueryState queryState = QueryState.forInternalCalls();
+        return new AbstractIterator<UntypedResultSet.Row>()
+        {
+            private PagingState pagingState = null;
+            private boolean exhausted = false;
+            private Iterator<UntypedResultSet.Row> page = Collections.emptyIterator();
+
+            @Override
+            protected UntypedResultSet.Row computeNext()
+            {
+                while (!page.hasNext())
+                {
+                    if (exhausted)
+                        return endOfData();
+
+                    QueryOptions options = QueryOptions.create(cl, values, false, PAGE_SIZE, pagingState, null,
+                                                               ProtocolVersion.CURRENT, null);
+                    CQLStatement statement = QueryProcessor.instance.parse(query, queryState, options);
+                    ResultMessage result = QueryProcessor.instance.process(statement, queryState, options,
+                                                                           Dispatcher.RequestTime.forImmediateExecution());
+                    if (!(result instanceof ResultMessage.Rows))
+                        return endOfData();
+
+                    ResultSet resultSet = ((ResultMessage.Rows) result).result;
+                    page = UntypedResultSet.create(resultSet).iterator();
+                    pagingState = resultSet.metadata.getPagingState();
+                    exhausted = pagingState == null;
+                }
+                return page.next();
+            }
+        };
     }
 
     /**

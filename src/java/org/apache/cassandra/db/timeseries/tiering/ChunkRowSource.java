@@ -110,6 +110,15 @@ final class ChunkRowSource
     @VisibleForTesting
     static final AtomicLong payloadReads = new AtomicLong();
 
+    /**
+     * Window rows pulled from the chunk table's window listing. The companion of
+     * {@link #payloadReads} for the step before it: a read can decode one payload and still have
+     * enumerated every window in the partition to find it, which is invisible in the results and
+     * was the real cost of an unbounded newest-first {@code LIMIT}.
+     */
+    @VisibleForTesting
+    static final AtomicLong windowRowsListed = new AtomicLong();
+
     private final TableMetadata metadata;
     /** {@code SELECT window_start, max_row_writetime ...} -- deliberately no payload column. */
     private final String windowSelect;
@@ -158,8 +167,14 @@ final class ChunkRowSource
             tagPredicate.append(column.name.toCQLString()).append(" = ?");
         }
         String ref = chunkRef(metadata);
-        this.windowSelect = format("SELECT window_start, max_row_writetime FROM %s " +
-                                   "WHERE %s AND window_start >= ? AND window_start < ?", ref, tagPredicate);
+        // Newest-first queries push the ordering into the chunk table instead of listing every
+        // window and reversing in memory: window_start is the clustering column and the whole
+        // partition key is restricted, so ORDER BY ... DESC is a plain reversed single-partition
+        // read. Combined with the lazy window iterator below, an unbounded `LIMIT n` now touches
+        // one page of window rows rather than every window the tag has ever had.
+        String select = format("SELECT window_start, max_row_writetime FROM %s " +
+                               "WHERE %s AND window_start >= ? AND window_start < ?", ref, tagPredicate);
+        this.windowSelect = descending ? select + " ORDER BY window_start DESC" : select;
         this.payloadSelect = format("SELECT payload FROM %s WHERE %s AND window_start = ?", ref, tagPredicate);
         this.lookbackMs = lookbackMs;
         this.startMs = startMs;
@@ -179,16 +194,18 @@ final class ChunkRowSource
     CloseableIterator<Row> rowsFor(DecoratedKey key)
     {
         List<ByteBuffer> tagValues = tagValues(key);
-        List<Window> windows = windows(tagValues);
-        if (windows.isEmpty())
-            return CloseableIterator.empty();
-        if (descending)
-            Collections.reverse(windows);                 // the window list arrives ascending
-        return new ChunkRows(tagValues, windows);
+        return new ChunkRows(tagValues, windows(tagValues));
     }
 
-    /** The windows whose data can reach into this query's range, in ascending {@code window_start} order. */
-    private List<Window> windows(List<ByteBuffer> tagValues)
+    /**
+     * The windows whose data can reach into this query's range, in emission order — ascending
+     * {@code window_start}, or descending when the query emits newest-first.
+     *
+     * <p>Lazy: the rows are pulled a page at a time as the consumer walks them, so a query that
+     * stops early never pays for the windows past the one that satisfied it. Listing them all was
+     * the dominant cost of an unbounded {@code LIMIT 1} on a tag with years of history.
+     */
+    private Iterator<Window> windows(List<ByteBuffer> tagValues)
     {
         // A chunk of width W starting at S holds timestamps in [S, S+W), so it can reach into the
         // range iff S > startMs - W. Unbounded slice ends arrive as Long.MIN/MAX_VALUE - clamp to
@@ -203,23 +220,44 @@ final class ChunkRowSource
         values.add(TimestampType.instance.decompose(new Date(windowLow)));
         values.add(TimestampType.instance.decompose(new Date(windowHigh)));
 
-        List<Window> windows = new ArrayList<>();
+        Iterator<UntypedResultSet.Row> rows;
         try
         {
-            // Paged on both branches: a partition holding years of hourly windows has tens of
-            // thousands of them, and while each row is tiny, one unpaged page of them is not.
-            Iterable<UntypedResultSet.Row> rows =
-                cl == null ? QueryProcessor.executeInternalWithPaging(windowSelect, TieredStorageService.PAGE_SIZE,
-                                                                      values.toArray())
-                           : TieredStorageService.pagedSelect(windowSelect, cl, values);
-            for (UntypedResultSet.Row row : rows)
-                windows.add(new Window(row.getBytes("window_start"), row.getLong("max_row_writetime")));
+            // Paged AND lazily consumed on both branches: a partition holding years of hourly
+            // windows has tens of thousands of them, and while each row is tiny, materializing all
+            // of them before the first payload is read is what made `LIMIT 1` cost a full scan.
+            rows = cl == null
+                   ? QueryProcessor.executeInternalWithPaging(windowSelect, TieredStorageService.PAGE_SIZE,
+                                                              values.toArray()).iterator()
+                   : TieredStorageService.pagedSelectLazy(windowSelect, cl, values);
         }
         catch (RuntimeException e)
         {
             throw chunkReadFailed(e);
         }
-        return windows;
+
+        // The failure contract is per-page, not per-call: paging means a later page can throw long
+        // after this method returned, and that must surface as the same chunk-read failure rather
+        // than as a raw driver exception from inside the row iterator.
+        return new AbstractIterator<Window>()
+        {
+            @Override
+            protected Window computeNext()
+            {
+                try
+                {
+                    if (!rows.hasNext())
+                        return endOfData();
+                    UntypedResultSet.Row row = rows.next();
+                    windowRowsListed.incrementAndGet();
+                    return new Window(row.getBytes("window_start"), row.getLong("max_row_writetime"));
+                }
+                catch (RuntimeException e)
+                {
+                    throw chunkReadFailed(e);
+                }
+            }
+        };
     }
 
     /**
@@ -308,12 +346,11 @@ final class ChunkRowSource
     private final class ChunkRows extends AbstractIterator<Row>
     {
         private final List<ByteBuffer> tagValues;
-        private final List<Window> windows;
-        private int nextWindow;
+        private final Iterator<Window> windows;
         private Iterator<Row> current = Collections.emptyIterator();
         private boolean closed;
 
-        ChunkRows(List<ByteBuffer> tagValues, List<Window> windows)
+        ChunkRows(List<ByteBuffer> tagValues, Iterator<Window> windows)
         {
             this.tagValues = tagValues;
             this.windows = windows;
@@ -330,9 +367,11 @@ final class ChunkRowSource
                     if (selects(row))
                         return row;
                 }
-                if (closed || nextWindow >= windows.size())
+                // hasNext() on the window iterator is what fetches the next page of the window
+                // listing, so a consumer that stopped early never triggers it.
+                if (closed || !windows.hasNext())
                     return endOfData();
-                current = decode(windows.get(nextWindow++));
+                current = decode(windows.next());
             }
         }
 

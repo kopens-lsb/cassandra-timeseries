@@ -21,23 +21,28 @@ package org.apache.cassandra.db.timeseries.tiering;
 import java.nio.ByteBuffer;
 import java.util.ArrayList;
 import java.util.Collections;
-import java.util.Date;
 import java.util.Iterator;
 import java.util.List;
 import java.util.Set;
+import java.util.TreeMap;
 
 import org.apache.cassandra.db.Clustering;
 import org.apache.cassandra.db.LivenessInfo;
 import org.apache.cassandra.db.marshal.TimestampType;
+import org.apache.cassandra.db.rows.ArrayCell;
 import org.apache.cassandra.db.rows.BTreeRow;
 import org.apache.cassandra.db.rows.BufferCell;
+import org.apache.cassandra.db.rows.Cell;
 import org.apache.cassandra.db.rows.Row;
 import org.apache.cassandra.db.timeseries.ColumnarChunkCodec;
 import org.apache.cassandra.db.timeseries.ColumnarCursor;
 import org.apache.cassandra.schema.ColumnMetadata;
 import org.apache.cassandra.schema.TableMetadata;
 import org.apache.cassandra.utils.AbstractIterator;
+import org.apache.cassandra.utils.BulkIterator;
 import org.apache.cassandra.utils.ByteBufferUtil;
+import org.apache.cassandra.utils.btree.BTree;
+import org.apache.cassandra.utils.btree.UpdateFunction;
 
 /**
  * SP3 transparent reads: decodes a chunk payload into synthetic CQL rows for coordinator-side
@@ -160,20 +165,7 @@ public final class ChunkReadSupport
         // overflow -- a corrupt chunk could carry Long.MAX_VALUE.
         long cellTimestamp = maxRowWritetime == Long.MAX_VALUE ? Long.MAX_VALUE : maxRowWritetime + 1;
 
-        // Resolve the chunk's column names against the table once, not per row.
-        List<String> names = new ArrayList<>(cursor.columns().size());
-        List<ColumnMetadata> columns = new ArrayList<>(cursor.columns().size());
-        for (String name : cursor.columns())
-        {
-            ColumnMetadata column = metadata.getColumn(ByteBufferUtil.bytes(name));
-            // Dropped since the chunk was written (or, defensively, no longer a regular column):
-            // there is nowhere to put its cells, so leave it out rather than failing the read.
-            if (column != null && column.isRegular())
-            {
-                names.add(name);
-                columns.add(column);
-            }
-        }
+        RowAssembler assembler = new RowAssembler(cursor, metadata, cellTimestamp);
 
         if (descending)
         {
@@ -182,7 +174,7 @@ public final class ChunkReadSupport
             // what this method always did, kept bit-for-bit for the order it applies to.
             List<Row> rows = new ArrayList<>();
             Row row;
-            while ((row = nextRow(cursor, startMsInclusive, endMsExclusive, names, columns, cellTimestamp)) != null)
+            while ((row = assembler.next(startMsInclusive, endMsExclusive)) != null)
                 rows.add(row);
             Collections.reverse(rows);
             return rows.iterator();
@@ -193,47 +185,121 @@ public final class ChunkReadSupport
             @Override
             protected Row computeNext()
             {
-                Row row = nextRow(cursor, startMsInclusive, endMsExclusive, names, columns, cellTimestamp);
+                Row row = assembler.next(startMsInclusive, endMsExclusive);
                 return row == null ? endOfData() : row;
             }
         };
     }
 
     /**
-     * Advances {@code cursor} to the next sample inside {@code [startMsInclusive, endMsExclusive)}
-     * and builds its row.
-     *
-     * @return that row, or {@code null} once the chunk is exhausted
+     * Turns cursor positions into rows. Holds everything that can be resolved once per read rather
+     * than once per row: the chunk's columns matched against the table, the order they have to be
+     * emitted in, and the scratch the per-row build writes through.
+     * <p>
+     * Single-threaded by construction -- one instance serves one
+     * {@link ChunkReadSupport#rowsFromChunk} call, and the cursor it wraps is forward-only, so the
+     * iterator handed back has exactly one consumer.
      */
-    private static Row nextRow(ColumnarCursor cursor,
-                               long startMsInclusive,
-                               long endMsExclusive,
-                               List<String> names,
-                               List<ColumnMetadata> columns,
-                               long cellTimestamp)
+    private static final class RowAssembler
     {
-        while (cursor.advance())
-        {
-            long ts = cursor.timestamp();
-            if (ts < startMsInclusive || ts >= endMsExclusive)
-                continue;
+        private final ColumnarCursor cursor;
+        /**
+         * The same cursor's {@code byte[]} view, or {@code null} if it does not offer one. Optional
+         * on purpose: the fast path is a representation choice, not a contract change, so a cursor
+         * implementation without it still reads correctly through {@link ColumnarCursor#getBytes}.
+         */
+        private final ColumnarChunkCodec.ArrayValueCursor arrays;
+        /** Chunk column names, and the table columns they resolve to, in BTree (ColumnData) order. */
+        private final String[] names;
+        private final ColumnMetadata[] columns;
+        private final long cellTimestamp;
+        /**
+         * The cells of the row being built. Reused across rows: {@code BTree.build} bulk-COPIES its
+         * input into the nodes it allocates, so nothing downstream can observe this array.
+         */
+        private final Object[] scratch;
+        /**
+         * False if any resolved column is complex, which forces the general builder. A chunk cannot
+         * legally carry one -- {@link TieringPolicy#unsupportedSchemaError} refuses to tier a table
+         * with multi-cell columns, and frozen collections are simple -- but a column DROPped and
+         * re-ADDed as a collection under the same name would land here, and the general builder is
+         * the only path that wraps such a cell in {@code ComplexColumnData} the way it always did.
+         */
+        private final boolean allSimple;
 
-            Clustering<?> clustering = Clustering.make(TimestampType.instance.decompose(new Date(ts)));
-            // unsorted, not sorted: the chunk's directory is ordered by Java String comparison while
-            // a row's columns are ordered by UTF-8 byte comparison of their names, and the two differ
-            // for non-ASCII names.
-            Row.Builder builder = BTreeRow.unsortedBuilder();
-            builder.newRow(clustering);
-            boolean anyCell = false;
-            for (int i = 0; i < columns.size(); i++)
+        RowAssembler(ColumnarCursor cursor, TableMetadata metadata, long cellTimestamp)
+        {
+            this.cursor = cursor;
+            this.arrays = cursor instanceof ColumnarChunkCodec.ArrayValueCursor
+                          ? (ColumnarChunkCodec.ArrayValueCursor) cursor
+                          : null;
+            this.cellTimestamp = cellTimestamp;
+
+            // Resolve the chunk's column names against the table once, not per row, and keep them in
+            // ColumnMetadata order -- which is the order a row's BTree wants (ColumnData.comparator
+            // is just ColumnMetadata.compareTo). The chunk's own directory cannot supply that order:
+            // it is sorted by Java String comparison while columns compare by UTF-8 name bytes, and
+            // the two differ for non-ASCII names. Sorting here once is what lets the per-row build
+            // skip BTreeRow.unsortedBuilder's sort-and-resolve entirely.
+            TreeMap<ColumnMetadata, String> byColumn = new TreeMap<>();
+            for (String name : cursor.columns())
             {
-                ByteBuffer value = cursor.getBytes(names.get(i));
-                if (value == null)
-                    continue;                             // null cell: stays null, no cell emitted
-                builder.addCell(BufferCell.live(columns.get(i), cellTimestamp, value));
-                anyCell = true;
+                ColumnMetadata column = metadata.getColumn(ByteBufferUtil.bytes(name));
+                // Dropped since the chunk was written (or, defensively, no longer a regular column):
+                // there is nowhere to put its cells, so leave it out rather than failing the read.
+                if (column != null && column.isRegular())
+                    byColumn.put(column, name);
             }
-            if (!anyCell)
+            this.columns = byColumn.keySet().toArray(new ColumnMetadata[0]);
+            this.names = byColumn.values().toArray(new String[0]);
+            this.scratch = new Object[this.columns.length];
+
+            boolean simple = true;
+            for (ColumnMetadata column : this.columns)
+                simple &= column.isSimple();
+            this.allSimple = simple;
+        }
+
+        /**
+         * Advances the cursor to the next sample inside {@code [startMsInclusive, endMsExclusive)}
+         * and builds its row.
+         *
+         * @return that row, or {@code null} once the chunk is exhausted
+         */
+        Row next(long startMsInclusive, long endMsExclusive)
+        {
+            while (cursor.advance())
+            {
+                long ts = cursor.timestamp();
+                if (ts < startMsInclusive || ts >= endMsExclusive)
+                    continue;
+
+                // fromTimeInMillis is decompose(new Date(ts)) with the Date left out: a timestamp's
+                // serialized form IS the 8-byte epoch-millis long, so the bytes are the same ones.
+                Clustering<?> clustering = Clustering.make(TimestampType.instance.fromTimeInMillis(ts));
+                return allSimple ? buildRow(clustering) : buildViaBuilder(clustering);
+            }
+            return null;
+        }
+
+        /**
+         * Assembles the BTree directly. Legal only because every input is fixed by construction:
+         * cells arrive in BTree order (see the constructor), one per column so no two can collide,
+         * all simple, and all with the same live {@code (cellTimestamp, NO_TTL, NO_DELETION_TIME)} --
+         * which is what makes {@code minDeletionTime} an O(1) constant instead of an accumulate over
+         * the tree. A chunk carries values only; it has no way to express a TTL or a tombstone.
+         */
+        private Row buildRow(Clustering<?> clustering)
+        {
+            int n = 0;
+            for (int i = 0; i < columns.length; i++)
+            {
+                Cell<?> cell = cellFor(i);
+                if (cell != null)
+                    scratch[n++] = cell;                  // null value: stays null, no cell emitted
+            }
+
+            if (n == 0)
             {
                 // Every DECODED column null on this sample. The row still EXISTS - the re-encoder
                 // chunked it precisely so its existence would not be lost to the range delete - and a
@@ -245,10 +311,60 @@ public final class ChunkReadSupport
                 // column so it can tell "row exists, queried column is null" from "no row"; a
                 // projected read cannot, so it reaches this branch instead and reconstructs the same
                 // distinction from liveness. See the class javadoc for why that is equivalent.
-                builder.addPrimaryKeyLivenessInfo(LivenessInfo.create(cellTimestamp));
+                return BTreeRow.noCellLiveRow(clustering, LivenessInfo.create(cellTimestamp));
             }
+
+            Object[] tree;
+            if (n == 1)
+            {
+                tree = BTree.singleton(scratch[0]);
+            }
+            else
+            {
+                // The BulkIterator is pooled and must be closed, or its thread-local slot leaks.
+                try (BulkIterator<Object> bulk = BulkIterator.of(scratch, 0))
+                {
+                    tree = BTree.build(bulk, n, UpdateFunction.noOp());
+                }
+            }
+            return BTreeRow.create(clustering, LivenessInfo.EMPTY, Row.Deletion.LIVE, tree, Cell.MAX_DELETION_TIME);
+        }
+
+        /** The pre-existing path, kept verbatim for the complex-column case {@link #allSimple} guards. */
+        private Row buildViaBuilder(Clustering<?> clustering)
+        {
+            Row.Builder builder = BTreeRow.unsortedBuilder();
+            builder.newRow(clustering);
+            boolean anyCell = false;
+            for (int i = 0; i < columns.length; i++)
+            {
+                Cell<?> cell = cellFor(i);
+                if (cell == null)
+                    continue;
+                builder.addCell(cell);
+                anyCell = true;
+            }
+            if (!anyCell)
+                builder.addPrimaryKeyLivenessInfo(LivenessInfo.create(cellTimestamp));
             return builder.build();
         }
-        return null;
+
+        /**
+         * The current row's cell for column {@code i}, or {@code null} when the sample has no value
+         * there. {@link ArrayCell} over the decoder's {@code byte[]} rather than {@link BufferCell}
+         * over a {@link ByteBuffer}: the value is the same bytes either way, and the buffer was pure
+         * wrapper overhead on a path that only ever reads the value back out through a
+         * {@code ValueAccessor}.
+         */
+        private Cell<?> cellFor(int i)
+        {
+            if (arrays != null)
+            {
+                byte[] value = arrays.getByteArray(names[i]);
+                return value == null ? null : ArrayCell.live(columns[i], cellTimestamp, value, null);
+            }
+            ByteBuffer value = cursor.getBytes(names[i]);
+            return value == null ? null : BufferCell.live(columns[i], cellTimestamp, value);
+        }
     }
 }

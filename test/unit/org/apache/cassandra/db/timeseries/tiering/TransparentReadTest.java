@@ -515,6 +515,42 @@ public class TransparentReadTest extends CQLTester
         assertEquals(6, payloadReadsFor("SELECT value FROM %s WHERE tag = 't1'"));
     }
 
+    /** Runs {@code query} and reports how many window rows the read had to list to answer it. */
+    private long windowRowsListedFor(String query, Object... values) throws Throwable
+    {
+        long before = ChunkRowSource.windowRowsListed.get();
+        execute(query, values);
+        return ChunkRowSource.windowRowsListed.get() - before;
+    }
+
+    /**
+     * The step before the payload read. Decoding one payload is not enough: the window listing that
+     * chooses it used to be materialized whole — every window the tag ever had — and, for a
+     * newest-first query, reversed in memory afterwards. On a tag with years of hourly windows that
+     * listing alone dominated the query, and like the payload count it is invisible in the results,
+     * so only a counter can hold the line.
+     * <p>
+     * The descending case is the one that needs the ORDER BY pushdown: without it the newest window
+     * is the LAST row of the listing, so finding it means reading all of them no matter how lazy the
+     * consumption is.
+     */
+    @Test
+    public void unboundedLimitedReadListsOnlyTheWindowsItNeeds() throws Throwable
+    {
+        loadSixWindowsAndReencode();
+
+        assertEquals("an ascending LIMIT 2 must stop listing after the window that satisfied it",
+                     1, windowRowsListedFor("SELECT value FROM %s WHERE tag = 't1' LIMIT 2"));
+
+        assertEquals("a newest-first LIMIT 2 must get its window first from the chunk table, " +
+                     "not by listing every window and reversing",
+                     1, windowRowsListedFor("SELECT value FROM %s WHERE tag = 't1' ORDER BY ts DESC LIMIT 2"));
+
+        // The control: a query that wants everything still lists every window, so the counts above
+        // are early termination and not a listing that silently stopped finding chunks.
+        assertEquals(6, windowRowsListedFor("SELECT value FROM %s WHERE tag = 't1'"));
+    }
+
     /**
      * ...and the rows are the same rows. Early termination is only correct if it terminates after
      * emitting exactly what the eager version emitted, in the same order, in both directions.

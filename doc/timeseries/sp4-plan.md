@@ -141,6 +141,37 @@ DataResolver.resolveInternal(:303-343)이 Row-형태 전제라 최난관. CL=ONE
 5. 기타 명세 확보분: C4(ArrayClustering), 이중 스킵리스트 탐색 제거, dataSize 융합(2d),
    per-shard 통계, O(1) flush 사이징.
 
+## TSCS 컴팩션 (2026-08-03 분석 + 사용자 제안)
+
+분석으로 확인된 것 — 잘 되어 있는 부분: O(n²) 없음, `getEstimatedRemainingTasks`는 O(1)
+volatile 읽기(재선정 안 함), 만료는 파일 통째 폐기, 동결된 SSTable을 UCS에서 제외하는 설계가
+10년 테이블에서 결정적으로 옳음.
+
+**S난이도 (독립·선행 가능):**
+1. `windows()`가 라운드마다 3회 재구축(+완료 시 1회) — 한 번 만들어 넘기고 동결/split 스캔을
+   한 루프로 융합. 3,651창 테이블 기준 라운드당 TreeMap 3개·HashSet 1.1만 개 절약.
+2. 진행 중 동결에 compacting 필터 없음 → 같은 창 매 라운드 재선정, split-refreeze가 그동안
+   차단, 경고 로그 매 라운드 스팸. UCS의 `getCompactableSSTables` 필터를 미러링 +
+   `freezeAttempted`를 `tryModify` 성공 후로 이동 + NoSpamLogger.
+3. 재동결 임계값: 닫힌 창에 SSTable 2개면 무조건 전체 재작성(1MB 지각 flush → 120MB 재작성).
+   최소 배치/지각바이트 비율/쿨다운 옵션. 리스크: 지각 데이터 병합 지연 → 티어링 리스너 타이밍.
+
+**L난이도 — 근본 수정: 창당 UCS 델리게이트 (사용자 제안, 채택 방향):**
+현재 `syncDelegate`는 활성 창 ~3개를 하나의 평평한 집합으로 UCS에 넘기고, UCS는 창을 모른 채
+토큰 겹침으로 판단해 창 경계를 넘어 병합한다 → 동결이 또 병합 → split-refreeze가 도로 쪼갬
+(같은 바이트 3회 재작성). **UCS 코드를 고치지 말고 창마다 UCS 인스턴스를 두면** 창을 넘는
+병합이 물리적으로 불가능해지고, 출력이 자동으로 창 정렬되며, 동결이 싸진다. 서로 다른 시간
+창의 토큰 겹침은 이 데이터 모델에서 *거짓 겹침*이라는 것이 근거.
+검증 필요: 창당 후보 감소로 활성 창 읽기 증폭이 오르는가(운영 창 ~120MB), 델리게이트
+생명주기(창 은퇴)를 CompactionStrategyManager가 어떻게 보는가, 재시작 시 레벨 상태 재구성 비용.
+설계 에이전트 → 리뷰 → 구현 순서로, S난이도 3건과 독립 진행.
+
+**운영 튜닝 주의:** `freeze_after`를 줄이면 UCS의 창 경계 노출이 줄지만(72h→30h ≈ 2.4×,
+6-12×가 아님), `gc_grace_seconds < freeze_after` 규칙에 걸린다 — 현재 gc_grace 1d이므로
+freeze_after 6h는 gc_grace를 3h 이하로 함께 내려야 하고 그건 `max_hint_window=3h`와 충돌.
+현실적 첫 걸음은 12h + gc_grace 6h. 그리고 지각 데이터가 다일 단위면 재동결이 늘어난다 —
+지각 분포를 먼저 측정할 것.
+
 ## SP4 이후 후보 (이번 범위 밖, 서베이 확보분)
 
 - Continuous aggregates 실행(기존 DRAFT·watermark 설계가 업계 방향과 일치 확인) — Phase 1의

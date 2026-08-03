@@ -924,9 +924,18 @@ public class TimeSeriesMemtable extends AbstractAllocatorMemtable
         long put(PartitionUpdate update, UpdateTransaction indexer, Cloner cloner, OpOrder.Group opGroup, AtomicLong liveDataSize);
 
         /**
-         * A fully-materialized, stable view for the flush path. Unlike the read path this must not
-         * leave a cached materialization behind, or flushing a memtable would rebuild — and pin —
-         * the object form of every partition at once.
+         * This partition as the flush path reads it: every row, in order, once, and then dropped.
+         * Not required to be materialized and not required to be a stable snapshot —
+         * {@link TimeSeriesColumnarPartition} streams straight off its arrays, and nothing writes to
+         * a memtable being flushed anyway (the flush task awaits the {@code Keyspace.writeOrder}
+         * barrier before the flush set is built). What no implementation may do is leave a cached
+         * materialization behind: the flush set walks every partition, so pinning each one's object
+         * form would rebuild the whole memtable on the heap at flush time — the footprint the
+         * columnar arrays exist to avoid, and the shape of the OOM that f70a0a0610 removed.
+         *
+         * <p>The view must also not put rows or the partition key through
+         * {@code MemtableAllocator.ensureOnHeap()}, unlike the read path's accessors: flush never
+         * has, and the sstable writer copies what it needs as it serializes.
          */
         Partition flushView();
 
