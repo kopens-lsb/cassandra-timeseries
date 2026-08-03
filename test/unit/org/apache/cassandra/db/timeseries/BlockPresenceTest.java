@@ -143,6 +143,174 @@ public class BlockPresenceTest
         assertThatThrownBy(() -> BlockPresence.rank(words, -1)).isInstanceOf(IllegalArgumentException.class);
     }
 
+    /**
+     * Pins the rule {@code rank}'s javadoc states normatively: a sequential scan carries its own
+     * value index, incremented by each row's presence bit, and calls {@code rank} only on a seek.
+     * The rule is only safe to state if the running index and {@code rank} agree at <i>every</i>
+     * offset, so that is what is asserted -- including that the index a seek computes is exactly the
+     * one a scan would have carried to the same row, which is what makes the two interchangeable.
+     *
+     * <p>Written against the raw word expression the cursor will use rather than against the
+     * {@code boolean[]}, because the cursor will not have a {@code boolean[]}.
+     */
+    @Test
+    public void aRunningValueIndexAgreesWithRankAtEveryOffsetAndSeek()
+    {
+        Random random = new Random(4242L);
+        int[] sizes = { 1, 2, 63, 64, 65, 127, 128, 129, 1000, 1024, 1025 };
+        for (int blockRows : sizes)
+        {
+            for (int trial = 0; trial < 10; trial++)
+            {
+                boolean[] present = randomPresence(random, blockRows);
+                long[] words = BlockPresence.toWords(present, blockRows);
+
+                // the densified value lane a block actually stores: one entry per present row
+                int[] lane = new int[BlockPresence.cardinality(words, blockRows)];
+                int filled = 0;
+                for (int row = 0; row < blockRows; row++)
+                    if (present[row])
+                        lane[filled++] = row;
+
+                // the scan: one increment per row, no bitCount anywhere
+                int valueIndex = 0;
+                for (int row = 0; row < blockRows; row++)
+                {
+                    assertEquals("blockRows " + blockRows + " row " + row,
+                                 valueIndex, BlockPresence.rank(words, row));
+                    int bit = (int) ((words[row >>> 6] >>> (row & 63)) & 1L);
+                    if (bit == 1)
+                        assertEquals("blockRows " + blockRows + " row " + row, row, lane[valueIndex]);
+                    valueIndex += bit;
+                }
+                assertEquals("blockRows " + blockRows, valueIndex, BlockPresence.rank(words, blockRows));
+                assertEquals(lane.length, valueIndex);
+
+                // the seek: rank() must reproduce exactly the index the scan would have carried
+                for (int probe = 0; probe < 8; probe++)
+                {
+                    int offset = random.nextInt(blockRows + 1);
+                    int scanned = 0;
+                    for (int row = 0; row < offset; row++)
+                        scanned += (int) ((words[row >>> 6] >>> (row & 63)) & 1L);
+                    assertEquals("blockRows " + blockRows + " seek " + offset,
+                                 scanned, BlockPresence.rank(words, offset));
+                }
+            }
+        }
+    }
+
+    // -----------------------------------------------------------------------------------------
+    // RLE expansion into bit words (§4)
+    // -----------------------------------------------------------------------------------------
+
+    /**
+     * The differential test for the word-at-a-time run expansion. The reference below is the naive
+     * per-row {@code words[i >>> 6] |= 1L << (i & 63)} loop the decoder used to run; the production
+     * path reaches the same runs through {@code decode(MODE_RLE, ...)}. Every run pattern must
+     * produce a bit-identical {@code long[]}.
+     *
+     * <p>The entire risk of the fast path is an off-by-one at one of the two partial-word edges, so
+     * the shapes below place run boundaries at every alignment: word-aligned starts and ends, starts
+     * and ends one row either side of a word boundary, single-row runs at both ends of the block, a
+     * run confined to one word, runs spanning many words, a run ending exactly at a non-word-aligned
+     * {@code blockRows}, and the full-block run. Such an error does not throw and does not break the
+     * round trip in any visible way -- it shifts one column's values by one row -- which is why it
+     * has to be caught by comparing the words themselves.
+     */
+    @Test
+    public void rleExpansionMatchesANaivePerRowReferenceAtEveryAlignment()
+    {
+        // { firstRunPresent, run lengths... }; the runs sum to blockRows.
+        int[][] shapes = {
+            { 1, 1 },                       // one row, present
+            { 0, 1 },                       // one row, absent
+            { 1, 1024 },                    // the full-block run
+            { 1, 128 },                     // full block, word-aligned
+            { 0, 1, 1022, 1 },              // single-row runs at both edges
+            { 0, 63, 1, 960 },              // a single present row at the last bit of word 0
+            { 0, 64, 1, 959 },              // a single present row at the first bit of word 1
+            { 0, 63, 2, 959 },              // a present run straddling the word 0/1 boundary
+            { 0, 63, 66, 895 },             // straddling both edges, with a whole word inside
+            { 1, 64, 64, 896 },             // a word-aligned present run at the block start
+            { 0, 64, 64, 896 },             // a word-aligned present run in the middle
+            { 0, 64, 128, 832 },            // word-aligned, spanning two whole words
+            { 0, 5, 250, 769 },             // starts and ends mid-word, spans four words
+            { 0, 1, 1023 },                 // a present run reaching the exact end of the block
+            { 1, 1023, 1 },                 // a present run from row 0 ending one short of the end
+            { 0, 960, 64 },                 // present tail, word-aligned start, ends at blockRows
+            { 0, 1, 999 },                  // blockRows 1000: present run ends in a partial word
+            { 1, 999, 1 },                  // blockRows 1000: present run starts at 0, partial tail
+            { 0, 64, 1 },                   // blockRows 65: the present row is alone in word 1
+            { 1, 65 },                      // blockRows 65: full block over a partial tail word
+            { 1, 127 },                     // blockRows 127: full block, tail word one short
+            { 0, 126, 1 },                  // blockRows 127: last row of a partial tail word
+            { 1, 1, 1, 1, 1, 1, 1, 1, 1 },  // alternating single rows across no boundary
+            { 0, 60, 1, 1, 1, 1, 1, 1, 1 }, // alternating single rows across the word 0/1 boundary
+        };
+        for (int[] shape : shapes)
+            assertRleExpansionMatchesReference(shape[0] == 1, Arrays.copyOfRange(shape, 1, shape.length));
+
+        Random random = new Random(90210L);
+        int[] sizes = { 1, 63, 64, 65, 127, 128, 129, 191, 192, 193, 1000, 1023, 1024, 1025, 4096 };
+        for (int blockRows : sizes)
+            for (int trial = 0; trial < 40; trial++)
+                assertRleExpansionMatchesReference(random.nextBoolean(), randomRuns(random, blockRows));
+    }
+
+    private static void assertRleExpansionMatchesReference(boolean firstRunPresent, int[] runs)
+    {
+        int blockRows = 0;
+        for (int run : runs)
+            blockRows += run;
+
+        // The reference: one read-modify-write per present row, deliberately naive, written here
+        // rather than borrowed so that a change to the production expansion cannot change it too.
+        long[] expected = new long[(blockRows + 63) / 64];
+        boolean present = firstRunPresent;
+        int row = 0;
+        for (int run : runs)
+        {
+            if (present)
+                for (int i = row; i < row + run; i++)
+                    expected[i >>> 6] |= 1L << (i & 63);
+            row += run;
+            present = !present;
+        }
+
+        String description = "firstRunPresent " + firstRunPresent + " runs " + Arrays.toString(runs);
+        byte[] encoded = BlockPresence.encode(BlockPresence.MODE_RLE, expected, blockRows);
+        long[] actual = BlockPresence.decode(BlockPresence.MODE_RLE, ByteBuffer.wrap(encoded), blockRows);
+        assertArrayEquals(description, expected, actual);
+
+        // and the words really do describe these runs, so a reference that agreed with a broken
+        // production path on a degenerate pattern could not pass unnoticed
+        int expectedRuns = 0;
+        for (int run : runs)
+            if (run > 0)
+                expectedRuns++;
+        assertEquals(description, expectedRuns, ByteBuffer.wrap(encoded).getShort() & 0xFFFF);
+    }
+
+    /** Run lengths clustered around word boundaries, so runs begin and end at every alignment. */
+    private static int[] randomRuns(Random random, int blockRows)
+    {
+        int[] candidates = { 1, 2, 3, 31, 32, 33, 63, 64, 65, 126, 127, 128, 129, 191, 192, 193, 255, 256, 257 };
+        int[] runs = new int[blockRows];
+        int count = 0;
+        int row = 0;
+        while (row < blockRows)
+        {
+            int remaining = blockRows - row;
+            int run = random.nextInt(4) == 0 ? 1 + random.nextInt(remaining)
+                                             : candidates[random.nextInt(candidates.length)];
+            run = Math.min(run, remaining);
+            runs[count++] = run;
+            row += run;
+        }
+        return Arrays.copyOf(runs, count);
+    }
+
     // -----------------------------------------------------------------------------------------
     // mode choice (§5 rule 3)
     // -----------------------------------------------------------------------------------------

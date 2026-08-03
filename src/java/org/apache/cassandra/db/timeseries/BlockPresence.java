@@ -104,6 +104,20 @@ public final class BlockPresence
      * <p>An off-by-one here does not throw; it returns another row's value. §12 ranks that as the
      * second-largest risk in the format, which is why the test for it is a property over random
      * null patterns rather than a handful of examples.
+     *
+     * <p><b>Normative, for every caller that walks rows in order: a sequential scan must not call
+     * this per row.</b> This is O(offset/64) by construction -- the right shape for a random-access
+     * seek, which is what it exists for, and the wrong shape for a scan. A cursor that called it
+     * once per row would turn a block walk into O(n * n/64): 8,192 {@code bitCount} intrinsics to
+     * read a 1024-row block instead of 1,024 increments, and 16x worse again at the §7 maximum block
+     * size. Instead, carry a running value index alongside the row offset and increment it by the
+     * row's own presence bit -- {@code valueIndex += (words[row >>> 6] >>> (row & 63)) & 1} -- which
+     * is exactly {@code rank(words, row + 1) - rank(words, row)} and needs no {@code bitCount} at
+     * all. Call {@code rank()} only when the scan position moves discontinuously: opening a block,
+     * a seek, or resuming a paged read. The v4 block cursor is not written yet; this rule is cheap
+     * to honour while writing it and expensive to retrofit afterwards, because by then the per-row
+     * call reads as correct code and its cost is invisible in a profile that blames
+     * {@code Long.bitCount}.
      */
     public static int rank(long[] words, int offset)
     {
@@ -469,10 +483,44 @@ public final class BlockPresence
         return ((words[index >>> 6] >>> (index & 63)) & 1L) != 0;
     }
 
+    /**
+     * Sets bits {@code [from, to)} a word at a time: a masked OR for the partial head word,
+     * {@link Arrays#fill} for the whole-word interior, a masked OR for the partial tail. Cost is
+     * O(words touched), not O(rows).
+     *
+     * <p>This is the whole point of the class javadoc's argument, and it was originally written the
+     * other way round. The claim above is that expanding RLE into bit words at block-open time is
+     * what removes the serial per-row dependency the format spent its budget on -- but a per-row
+     * {@code words[i >>> 6] |= 1L << (i & 63)} loop *is* that serial dependency, just moved. It
+     * repeatedly read-modify-writes the same word: a 1024-row block that is one long present run
+     * cost 1024 dependent iterations to set 16 words. The expansion has to be word-at-a-time or it
+     * reintroduces exactly what it was meant to remove.
+     *
+     * <p>The two partial words are where this can go wrong, and nowhere else. {@code -1L << (from &
+     * 63)} keeps bits {@code from..63}; {@code -1L >>> (-to & 63)} keeps bits {@code 0..(to-1)&63}
+     * and is deliberately written against {@code -to} so that a word-aligned {@code to} yields a
+     * shift of 0 and a full mask rather than an empty one. A run confined to one word takes the
+     * intersection of both masks. An off-by-one at either edge does not throw -- it shifts one
+     * column's values by one row -- so the test for it is a differential property against a naive
+     * per-row reference, over runs placed at every alignment.
+     */
     private static void setBits(long[] words, int from, int to)
     {
-        for (int i = from; i < to; i++)
-            words[i >>> 6] |= 1L << (i & 63);
+        if (from >= to)
+            return;
+        int firstWord = from >>> 6;
+        int lastWord = (to - 1) >>> 6;
+        long head = -1L << (from & 63);
+        long tail = -1L >>> (-to & 63);
+        if (firstWord == lastWord)
+        {
+            words[firstWord] |= head & tail;
+            return;
+        }
+        words[firstWord] |= head;
+        // Empty when the run spans exactly two words; Arrays.fill tolerates from == to.
+        Arrays.fill(words, firstWord + 1, lastWord, -1L);
+        words[lastWord] |= tail;
     }
 
     /** Runs in the presence pattern; at least 1 for a non-empty block, at most {@code blockRows}. */
