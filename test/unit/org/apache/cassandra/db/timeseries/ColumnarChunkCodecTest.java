@@ -36,6 +36,7 @@ import org.apache.cassandra.db.marshal.ByteBufferAccessor;
 import org.apache.cassandra.db.marshal.ValueAccessor;
 import org.apache.cassandra.utils.FastByteOperations;
 
+import static org.apache.cassandra.db.timeseries.ChunkV4HeaderTest.hex;
 import static org.assertj.core.api.Assertions.assertThatThrownBy;
 import static org.junit.Assert.assertArrayEquals;
 import static org.junit.Assert.assertEquals;
@@ -44,13 +45,41 @@ import static org.junit.Assert.assertNull;
 import static org.junit.Assert.assertTrue;
 
 /**
- * Tests the version-3 columnar chunk format: many named columns sharing one timestamp axis,
- * with per-column O(1) encoding for constant/all-null columns and byte-exact projection skip.
- * See {@link ColumnarChunkCodec} for the format and {@link ChunkCodecs} for how it is (and is
- * not) reachable from the single-column dispatcher.
+ * Tests the {@link ColumnarChunkCodec} <em>entry point</em> -- the surface the tiering tree
+ * consumes -- against the chunk format it now routes to (v4, {@link ChunkV4Codec}). These are the
+ * codec's cross-version CONTRACTS, deliberately re-proven through the facade rather than through
+ * {@code ChunkV4Codec} directly, so a routing regression fails here even while the v4 tests stay
+ * green: round-trip fidelity for every type-code family, O(1) constant/all-null columns,
+ * projection skipping unread sections, encode determinism (including the caller-comparator trap),
+ * NaN-payload bit exactness, {@code hasArray()} on every decoded buffer, corruption as
+ * {@link IllegalArgumentException}, and removed formats -- now including v3 itself -- as
+ * {@link UnsupportedChunkFormatException}.
+ * <p>
+ * The v3-layout-specific tests this file used to hold (golden v3 byte surgery, the 256-entry
+ * dictionary threshold, the removed gorilla/chimp inner type codes) died with the v3 read path;
+ * their v4 equivalents live in {@link ChunkV4CodecTest} and the per-layer v4 suites. The one v3
+ * artifact kept is {@link #GOLDEN_V3_HEX}: a byte-exact v3 payload that must now be rejected as an
+ * unsupported <em>format</em>, never as corruption.
  */
 public class ColumnarChunkCodecTest
 {
+    /**
+     * A byte-exact v3 chunk, hand-assembled from the retired v3 layout (25-byte header, directory,
+     * raw first timestamp + empty delta-of-delta stream): one row at t=1000, one ALL_PRESENT
+     * CONSTANT {@code int} column "v" = 7. Kept as a golden vector so the rejection test below
+     * proves a <em>well-formed</em> v3 payload is refused by version dispatch, not by tripping over
+     * its bytes.
+     */
+    private static final String GOLDEN_V3_HEX =
+        "03" +                  // version 3 -- the removed columnar format
+        "00000001" +            // rowCount 1
+        "00000000000003E8" +    // firstTimestamp 1000
+        "00000000000003E8" +    // lastTimestamp 1000
+        "0001" +                // columnCount
+        "000A" +                // dirSize 10
+        "03" + "05" + "01" + "76" + "00" + "04" + "00000007" +   // "v": INT32, ALL_PRESENT|CONSTANT, const 7
+        "00000000000003E8";     // timestamp section: first value raw, zero DoD bits
+
     @Test
     public void roundtripAllTypes()
     {
@@ -71,6 +100,7 @@ public class ColumnarChunkCodecTest
         ByteBuffer[] boolValues = new ByteBuffer[n];
         ByteBuffer[] int32Values = new ByteBuffer[n];
         ByteBuffer[] int64Values = new ByteBuffer[n];
+        ByteBuffer[] dateValues = new ByteBuffer[n];
         ByteBuffer[] textValues = new ByteBuffer[n];
         ByteBuffer[] opaqueValues = new ByteBuffer[n];
         for (int i = 0; i < n; i++)
@@ -79,19 +109,23 @@ public class ColumnarChunkCodecTest
             boolValues[i] = bytesOf(i % 3 == 0);
             int32Values[i] = bytesOf(i * 7 - 500);
             int64Values[i] = bytesOf((long) i * 1_000_000_007L - 12345L);
+            // date serializes as an unsigned day count around the 2^31 epoch
+            dateValues[i] = bytesOf((int) (0x80000000L + i));
             textValues[i] = bytesOf(words[i % words.length]);
             opaqueValues[i] = bytesOf(new byte[]{ (byte) i, (byte) (i >> 8), 0x42 });
         }
 
-        SortedMap<String, ColumnarChunkCodec.ColumnInput> columns = new TreeMap<>();
-        columns.put("c_double", new ColumnarChunkCodec.ColumnInput(ColumnarChunkCodec.TYPE_DOUBLE_ALP, doubleValues));
-        columns.put("c_bool", new ColumnarChunkCodec.ColumnInput(ColumnarChunkCodec.TYPE_BOOLEAN, boolValues));
-        columns.put("c_int32", new ColumnarChunkCodec.ColumnInput(ColumnarChunkCodec.TYPE_INT32, int32Values));
-        columns.put("c_int64", new ColumnarChunkCodec.ColumnInput(ColumnarChunkCodec.TYPE_INT64, int64Values));
-        columns.put("c_text", new ColumnarChunkCodec.ColumnInput(ColumnarChunkCodec.TYPE_TEXT, textValues));
-        columns.put("c_opaque", new ColumnarChunkCodec.ColumnInput(ColumnarChunkCodec.TYPE_OPAQUE, opaqueValues));
+        SortedMap<String, ChunkV4Codec.ColumnInput> columns = new TreeMap<>();
+        columns.put("c_double", input(ChunkV4Directory.TYPE_DOUBLE, doubleValues));
+        columns.put("c_bool", input(ChunkV4Directory.TYPE_BOOLEAN, boolValues));
+        columns.put("c_int32", input(ChunkV4Directory.TYPE_INT32, int32Values));
+        columns.put("c_int64", input(ChunkV4Directory.TYPE_INT64, int64Values));
+        columns.put("c_date", input(ChunkV4Directory.TYPE_DATE32, dateValues));
+        columns.put("c_text", input(ChunkV4Directory.TYPE_TEXT, textValues));
+        columns.put("c_opaque", input(ChunkV4Directory.TYPE_OPAQUE, opaqueValues));
 
         ByteBuffer payload = ColumnarChunkCodec.encode(ts, n, columns);
+        assertEquals(ColumnarChunkCodec.VERSION, payload.get(payload.position()));
         assertEquals(n, ColumnarChunkCodec.rowCount(payload));
         assertEquals(ts[0], ColumnarChunkCodec.firstTimestamp(payload));
         assertEquals(ts[n - 1], ColumnarChunkCodec.lastTimestamp(payload));
@@ -106,6 +140,7 @@ public class ColumnarChunkCodecTest
             assertEquals("row " + i, i % 3 == 0, asBool(cursor.getBytes("c_bool")));
             assertEquals("row " + i, i * 7 - 500, asInt(cursor.getBytes("c_int32")));
             assertEquals("row " + i, (long) i * 1_000_000_007L - 12345L, asLong(cursor.getBytes("c_int64")));
+            assertEquals("row " + i, (int) (0x80000000L + i), asInt(cursor.getBytes("c_date")));
             assertEquals("row " + i, words[i % words.length], asText(cursor.getBytes("c_text")));
             assertArrayEquals("row " + i, new byte[]{ (byte) i, (byte) (i >> 8), 0x42 }, asBytes(cursor.getBytes("c_opaque")));
         }
@@ -123,9 +158,9 @@ public class ColumnarChunkCodecTest
         int constantGrowth = constantLarge - constantSmall;
         int variableGrowth = variableLarge - variableSmall;
 
-        // both payloads pay the same (DoD-compressed) timestamp-axis cost for the extra rows; the
-        // constant column itself contributes ~0 additional bytes, while the variable column's
-        // zigzag-varint deltas cost real bytes per row, so growth must differ by a wide margin
+        // both payloads pay the same timestamp-axis cost for the extra rows; the constant column
+        // itself contributes ~0 additional bytes (a 0-byte section in every chunk size), while the
+        // variable column's bit-packed blocks cost real bytes per row, so growth must differ widely
         assertTrue("constant grew " + constantGrowth + ", variable grew " + variableGrowth,
                    constantGrowth < variableGrowth / 4);
         assertTrue("constant payload size grew too much going 100 -> 10000 rows: " +
@@ -139,8 +174,8 @@ public class ColumnarChunkCodecTest
         Random random = new Random(3);
         for (int i = 0; i < n; i++)
             values[i] = bytesOf(constant ? 192 : random.nextInt(1_000_000));
-        SortedMap<String, ColumnarChunkCodec.ColumnInput> columns = new TreeMap<>();
-        columns.put("quality", new ColumnarChunkCodec.ColumnInput(ColumnarChunkCodec.TYPE_INT32, values));
+        SortedMap<String, ChunkV4Codec.ColumnInput> columns = new TreeMap<>();
+        columns.put("quality", input(ChunkV4Directory.TYPE_INT32, values));
         return ColumnarChunkCodec.encode(ts, n, columns).remaining();
     }
 
@@ -150,8 +185,8 @@ public class ColumnarChunkCodecTest
         int n = 50;
         long[] ts = sequentialTimestamps(n);
         ByteBuffer[] values = new ByteBuffer[n];   // every entry null
-        SortedMap<String, ColumnarChunkCodec.ColumnInput> columns = new TreeMap<>();
-        columns.put("maybe_col", new ColumnarChunkCodec.ColumnInput(ColumnarChunkCodec.TYPE_DOUBLE_ALP, values));
+        SortedMap<String, ChunkV4Codec.ColumnInput> columns = new TreeMap<>();
+        columns.put("maybe_col", input(ChunkV4Directory.TYPE_DOUBLE, values));
 
         ByteBuffer payload = ColumnarChunkCodec.encode(ts, n, columns);
         ColumnarCursor cursor = ColumnarChunkCodec.cursor(payload, null);
@@ -172,8 +207,8 @@ public class ColumnarChunkCodecTest
         ByteBuffer[] values = new ByteBuffer[n];
         for (int i = 0; i < n; i++)
             values[i] = (i % 4 == 0) ? null : bytesOf(1000 + i);
-        SortedMap<String, ColumnarChunkCodec.ColumnInput> columns = new TreeMap<>();
-        columns.put("latency", new ColumnarChunkCodec.ColumnInput(ColumnarChunkCodec.TYPE_INT32, values));
+        SortedMap<String, ChunkV4Codec.ColumnInput> columns = new TreeMap<>();
+        columns.put("latency", input(ChunkV4Directory.TYPE_INT32, values));
 
         ByteBuffer payload = ColumnarChunkCodec.encode(ts, n, columns);
         ColumnarCursor cursor = ColumnarChunkCodec.cursor(payload, null);
@@ -193,13 +228,18 @@ public class ColumnarChunkCodecTest
         }
     }
 
+    /**
+     * Text must round-trip whatever the encoder's dictionary-vs-raw decision is at each
+     * cardinality. (The exact crossover is a v4 per-block argmin, not v3's 256-entry cliff; which
+     * side wins is pinned by the v4 layout tests, and here only fidelity matters.)
+     */
     @Test
-    public void textDictionaryVsRawFallbackAcrossThreshold()
+    public void textRoundTripsAcrossDictionaryAndRawShapes()
     {
-        assertTextRoundtrip(200);   // dictionary mode
-        assertTextRoundtrip(256);   // dictionary mode, exactly at the threshold
-        assertTextRoundtrip(257);   // crosses the threshold -> raw fallback
-        assertTextRoundtrip(500);   // comfortably over -> raw fallback
+        assertTextRoundtrip(200);
+        assertTextRoundtrip(256);
+        assertTextRoundtrip(257);
+        assertTextRoundtrip(500);
     }
 
     private static void assertTextRoundtrip(int distinctCount)
@@ -213,8 +253,8 @@ public class ColumnarChunkCodecTest
             expected[i] = "value-" + i;
             values[i] = bytesOf(expected[i]);
         }
-        SortedMap<String, ColumnarChunkCodec.ColumnInput> columns = new TreeMap<>();
-        columns.put("tag", new ColumnarChunkCodec.ColumnInput(ColumnarChunkCodec.TYPE_TEXT, values));
+        SortedMap<String, ChunkV4Codec.ColumnInput> columns = new TreeMap<>();
+        columns.put("tag", input(ChunkV4Directory.TYPE_TEXT, values));
 
         ByteBuffer payload = ColumnarChunkCodec.encode(ts, n, columns);
         ColumnarCursor cursor = ColumnarChunkCodec.cursor(payload, null);
@@ -226,23 +266,23 @@ public class ColumnarChunkCodecTest
     }
 
     @Test
-    public void dictionaryModeIsMuchSmallerThanRawForRepeatedValues()
+    public void lowCardinalityTextIsMuchSmallerThanHighCardinality()
     {
         int n = 5000;
         long[] ts = sequentialTimestamps(n);
 
-        ByteBuffer[] fewDistinct = new ByteBuffer[n];    // 10 distinct values repeated -> dictionary mode
-        ByteBuffer[] manyDistinct = new ByteBuffer[n];   // all unique, well over 256 -> raw mode
+        ByteBuffer[] fewDistinct = new ByteBuffer[n];    // 10 distinct values repeated -> dictionary codes
+        ByteBuffer[] manyDistinct = new ByteBuffer[n];   // all unique -> the bytes must be carried
         for (int i = 0; i < n; i++)
         {
             fewDistinct[i] = bytesOf("tag-" + (i % 10));
             manyDistinct[i] = bytesOf("unique-value-number-" + i);
         }
 
-        SortedMap<String, ColumnarChunkCodec.ColumnInput> few = new TreeMap<>();
-        few.put("tag", new ColumnarChunkCodec.ColumnInput(ColumnarChunkCodec.TYPE_TEXT, fewDistinct));
-        SortedMap<String, ColumnarChunkCodec.ColumnInput> many = new TreeMap<>();
-        many.put("tag", new ColumnarChunkCodec.ColumnInput(ColumnarChunkCodec.TYPE_TEXT, manyDistinct));
+        SortedMap<String, ChunkV4Codec.ColumnInput> few = new TreeMap<>();
+        few.put("tag", input(ChunkV4Directory.TYPE_TEXT, fewDistinct));
+        SortedMap<String, ChunkV4Codec.ColumnInput> many = new TreeMap<>();
+        many.put("tag", input(ChunkV4Directory.TYPE_TEXT, manyDistinct));
 
         int dictSize = ColumnarChunkCodec.encode(ts, n, few).remaining();
         int rawSize = ColumnarChunkCodec.encode(ts, n, many).remaining();
@@ -268,8 +308,8 @@ public class ColumnarChunkCodecTest
             expected[i] = blob;
             values[i] = bytesOf(blob);
         }
-        SortedMap<String, ColumnarChunkCodec.ColumnInput> columns = new TreeMap<>();
-        columns.put("attribute", new ColumnarChunkCodec.ColumnInput(ColumnarChunkCodec.TYPE_OPAQUE, values));
+        SortedMap<String, ChunkV4Codec.ColumnInput> columns = new TreeMap<>();
+        columns.put("attribute", input(ChunkV4Directory.TYPE_OPAQUE, values));
 
         ByteBuffer payload = ColumnarChunkCodec.encode(ts, n, columns);
         ColumnarCursor cursor = ColumnarChunkCodec.cursor(payload, null);
@@ -291,13 +331,13 @@ public class ColumnarChunkCodecTest
         for (int i = 0; i < n; i++)
         {
             keepValues[i] = bytesOf(i);
-            skipValues[i] = bytesOf("skip-me-" + i);   // 500 distinct values -> raw mode, real per-row bytes
+            skipValues[i] = bytesOf("skip-me-" + i);   // 500 distinct values -> real per-row bytes
         }
 
-        SortedMap<String, ColumnarChunkCodec.ColumnInput> columns = new TreeMap<>();
-        columns.put("aaa_keep", new ColumnarChunkCodec.ColumnInput(ColumnarChunkCodec.TYPE_INT32, keepValues));
-        // "zzz_skip" sorts last among the two columns, so its data section is the payload's tail
-        columns.put("zzz_skip", new ColumnarChunkCodec.ColumnInput(ColumnarChunkCodec.TYPE_TEXT, skipValues));
+        SortedMap<String, ChunkV4Codec.ColumnInput> columns = new TreeMap<>();
+        columns.put("aaa_keep", input(ChunkV4Directory.TYPE_INT32, keepValues));
+        // "zzz_skip" sorts last among the two columns, so its section is the payload's tail
+        columns.put("zzz_skip", input(ChunkV4Directory.TYPE_TEXT, skipValues));
 
         ByteBuffer clean = ColumnarChunkCodec.encode(ts, n, columns);
 
@@ -311,8 +351,8 @@ public class ColumnarChunkCodecTest
             assertEquals("skip-me-" + i, asText(sanity.getBytes("zzz_skip")));
         }
 
-        // corrupt the last 16 bytes of the payload -- guaranteed to fall inside "zzz_skip"'s data
-        // section since that column sorts last and its raw-mode section is far larger than 16 bytes
+        // corrupt the last 16 bytes of the payload -- guaranteed to fall inside "zzz_skip"'s
+        // section since that column sorts last and its section is far larger than 16 bytes
         byte[] rawCopy = new byte[clean.remaining()];
         clean.duplicate().get(rawCopy);
         for (int i = rawCopy.length - 16; i < rawCopy.length; i++)
@@ -337,7 +377,7 @@ public class ColumnarChunkCodecTest
     {
         int n = 300;
         long[] ts = sequentialTimestamps(n);
-        SortedMap<String, ColumnarChunkCodec.ColumnInput> natural = representativeColumns(n);
+        SortedMap<String, ChunkV4Codec.ColumnInput> natural = representativeColumns(n);
 
         ByteBuffer first = ColumnarChunkCodec.encode(ts, n, natural);
         ByteBuffer second = ColumnarChunkCodec.encode(ts, n, natural);
@@ -346,7 +386,8 @@ public class ColumnarChunkCodecTest
         // same entries, but built with a reversed comparator and a reversed insertion order, to
         // prove the directory's determinism comes from encode() re-sorting by name itself, not
         // from whatever order/comparator the caller's SortedMap happened to be built with
-        SortedMap<String, ColumnarChunkCodec.ColumnInput> reversed = new TreeMap<>(Collections.<String>reverseOrder());
+        // (v4 §5 rule 1 -- the `new TreeMap<>(map)` comparator-adoption trap)
+        SortedMap<String, ChunkV4Codec.ColumnInput> reversed = new TreeMap<>(Collections.<String>reverseOrder());
         List<String> keysInReverseInsertOrder = new ArrayList<>(natural.keySet());
         Collections.reverse(keysInReverseInsertOrder);
         for (String key : keysInReverseInsertOrder)
@@ -362,9 +403,9 @@ public class ColumnarChunkCodecTest
      * {@code hasArray()}, and if that is false it reads the buffer's {@code address} field and
      * dereferences it. A read-only HEAP buffer -- which is what {@code asReadOnlyBuffer()} produces --
      * answers {@code false} to both {@code hasArray()} and {@code isDirect()}, so its address is 0
-     * and the comparison segfaults the JVM. The decoder returned exactly such buffers from the
-     * CONSTANT and TEXT/OPAQUE paths until it was fixed, and no existing assertion noticed, because
-     * reading the bytes back out works fine; only comparing them crashes.
+     * and the comparison segfaults the JVM. The v3 decoder returned exactly such buffers from the
+     * CONSTANT and TEXT/OPAQUE paths until it was fixed, and no round-trip assertion noticed, because
+     * reading the bytes back out works fine; only comparing them crashes. v4 inherits the contract.
      * <p>
      * So this asserts the comparison RESULT (not merely that nothing throws -- a SIGSEGV would not
      * throw anyway) over one value from each decode path, plus the structural property that makes
@@ -376,7 +417,7 @@ public class ColumnarChunkCodecTest
         int n = 8;
         long[] ts = sequentialTimestamps(n);
         ByteBuffer[] constantDouble = new ByteBuffer[n];      // CONSTANT path (directory, 0-byte section)
-        ByteBuffer[] varyingDouble = new ByteBuffer[n];       // normal fixed-width data section
+        ByteBuffer[] varyingDouble = new ByteBuffer[n];       // normal fixed-width blocks
         ByteBuffer[] text = new ByteBuffer[n];                // TEXT dictionary path
         ByteBuffer[] opaque = new ByteBuffer[n];              // OPAQUE dictionary path
         ByteBuffer[] ints = new ByteBuffer[n];                // TYPE_INT32 fixed-width path
@@ -392,14 +433,14 @@ public class ColumnarChunkCodecTest
             longs[i] = bytesOf(1_000_000_000_000L + i);
             bools[i] = bytesOf(i % 2 == 0);
         }
-        SortedMap<String, ColumnarChunkCodec.ColumnInput> columns = new TreeMap<>();
-        columns.put("constant", new ColumnarChunkCodec.ColumnInput(ColumnarChunkCodec.TYPE_DOUBLE_ALP, constantDouble));
-        columns.put("varying", new ColumnarChunkCodec.ColumnInput(ColumnarChunkCodec.TYPE_DOUBLE_ALP, varyingDouble));
-        columns.put("label", new ColumnarChunkCodec.ColumnInput(ColumnarChunkCodec.TYPE_TEXT, text));
-        columns.put("blobish", new ColumnarChunkCodec.ColumnInput(ColumnarChunkCodec.TYPE_OPAQUE, opaque));
-        columns.put("counter32", new ColumnarChunkCodec.ColumnInput(ColumnarChunkCodec.TYPE_INT32, ints));
-        columns.put("counter64", new ColumnarChunkCodec.ColumnInput(ColumnarChunkCodec.TYPE_INT64, longs));
-        columns.put("flag", new ColumnarChunkCodec.ColumnInput(ColumnarChunkCodec.TYPE_BOOLEAN, bools));
+        SortedMap<String, ChunkV4Codec.ColumnInput> columns = new TreeMap<>();
+        columns.put("constant", input(ChunkV4Directory.TYPE_DOUBLE, constantDouble));
+        columns.put("varying", input(ChunkV4Directory.TYPE_DOUBLE, varyingDouble));
+        columns.put("label", input(ChunkV4Directory.TYPE_TEXT, text));
+        columns.put("blobish", input(ChunkV4Directory.TYPE_OPAQUE, opaque));
+        columns.put("counter32", input(ChunkV4Directory.TYPE_INT32, ints));
+        columns.put("counter64", input(ChunkV4Directory.TYPE_INT64, longs));
+        columns.put("flag", input(ChunkV4Directory.TYPE_BOOLEAN, bools));
 
         ColumnarCursor cursor = ColumnarChunkCodec.cursor(ColumnarChunkCodec.encode(ts, n, columns), null);
         assertTrue(cursor.advance());
@@ -414,7 +455,7 @@ public class ColumnarChunkCodecTest
                          bytesOf(1_000_000_000_000L), bytesOf(9_000_000_000_000L));
         assertComparable("flag", cursor.getBytes("flag"), bytesOf(true), ByteBuffer.wrap(new byte[]{ 9 }));
 
-        // A second row, so the per-row (non-constant) sections are exercised at an offset too.
+        // A second row, so the per-row (non-constant) paths are exercised at an offset too.
         assertTrue(cursor.advance());
         assertComparable("constant", cursor.getBytes("constant"), bytesOf(1.5), bytesOf(9.0));
         assertComparable("varying", cursor.getBytes("varying"), bytesOf(1.25), bytesOf(9.0));
@@ -452,7 +493,7 @@ public class ColumnarChunkCodecTest
                      ValueAccessor.compare(decoded, ByteBufferAccessor.instance, same, ByteBufferAccessor.instance));
     }
 
-    private static SortedMap<String, ColumnarChunkCodec.ColumnInput> representativeColumns(int n)
+    private static SortedMap<String, ChunkV4Codec.ColumnInput> representativeColumns(int n)
     {
         ByteBuffer[] doubleValues = new ByteBuffer[n];
         ByteBuffer[] textValues = new ByteBuffer[n];
@@ -464,10 +505,10 @@ public class ColumnarChunkCodecTest
             textValues[i] = bytesOf("word-" + (i % 20));
             constantValues[i] = bytesOf(0);
         }
-        SortedMap<String, ColumnarChunkCodec.ColumnInput> columns = new TreeMap<>();
-        columns.put("readings", new ColumnarChunkCodec.ColumnInput(ColumnarChunkCodec.TYPE_DOUBLE_ALP, doubleValues));
-        columns.put("labels", new ColumnarChunkCodec.ColumnInput(ColumnarChunkCodec.TYPE_TEXT, textValues));
-        columns.put("error_code", new ColumnarChunkCodec.ColumnInput(ColumnarChunkCodec.TYPE_INT32, constantValues));
+        SortedMap<String, ChunkV4Codec.ColumnInput> columns = new TreeMap<>();
+        columns.put("readings", input(ChunkV4Directory.TYPE_DOUBLE, doubleValues));
+        columns.put("labels", input(ChunkV4Directory.TYPE_TEXT, textValues));
+        columns.put("error_code", input(ChunkV4Directory.TYPE_INT32, constantValues));
         return columns;
     }
 
@@ -479,8 +520,8 @@ public class ColumnarChunkCodecTest
         ByteBuffer[] values = new ByteBuffer[n];
         for (int i = 0; i < n; i++)
             values[i] = bytesOf(i);
-        SortedMap<String, ColumnarChunkCodec.ColumnInput> columns = new TreeMap<>();
-        columns.put("existing_col", new ColumnarChunkCodec.ColumnInput(ColumnarChunkCodec.TYPE_INT32, values));
+        SortedMap<String, ChunkV4Codec.ColumnInput> columns = new TreeMap<>();
+        columns.put("existing_col", input(ChunkV4Directory.TYPE_INT32, values));
 
         ByteBuffer payload = ColumnarChunkCodec.encode(ts, n, columns);
         ColumnarCursor cursor = ColumnarChunkCodec.cursor(payload, null);
@@ -506,124 +547,17 @@ public class ColumnarChunkCodecTest
     }
 
     @Test
-    public void corruptDirectoryLengthThrowsIllegalArgument()
+    public void corruptDirectoryEntryThrowsIllegalArgument()
     {
         ByteBuffer payload = simpleTwoColumnPayload();
         byte[] bytes = new byte[payload.remaining()];
         payload.duplicate().get(bytes);
-        // header is HEADER_SIZE bytes; the first directory entry starts there as
-        // typeCode(1) + flags(1) + nameLen(1) + ... -- corrupt nameLen to an absurd value
-        bytes[ColumnarChunkCodec.HEADER_SIZE + 2] = (byte) 0xFF;
+        // the directory starts right after the 40-byte header; entry layout is
+        // typeCode(1) colFlags(1) statOrder(1) nameLen(1) name ... -- corrupt nameLen so the name
+        // overruns the directory region the header declares
+        bytes[ChunkV4Header.HEADER_SIZE + 3] = (byte) 0xFF;
         ByteBuffer corrupted = ByteBuffer.wrap(bytes);
         assertThatThrownBy(() -> ColumnarChunkCodec.cursor(corrupted, null))
-            .isInstanceOf(IllegalArgumentException.class);
-    }
-
-    @Test
-    public void corruptDictionaryCountThrowsWithoutAllocating()
-    {
-        int n = 5;
-        // exactly 2 distinct values -> dictionary mode; "QQMARKERQQ" sorts first (starts with 'Q',
-        // ASCII < 'z') among the two, so it is the dictionary's first entry, right after the mode
-        // byte and the dictCount varint
-        String marker = "QQMARKERQQ";
-        ByteBuffer[] values = new ByteBuffer[n];
-        for (int i = 0; i < n; i++)
-            values[i] = bytesOf(i % 2 == 0 ? marker : "zzz-other");
-        SortedMap<String, ColumnarChunkCodec.ColumnInput> columns = new TreeMap<>();
-        columns.put("tag", new ColumnarChunkCodec.ColumnInput(ColumnarChunkCodec.TYPE_TEXT, values));
-
-        ByteBuffer payload = ColumnarChunkCodec.encode(sequentialTimestamps(n), n, columns);
-        byte[] bytes = new byte[payload.remaining()];
-        payload.duplicate().get(bytes);
-
-        byte[] markerBytes = marker.getBytes(StandardCharsets.UTF_8);
-        int markerPos = indexOf(bytes, markerBytes);
-        assertTrue("marker not found in encoded payload", markerPos >= 0);
-        int dictCountPos = markerPos - 2;   // marker's own len-prefix byte, then dictCount, then mode
-        assertEquals("mode byte", 0, bytes[dictCountPos - 1] & 0xFF);
-        assertEquals("dictCount before corruption", 2, bytes[dictCountPos] & 0xFF);
-        assertEquals("marker's own length prefix", markerBytes.length, bytes[markerPos - 1] & 0xFF);
-
-        // Overwrite the (originally single-byte) dictCount varint with a multi-byte varint
-        // encoding a large but int-POSITIVE value (~536M, same magnitude as
-        // corruptRowCountThrowsWithoutAllocating). This matters: the earlier FF FF FF FF 7F
-        // pattern here encoded 2^35-1, which truncates to -1 under the `(int)` cast in the
-        // pre-fix code -- `new byte[-1]` throws NegativeArraySizeException, which cursor()'s
-        // pre-existing generic RuntimeException wrapper already converted to
-        // IllegalArgumentException *before this guard existed*, so that pattern did not actually
-        // discriminate fixed from unfixed code (verified by mutation -- see class javadoc note /
-        // fix-round-2 report). A value that survives the cast as a large positive int is required
-        // so only the new dictCount <= MAX_DICTIONARY_SIZE check can stop it before the
-        // `new byte[dictCount][]` allocation.
-        byte[] corrupted = bytes.clone();
-        System.arraycopy(varLongBytes(0x20000000L), 0, corrupted, dictCountPos, 5);
-
-        assertThatThrownBy(() -> ColumnarChunkCodec.cursor(ByteBuffer.wrap(corrupted), null))
-            .isInstanceOf(IllegalArgumentException.class);
-    }
-
-    @Test
-    public void corruptRawModeEntryLengthThrowsIllegalArgument()
-    {
-        int n = 300;   // > 256 distinct values forces raw mode
-        String firstValue = "ROWMARKERZERO";
-        ByteBuffer[] values = new ByteBuffer[n];
-        values[0] = bytesOf(firstValue);
-        for (int i = 1; i < n; i++)
-            values[i] = bytesOf("distinct-" + i);
-        SortedMap<String, ColumnarChunkCodec.ColumnInput> columns = new TreeMap<>();
-        columns.put("tag", new ColumnarChunkCodec.ColumnInput(ColumnarChunkCodec.TYPE_TEXT, values));
-
-        ByteBuffer payload = ColumnarChunkCodec.encode(sequentialTimestamps(n), n, columns);
-        byte[] bytes = new byte[payload.remaining()];
-        payload.duplicate().get(bytes);
-
-        // raw mode lays entries out in row order (unsorted), so row 0's value is the very first
-        // entry right after the mode byte: [mode][len][bytes]...
-        byte[] markerBytes = firstValue.getBytes(StandardCharsets.UTF_8);
-        int markerPos = indexOf(bytes, markerBytes);
-        assertTrue("marker not found in encoded payload", markerPos >= 0);
-        int lenPos = markerPos - 1;
-        assertEquals("row 0's own length prefix", markerBytes.length, bytes[lenPos] & 0xFF);
-        assertEquals("mode byte", 1, bytes[lenPos - 1] & 0xFF);
-
-        // large but int-positive value (~536M), not the sign-flipping 2^35-1 pattern -- see the
-        // comment in corruptDictionaryCountThrowsWithoutAllocating for why that distinction matters
-        byte[] corrupted = bytes.clone();
-        System.arraycopy(varLongBytes(0x20000000L), 0, corrupted, lenPos, 5);
-
-        assertThatThrownBy(() -> ColumnarChunkCodec.cursor(ByteBuffer.wrap(corrupted), null))
-            .isInstanceOf(IllegalArgumentException.class);
-    }
-
-    @Test
-    public void corruptConstantValueLengthInDirectoryThrowsIllegalArgument()
-    {
-        int n = 10;
-        ByteBuffer[] values = new ByteBuffer[n];
-        for (int i = 0; i < n; i++)
-            values[i] = bytesOf(192);   // identical everywhere -> CONSTANT column
-        SortedMap<String, ColumnarChunkCodec.ColumnInput> columns = new TreeMap<>();
-        columns.put("c", new ColumnarChunkCodec.ColumnInput(ColumnarChunkCodec.TYPE_INT32, values));
-
-        ByteBuffer payload = ColumnarChunkCodec.encode(sequentialTimestamps(n), n, columns);
-        byte[] bytes = new byte[payload.remaining()];
-        payload.duplicate().get(bytes);
-
-        // the single column "c"'s directory entry starts right after the header: typeCode(1) +
-        // flags(1) + nameLen(1) + name(1, "c") + sectionLen varint(1, value 0 -- constant columns
-        // have a 0-byte data section) + constLen varint -- this is reachable before any data
-        // section is read, so a corrupt constLen fires earliest of all three sites
-        int constLenPos = ColumnarChunkCodec.HEADER_SIZE + 5;
-        assertEquals("int32's canonical form is 4 bytes", 4, bytes[constLenPos] & 0xFF);
-
-        // large but int-positive value (~536M), not the sign-flipping 2^35-1 pattern -- see the
-        // comment in corruptDictionaryCountThrowsWithoutAllocating for why that distinction matters
-        byte[] corrupted = bytes.clone();
-        System.arraycopy(varLongBytes(0x20000000L), 0, corrupted, constLenPos, 5);
-
-        assertThatThrownBy(() -> ColumnarChunkCodec.cursor(ByteBuffer.wrap(corrupted), null))
             .isInstanceOf(IllegalArgumentException.class);
     }
 
@@ -634,9 +568,10 @@ public class ColumnarChunkCodecTest
         byte[] bytes = new byte[payload.remaining()];
         payload.duplicate().get(bytes);
 
-        // rowCount is the int32 right after the version byte
+        // rowCount is the int32 right after the version byte (v4 kept v3's offset); ~536M rows is
+        // over the format's MAX_ROWS and must be rejected before it can size any allocation
         byte[] corrupted = bytes.clone();
-        corrupted[1] = (byte) 0x20;   // ~536 million rows, still positive after the int cast
+        corrupted[1] = (byte) 0x20;
         corrupted[2] = 0;
         corrupted[3] = 0;
         corrupted[4] = 0;
@@ -648,40 +583,10 @@ public class ColumnarChunkCodecTest
     @Test
     public void headerPeeksOnTruncatedBufferThrowIllegalArgument()
     {
-        ByteBuffer truncated = ByteBuffer.wrap(new byte[]{ 3, 0 });   // valid version byte, nothing else
+        ByteBuffer truncated = ByteBuffer.wrap(new byte[]{ 4, 0 });   // valid version byte, nothing else
         assertThatThrownBy(() -> ColumnarChunkCodec.rowCount(truncated)).isInstanceOf(IllegalArgumentException.class);
         assertThatThrownBy(() -> ColumnarChunkCodec.firstTimestamp(truncated)).isInstanceOf(IllegalArgumentException.class);
         assertThatThrownBy(() -> ColumnarChunkCodec.lastTimestamp(truncated)).isInstanceOf(IllegalArgumentException.class);
-    }
-
-    /** LEB128 unsigned varint encoding, mirroring ColumnarChunkCodec's private writeVarLong. */
-    private static byte[] varLongBytes(long value)
-    {
-        java.io.ByteArrayOutputStream out = new java.io.ByteArrayOutputStream();
-        while (true)
-        {
-            int low7 = (int) (value & 0x7F);
-            value >>>= 7;
-            if (value == 0)
-            {
-                out.write(low7);
-                return out.toByteArray();
-            }
-            out.write(low7 | 0x80);
-        }
-    }
-
-    private static int indexOf(byte[] haystack, byte[] needle)
-    {
-        outer:
-        for (int i = 0; i <= haystack.length - needle.length; i++)
-        {
-            for (int j = 0; j < needle.length; j++)
-                if (haystack[i + j] != needle[j])
-                    continue outer;
-            return i;
-        }
-        return -1;
     }
 
     @Test
@@ -692,73 +597,52 @@ public class ColumnarChunkCodecTest
         gorillaPayload.put(gorillaPayload.position(), (byte) 1);   // the removed v1 version byte
 
         assertThatThrownBy(() -> ColumnarChunkCodec.cursor(gorillaPayload, null))
-            .isInstanceOf(IllegalArgumentException.class);
+            .isInstanceOf(UnsupportedChunkFormatException.class);
         assertThatThrownBy(() -> ColumnarChunkCodec.cursor(chimpPayload, null))
-            .isInstanceOf(IllegalArgumentException.class);
+            .isInstanceOf(UnsupportedChunkFormatException.class);
 
         ByteBuffer columnarPayload = simpleTwoColumnPayload();
         assertThatThrownBy(() -> ChunkCodecs.cursor(columnarPayload))
-            .isInstanceOf(IllegalArgumentException.class);
-    }
-
-    @Test
-    public void removedGorillaColumnTypeCodeIsRejectedNotMisread()
-    {
-        // Type code 0 was DOUBLE_GORILLA. A v3 chunk written before that codec was dropped must be
-        // rejected by name -- for a CONSTANT double column especially, whose raw constBytes would
-        // otherwise decode perfectly well under any type code and hide the format change.
-        SortedMap<String, ColumnarChunkCodec.ColumnInput> columns = new TreeMap<>();
-        columns.put("d", new ColumnarChunkCodec.ColumnInput(ColumnarChunkCodec.TYPE_DOUBLE_ALP,
-                                                             new ByteBuffer[]{ bytesOf(1.5), bytesOf(1.5),
-                                                                               bytesOf(1.5) }));
-        ByteBuffer payload = ColumnarChunkCodec.encode(new long[]{ 1L, 2L, 3L }, 3, columns);
-
-        byte[] bytes = new byte[payload.remaining()];
-        payload.duplicate().get(bytes);
-        // the first directory entry starts right after the header; its first byte is the type code
-        assertEquals(ColumnarChunkCodec.TYPE_DOUBLE_ALP, bytes[ColumnarChunkCodec.HEADER_SIZE]);
-        bytes[ColumnarChunkCodec.HEADER_SIZE] = 0x00;
-
-        assertThatThrownBy(() -> ColumnarChunkCodec.cursor(ByteBuffer.wrap(bytes), null))
-            .isInstanceOf(UnsupportedChunkFormatException.class)
-            .hasMessageContaining("gorilla");
-    }
-
-    @Test
-    public void removedChimpColumnTypeCodeIsRejectedNotMisread()
-    {
-        // Type code 1 was DOUBLE_CHIMP until ALP replaced it as the only double encoding. Same
-        // reasoning as the gorilla case above: a CONSTANT double column stores its value raw in the
-        // directory, so it would decode perfectly under the new code and hide the fact that this
-        // chunk's non-constant double sections are unreadable.
-        SortedMap<String, ColumnarChunkCodec.ColumnInput> columns = new TreeMap<>();
-        columns.put("d", new ColumnarChunkCodec.ColumnInput(ColumnarChunkCodec.TYPE_DOUBLE_ALP,
-                                                             new ByteBuffer[]{ bytesOf(1.5), bytesOf(2.5),
-                                                                               bytesOf(3.5) }));
-        ByteBuffer payload = ColumnarChunkCodec.encode(new long[]{ 1L, 2L, 3L }, 3, columns);
-
-        byte[] bytes = new byte[payload.remaining()];
-        payload.duplicate().get(bytes);
-        assertEquals(ColumnarChunkCodec.TYPE_DOUBLE_ALP, bytes[ColumnarChunkCodec.HEADER_SIZE]);
-        bytes[ColumnarChunkCodec.HEADER_SIZE] = 0x01;
-
-        assertThatThrownBy(() -> ColumnarChunkCodec.cursor(ByteBuffer.wrap(bytes), null))
-            .isInstanceOf(UnsupportedChunkFormatException.class)
-            .hasMessageContaining("chimp128");
+            .isInstanceOf(UnsupportedChunkFormatException.class);
     }
 
     /**
-     * Doubles carry ALP's type code and nothing else. Which of ALP's two variants a column got is
-     * recorded <em>inside</em> the section, not in the directory, so a distribution ALP-RD wins and
-     * one decimal ALP wins are indistinguishable at this level -- there is exactly one double code.
+     * §10 of the v4 spec, from the entry points the read path actually uses: a well-formed v3
+     * payload names a real-but-removed format, so it must propagate as
+     * {@link UnsupportedChunkFormatException} -- systematic, never swallowed, never skipped as one
+     * corrupt chunk -- from the cursor, from the header peeks, and from the single-column
+     * dispatcher alike.
      */
     @Test
-    public void doubleColumnsAlwaysCarryTheAlpTypeCode()
+    public void goldenV3PayloadIsRejectedAsUnsupportedNotCorrupt()
+    {
+        byte[] v3 = hex(GOLDEN_V3_HEX);
+
+        assertThatThrownBy(() -> ColumnarChunkCodec.cursor(ByteBuffer.wrap(v3), null))
+            .isInstanceOf(UnsupportedChunkFormatException.class)
+            .hasMessageContaining("version: 3");
+        assertThatThrownBy(() -> ColumnarChunkCodec.rowCount(ByteBuffer.wrap(v3)))
+            .isInstanceOf(UnsupportedChunkFormatException.class);
+        assertThatThrownBy(() -> ColumnarChunkCodec.firstTimestamp(ByteBuffer.wrap(v3)))
+            .isInstanceOf(UnsupportedChunkFormatException.class);
+        assertThatThrownBy(() -> ColumnarChunkCodec.lastTimestamp(ByteBuffer.wrap(v3)))
+            .isInstanceOf(UnsupportedChunkFormatException.class);
+        assertThatThrownBy(() -> ChunkCodecs.cursor(ByteBuffer.wrap(v3)))
+            .isInstanceOf(UnsupportedChunkFormatException.class);
+    }
+
+    /**
+     * Doubles carry the one v4 double code whatever their distribution; which block encoding each
+     * block got (decimal ALP or ALP-RD) is recorded inside the section, not in the directory, so
+     * both fixtures must land on {@link ChunkV4Directory#TYPE_DOUBLE} and round-trip exactly.
+     */
+    @Test
+    public void doubleColumnsCarryTheOneDoubleTypeCode()
     {
         int n = 400;
         Random random = new Random(17);
         ByteBuffer[] decimals = new ByteBuffer[n];      // decimal ALP's home ground
-        ByteBuffer[] highEntropy = new ByteBuffer[n];   // nothing decimal here: ALP-RD must win
+        ByteBuffer[] highEntropy = new ByteBuffer[n];   // nothing decimal here: ALP-RD territory
         double walk = 20.0;
         for (int i = 0; i < n; i++)
         {
@@ -767,50 +651,20 @@ public class ColumnarChunkCodecTest
             highEntropy[i] = ByteBuffer.wrap(rawBytes(random.nextLong()));
         }
 
-        // One column each, so the directory entry under test is always the first one and no offset
-        // arithmetic over a variable-length name and varint is needed to find it.
-        assertEquals("decimal-like doubles must use the ALP type code",
-                     ColumnarChunkCodec.TYPE_DOUBLE_ALP, firstTypeCodeOf(n, decimals));
-        assertEquals("high-entropy doubles must use the same type code",
-                     ColumnarChunkCodec.TYPE_DOUBLE_ALP, firstTypeCodeOf(n, highEntropy));
-
-        // And the sub-format byte really did differ, i.e. the fixtures exercise both variants.
-        assertTrue("the two fixtures must pick different ALP variants",
-                   alpSubFormatOf(n, decimals) != alpSubFormatOf(n, highEntropy));
-    }
-
-    private static byte firstTypeCodeOf(int n, ByteBuffer[] values)
-    {
-        return payloadBytes(n, values)[ColumnarChunkCodec.HEADER_SIZE];
-    }
-
-    /** The first byte of the sole column's data section, which for an ALP column is its sub-format. */
-    private static byte alpSubFormatOf(int n, ByteBuffer[] values)
-    {
-        byte[] bytes = payloadBytes(n, values);
-        // Data sections are the payload's tail and this payload has exactly one column, so the
-        // section begins exactly sectionLen bytes before the end.
-        ByteBuffer directory = ByteBuffer.wrap(bytes);
-        directory.position(ColumnarChunkCodec.HEADER_SIZE + 3 + 1);   // typeCode, flags, nameLen, "v"
-        long sectionLen = 0;
-        for (int shift = 0; ; shift += 7)
+        for (ByteBuffer[] fixture : new ByteBuffer[][]{ decimals, highEntropy })
         {
-            byte b = directory.get();
-            sectionLen |= ((long) (b & 0x7F)) << shift;
-            if ((b & 0x80) == 0)
-                break;
-        }
-        return bytes[(int) (bytes.length - sectionLen)];
-    }
+            SortedMap<String, ChunkV4Codec.ColumnInput> columns = new TreeMap<>();
+            columns.put("v", input(ChunkV4Directory.TYPE_DOUBLE, fixture));
+            ByteBuffer payload = ColumnarChunkCodec.encode(sequentialTimestamps(n), n, columns);
 
-    private static byte[] payloadBytes(int n, ByteBuffer[] values)
-    {
-        SortedMap<String, ColumnarChunkCodec.ColumnInput> columns = new TreeMap<>();
-        columns.put("v", new ColumnarChunkCodec.ColumnInput(ColumnarChunkCodec.TYPE_DOUBLE_ALP, values));
-        ByteBuffer payload = ColumnarChunkCodec.encode(sequentialTimestamps(n), n, columns);
-        byte[] bytes = new byte[payload.remaining()];
-        payload.duplicate().get(bytes);
-        return bytes;
+            assertEquals(ChunkV4Directory.TYPE_DOUBLE, ChunkV4Codec.open(payload).column("v").typeCode);
+            ColumnarCursor cursor = ColumnarChunkCodec.cursor(payload, null);
+            for (int i = 0; i < n; i++)
+            {
+                assertTrue(cursor.advance());
+                assertArrayEquals("row " + i, asBytes(fixture[i]), asBytes(cursor.getBytes("v")));
+            }
+        }
     }
 
     /**
@@ -843,7 +697,7 @@ public class ColumnarChunkCodecTest
             Double.doubleToRawLongBits(-0.1),
         };
 
-        // Every second row null, so the presence bitmap and the scatter back to row indexes are in
+        // Every second row null, so the presence machinery and the value-index bookkeeping are in
         // play too -- an off-by-one there would shift values onto neighbouring rows.
         int n = patterns.length * 2;
         long[] ts = sequentialTimestamps(n);
@@ -851,8 +705,8 @@ public class ColumnarChunkCodecTest
         for (int i = 0; i < patterns.length; i++)
             values[i * 2] = ByteBuffer.wrap(rawBytes(patterns[i]));
 
-        SortedMap<String, ColumnarChunkCodec.ColumnInput> columns = new TreeMap<>();
-        columns.put("reading", new ColumnarChunkCodec.ColumnInput(ColumnarChunkCodec.TYPE_DOUBLE_ALP, values));
+        SortedMap<String, ChunkV4Codec.ColumnInput> columns = new TreeMap<>();
+        columns.put("reading", input(ChunkV4Directory.TYPE_DOUBLE, values));
 
         ColumnarCursor cursor = ColumnarChunkCodec.cursor(ColumnarChunkCodec.encode(ts, n, columns), null);
         for (int i = 0; i < n; i++)
@@ -874,12 +728,12 @@ public class ColumnarChunkCodecTest
     }
 
     /**
-     * Truncating a payload whose tail is an ALP section must be reported as corruption, the same as
-     * every other section type. The double column sorts last here so its data section really is the
-     * payload's tail.
+     * Truncating a payload whose tail is a double column's section must be reported as corruption,
+     * the same as every other section type. The double column sorts last here so its section really
+     * is the payload's tail.
      */
     @Test
-    public void truncatedAlpSectionThrowsIllegalArgument()
+    public void truncatedTrailingDoubleSectionThrowsIllegalArgument()
     {
         int n = 300;
         long[] ts = sequentialTimestamps(n);
@@ -893,9 +747,9 @@ public class ColumnarChunkCodecTest
             walk += (random.nextInt(3) - 1) * 0.01;
             doubles[i] = bytesOf(Math.round(walk * 100.0) / 100.0);
         }
-        SortedMap<String, ColumnarChunkCodec.ColumnInput> columns = new TreeMap<>();
-        columns.put("aaa_int", new ColumnarChunkCodec.ColumnInput(ColumnarChunkCodec.TYPE_INT32, head));
-        columns.put("zzz_double", new ColumnarChunkCodec.ColumnInput(ColumnarChunkCodec.TYPE_DOUBLE_ALP, doubles));
+        SortedMap<String, ChunkV4Codec.ColumnInput> columns = new TreeMap<>();
+        columns.put("aaa_int", input(ChunkV4Directory.TYPE_INT32, head));
+        columns.put("zzz_double", input(ChunkV4Directory.TYPE_DOUBLE, doubles));
 
         ByteBuffer payload = ColumnarChunkCodec.encode(ts, n, columns);
         byte[] bytes = new byte[payload.remaining()];
@@ -920,27 +774,30 @@ public class ColumnarChunkCodecTest
     @Test
     public void unknownColumnTypeCodeIsRejected()
     {
-        SortedMap<String, ColumnarChunkCodec.ColumnInput> columns = new TreeMap<>();
-        columns.put("d", new ColumnarChunkCodec.ColumnInput(ColumnarChunkCodec.TYPE_INT32,
-                                                             new ByteBuffer[]{ bytesOf(1), bytesOf(2), bytesOf(3) }));
+        SortedMap<String, ChunkV4Codec.ColumnInput> columns = new TreeMap<>();
+        columns.put("d", input(ChunkV4Directory.TYPE_INT32,
+                               new ByteBuffer[]{ bytesOf(1), bytesOf(2), bytesOf(3) }));
         ByteBuffer payload = ColumnarChunkCodec.encode(new long[]{ 1L, 2L, 3L }, 3, columns);
 
         byte[] bytes = new byte[payload.remaining()];
         payload.duplicate().get(bytes);
-        bytes[ColumnarChunkCodec.HEADER_SIZE] = 0x7F;
+        // the first directory entry starts right after the header; its first byte is the type code
+        assertEquals(ChunkV4Directory.TYPE_INT32, bytes[ChunkV4Header.HEADER_SIZE]);
+        bytes[ChunkV4Header.HEADER_SIZE] = 0x7F;
 
+        // An unallocated code INSIDE a v4 payload is corruption, not a future format -- a future
+        // format would carry a different version byte (v4 §9).
         assertThatThrownBy(() -> ColumnarChunkCodec.cursor(ByteBuffer.wrap(bytes), null))
             .isInstanceOf(IllegalArgumentException.class)
-            .isNotInstanceOf(UnsupportedChunkFormatException.class)   // corruption, not a removed format
-            .hasMessageContaining("unknown column type code");
+            .isNotInstanceOf(UnsupportedChunkFormatException.class);
     }
 
     @Test
     public void rejectsNonIncreasingTimestamps()
     {
-        SortedMap<String, ColumnarChunkCodec.ColumnInput> columns = new TreeMap<>();
-        columns.put("c", new ColumnarChunkCodec.ColumnInput(ColumnarChunkCodec.TYPE_INT32,
-                                                             new ByteBuffer[]{ bytesOf(1), bytesOf(2), bytesOf(3) }));
+        SortedMap<String, ChunkV4Codec.ColumnInput> columns = new TreeMap<>();
+        columns.put("c", input(ChunkV4Directory.TYPE_INT32,
+                               new ByteBuffer[]{ bytesOf(1), bytesOf(2), bytesOf(3) }));
 
         assertThatThrownBy(() -> ColumnarChunkCodec.encode(new long[]{ 1000L, 999L, 1001L }, 3, columns))
             .isInstanceOf(IllegalArgumentException.class);
@@ -977,6 +834,12 @@ public class ColumnarChunkCodecTest
         assertThatThrownBy(() -> cursor.isNull("colA")).isInstanceOf(IllegalStateException.class);
     }
 
+    /** A {@link ChunkV4Codec.ColumnInput} declaring the type code's own canonical stat order. */
+    private static ChunkV4Codec.ColumnInput input(int typeCode, ByteBuffer[] values)
+    {
+        return new ChunkV4Codec.ColumnInput(typeCode, ChunkV4Codec.canonicalStatOrder(typeCode), values);
+    }
+
     private static ByteBuffer simpleTwoColumnPayload()
     {
         int n = 20;
@@ -988,9 +851,9 @@ public class ColumnarChunkCodecTest
             a[i] = bytesOf(i);
             b[i] = bytesOf("v" + i);
         }
-        SortedMap<String, ColumnarChunkCodec.ColumnInput> columns = new TreeMap<>();
-        columns.put("colA", new ColumnarChunkCodec.ColumnInput(ColumnarChunkCodec.TYPE_INT32, a));
-        columns.put("colB", new ColumnarChunkCodec.ColumnInput(ColumnarChunkCodec.TYPE_TEXT, b));
+        SortedMap<String, ChunkV4Codec.ColumnInput> columns = new TreeMap<>();
+        columns.put("colA", input(ChunkV4Directory.TYPE_INT32, a));
+        columns.put("colB", input(ChunkV4Directory.TYPE_TEXT, b));
         return ColumnarChunkCodec.encode(ts, n, columns);
     }
 

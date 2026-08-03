@@ -39,7 +39,6 @@ import org.apache.cassandra.db.timeseries.ColumnarChunkCodec;
 import org.apache.cassandra.db.timeseries.ColumnarCursor;
 import org.apache.cassandra.schema.ColumnMetadata;
 import org.apache.cassandra.schema.TableMetadata;
-import org.apache.cassandra.utils.AbstractIterator;
 import org.apache.cassandra.utils.BulkIterator;
 import org.apache.cassandra.utils.ByteBufferUtil;
 import org.apache.cassandra.utils.btree.BTree;
@@ -50,7 +49,7 @@ import org.apache.cassandra.utils.btree.UpdateFunction;
  * merging with hot rows (design spec section 3.3.1, plan R3/R4).
  *
  * A chunk carries every regular column of the base table (SP4: {@link ColumnarChunkCodec}, format
- * version 3), so one sample becomes one row with one cell per column that is non-null on that
+ * version 4), so one sample becomes one row with one cell per column that is non-null on that
  * sample. Columns are matched to the table <b>by name</b>: a column the chunk carries but the table
  * has since dropped is ignored, and a column added after the chunk was written simply reads as null.
  *
@@ -108,33 +107,31 @@ import org.apache.cassandra.utils.btree.UpdateFunction;
  * ({@code metadata.regularAndStaticColumns()}), which is always legal; the illegal direction --
  * carrying a cell for an undeclared column -- is impossible here.
  *
- * <h2>Laziness</h2>
+ * <h2>Laziness, and the capture walk</h2>
  * {@link #rowsFromChunk} hands back an {@link Iterator}, not a list, so a {@code LIMIT} satisfied
  * part-way through a window stops building rows for the rest of it (see {@link ChunkRowSource},
- * which stops pulling). <b>Neither direction builds a {@link Row} it does not emit.</b>
- * <ul>
- *   <li><b>Ascending</b> streams straight off the cursor: one {@code advance()} per row emitted.</li>
- *   <li><b>Descending</b> cannot, because {@link ColumnarCursor} is forward-only: nothing in its
- *       interface addresses a row by index or rewinds, so the last row of a window is reachable only
- *       by walking to it. What the walk does <em>not</em> have to do is build rows. It captures each
- *       in-range sample's timestamp and its already-decoded per-column values -- references the
- *       cursor hands over, one array slot each -- and the {@code Row} itself (clustering, cells,
- *       BTree) is assembled only when the iterator reaches that index, counting down. A
- *       {@code LIMIT n} on a 3,600-sample window therefore assembles {@code n} rows rather than
- *       3,600, and holds strictly less than the list of built rows this replaced.</li>
- * </ul>
- * The remaining per-window cost of a newest-first {@code LIMIT 1} is the capture walk and, ahead of
- * it, {@link ColumnarChunkCodec#cursor}, which decodes every projected column of the whole payload
- * before it returns. Both are linear in the window and neither can be avoided from here: the cursor
- * would have to expose a row index (see the {@code descending} branch below) for a reverse read to
- * touch only the rows it emits.
+ * which stops pulling). <b>Neither direction builds a {@link Row} it does not emit.</b> Both
+ * directions run off one eager <em>capture</em> walk of the cursor: each in-range sample's
+ * timestamp and its already-decoded per-column values -- references the cursor hands over, one
+ * array slot each -- are recorded, and the {@code Row} itself (clustering, cells, BTree) is
+ * assembled only when the iterator reaches that index, counting up or down. A {@code LIMIT n} on a
+ * 3,600-sample window therefore assembles {@code n} rows rather than 3,600, and the capture holds
+ * strictly less than the list of built rows it replaced.
  * <p>
- * <b>None of this weakens the corrupt-chunk contract.</b> That same eager
- * {@link ColumnarChunkCodec#cursor} parse -- header, timestamps and every projected column's data
- * section -- is what makes deferred assembly safe: a corrupt or unreadable chunk throws out of the
- * call below, before a single row has been emitted, and assembling a row afterwards reads only
- * primitive arrays that decoding already validated. A window is therefore still all-or-nothing: the
- * caller's skip-and-warn cannot end up having already published a truncated prefix of it.
+ * The per-window cost of the capture walk is linear in the window, which is exactly what the v3
+ * decoder already cost: it decoded every projected column of the whole payload inside
+ * {@code cursor()} before returning. For descending the walk is also unavoidable --
+ * {@link ColumnarCursor} is forward-only, so the last row is reachable only by walking to it.
+ * <p>
+ * <b>The capture walk is what upholds the corrupt-chunk contract under v4.</b> The v4 cursor opens
+ * and decodes a column's blocks lazily as {@code advance()} crosses them, so corruption inside a
+ * block would otherwise surface mid-iteration -- after rows had been emitted, and past the
+ * skip-and-warn that {@link ChunkRowSource} wraps around this <em>call</em> (a mid-iteration
+ * {@link IllegalArgumentException} would fail the whole query instead of skipping one chunk).
+ * Walking every row of the cursor here decodes every projected block before a single row is
+ * emitted, so a corrupt or unreadable chunk still throws out of the call below and a window is
+ * all-or-nothing: the caller's skip-and-warn cannot end up having already published a truncated
+ * prefix of it. Assembling a row afterwards reads only arrays that decoding already validated.
  */
 public final class ChunkReadSupport
 {
@@ -145,7 +142,7 @@ public final class ChunkReadSupport
     /**
      * @param metadata          the base table's metadata (one timestamp clustering column; any set
      *                          of regular columns)
-     * @param payload           the chunk blob ({@link ColumnarChunkCodec}, version 3)
+     * @param payload           the chunk blob ({@link ColumnarChunkCodec}, version 4)
      * @param maxRowWritetime   the chunk row's max_row_writetime (micros); cells are stamped one
      *                          microsecond LATER, see the class javadoc
      * @param startMsInclusive  emit samples with timestamp &gt;= this (epoch ms)
@@ -184,22 +181,17 @@ public final class ChunkReadSupport
 
         RowAssembler assembler = new RowAssembler(cursor, metadata, cellTimestamp);
 
-        if (descending)
-        {
-            // Newest-first is the one order that cannot be streamed off the cursor: ColumnarCursor
-            // is forward-only (advance() is its only positioning operation, and every accessor reads
-            // "the current row"), so the last in-range sample is reachable only by walking past all
-            // the others. The walk still has to happen -- what it no longer does is build a Row per
-            // step. It records each in-range sample's timestamp and its decoded values, and the rows
-            // themselves are assembled on demand, counting down; a LIMIT n assembles n of them.
-            //
-            // Were the cursor to expose the row index its implementation already keys on -- e.g.
-            // `int rowCount()` plus a value accessor taking a row -- even the capture walk would go
-            // away and a reverse read would touch only the rows it emits.
-            return new Descending(assembler, assembler.capture(startMsInclusive, endMsExclusive));
-        }
-
-        return new Ascending(assembler, startMsInclusive, endMsExclusive);
+        // BOTH directions capture eagerly, and the eagerness is load-bearing (see the class
+        // javadoc): walking every row here decodes every projected block of the v4 payload, so a
+        // corrupt chunk throws out of this call -- where ChunkRowSource's skip-and-warn catches it
+        // -- rather than mid-iteration, after rows were already emitted. Row assembly stays lazy:
+        // the capture holds references, and a Row is built only when the iterator is pulled.
+        //
+        // Were the cursor's random access exposed through ColumnarCursor (ChunkV4Codec.Cursor
+        // already has seekTo), a reverse read could skip the walk -- but only by also giving up
+        // this call's throws-before-first-row contract or re-validating some other way.
+        Captured captured = assembler.capture(startMsInclusive, endMsExclusive);
+        return descending ? new Descending(assembler, captured) : new Ascending(assembler, captured);
     }
 
     /**
@@ -219,25 +211,35 @@ public final class ChunkReadSupport
         long rowsAssembled();
     }
 
-    /** Oldest-first: one cursor step per row emitted, and nothing held between them. */
-    private static final class Ascending extends AbstractIterator<Row> implements RowCounting
+    /**
+     * Oldest-first: walks the {@link Captured} window forwards, assembling each row as it is asked
+     * for -- {@link Descending}'s mirror image, sharing its capture and its laziness.
+     */
+    private static final class Ascending implements RowCounting
     {
         private final RowAssembler assembler;
-        private final long startMsInclusive;
-        private final long endMsExclusive;
+        private final Captured captured;
+        /** Index of the row to emit next, counting up; {@code count} once the window is exhausted. */
+        private int next;
 
-        Ascending(RowAssembler assembler, long startMsInclusive, long endMsExclusive)
+        Ascending(RowAssembler assembler, Captured captured)
         {
             this.assembler = assembler;
-            this.startMsInclusive = startMsInclusive;
-            this.endMsExclusive = endMsExclusive;
+            this.captured = captured;
         }
 
         @Override
-        protected Row computeNext()
+        public boolean hasNext()
         {
-            Row row = assembler.nextRow(startMsInclusive, endMsExclusive);
-            return row == null ? endOfData() : row;
+            return next < captured.count;
+        }
+
+        @Override
+        public Row next()
+        {
+            if (next >= captured.count)
+                throw new NoSuchElementException();
+            return assembler.assemble(captured, next++);
         }
 
         @Override
@@ -326,9 +328,9 @@ public final class ChunkReadSupport
     private static final class RowAssembler
     {
         /**
-         * Nulled once a {@link #capture} has walked it: that walk is the cursor's last use, and
-         * dropping it lets a whole window's decoded columns be collected while the reverse iterator
-         * built on the capture is still alive. Non-null for the whole life of an ascending read.
+         * Nulled once {@link #capture} has walked it: that walk is the cursor's last use in either
+         * direction, and dropping it lets a whole window's decoded columns be collected while the
+         * iterator built on the capture is still alive.
          */
         private ColumnarCursor cursor;
         /**
@@ -350,12 +352,6 @@ public final class ChunkReadSupport
          * input into the nodes it allocates, so nothing downstream can observe this array.
          */
         private final Object[] scratch;
-        /**
-         * The current cursor row's raw values, for the streaming path. A second array rather than
-         * {@link #scratch} because a build reads values out of one while writing cells into the
-         * other.
-         */
-        private final Object[] rowValues;
         /** Rows built so far; see {@link RowCounting}. Single-threaded, hence not atomic. */
         private long assembled;
         /**
@@ -394,7 +390,6 @@ public final class ChunkReadSupport
             this.columns = byColumn.keySet().toArray(new ColumnMetadata[0]);
             this.names = byColumn.values().toArray(new String[0]);
             this.scratch = new Object[this.columns.length];
-            this.rowValues = new Object[this.columns.length];
 
             boolean simple = true;
             for (ColumnMetadata column : this.columns)
@@ -403,24 +398,10 @@ public final class ChunkReadSupport
         }
 
         /**
-         * Advances the cursor to the next sample inside {@code [startMsInclusive, endMsExclusive)}
-         * and builds its row.
-         *
-         * @return that row, or {@code null} once the chunk is exhausted
-         */
-        Row nextRow(long startMsInclusive, long endMsExclusive)
-        {
-            if (!advanceToSample(startMsInclusive, endMsExclusive))
-                return null;
-            for (int i = 0; i < columns.length; i++)
-                rowValues[i] = valueOf(i);
-            return buildRow(clusteringAt(cursor.timestamp()), rowValues, 0);
-        }
-
-        /**
-         * Walks the rest of the chunk once, keeping what it takes to rebuild any of its in-range
-         * samples later but building none of them. The cursor is exhausted -- and released -- by the
-         * time this returns.
+         * Walks the whole chunk once, keeping what it takes to rebuild any of its in-range samples
+         * later but building none of them. The cursor is exhausted -- and released -- by the time
+         * this returns, which is also what forces every projected block of the payload through the
+         * decoder before any row is emitted (the corrupt-chunk contract; see the class javadoc).
          */
         Captured capture(long startMsInclusive, long endMsExclusive)
         {
@@ -455,7 +436,7 @@ public final class ChunkReadSupport
             return new Captured(timestamps, values, stride, count);
         }
 
-        /** Rebuilds the {@code index}-th captured sample. Identical to the row {@link #nextRow} would have built. */
+        /** Builds the {@code index}-th captured sample's row, exactly as an eager build would have. */
         Row assemble(Captured captured, int index)
         {
             return buildRow(clusteringAt(captured.timestamps[index]), captured.values, index * captured.stride);

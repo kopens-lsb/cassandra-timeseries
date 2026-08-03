@@ -41,6 +41,8 @@ import org.apache.cassandra.db.marshal.UTF8Type;
 import org.apache.cassandra.db.rows.Cell;
 import org.apache.cassandra.db.rows.Row;
 import org.apache.cassandra.db.timeseries.Chimp128Codec;
+import org.apache.cassandra.db.timeseries.ChunkV4Codec;
+import org.apache.cassandra.db.timeseries.ChunkV4Directory;
 import org.apache.cassandra.db.timeseries.ColumnarChunkCodec;
 import org.apache.cassandra.db.timeseries.UnsupportedChunkFormatException;
 import org.apache.cassandra.dht.Murmur3Partitioner;
@@ -100,9 +102,15 @@ public class ChunkReadSupportTest
             ts[i] = BASE + i * stepMs;
             values[i] = DoubleType.instance.decompose(20.0 + i * 0.1);
         }
-        SortedMap<String, ColumnarChunkCodec.ColumnInput> columns = new TreeMap<>();
-        columns.put("value", new ColumnarChunkCodec.ColumnInput(ColumnarChunkCodec.TYPE_DOUBLE_ALP, values));
+        SortedMap<String, ChunkV4Codec.ColumnInput> columns = new TreeMap<>();
+        columns.put("value", input(ChunkV4Directory.TYPE_DOUBLE, values));
         return ColumnarChunkCodec.encode(ts, count, columns);
+    }
+
+    /** A {@link ChunkV4Codec.ColumnInput} declaring the type code's own canonical stat order. */
+    private static ChunkV4Codec.ColumnInput input(int typeCode, ByteBuffer... values)
+    {
+        return new ChunkV4Codec.ColumnInput(typeCode, ChunkV4Codec.canonicalStatOrder(typeCode), values);
     }
 
     private static void assertRow(Row row, long expectedTsMs, double expectedValue)
@@ -207,19 +215,19 @@ public class ChunkReadSupportTest
         // label present throughout. Each cell must land on its own column, and a null must produce
         // NO cell rather than a zero/empty one.
         long[] ts = { BASE, BASE + 1000, BASE + 2000 };
-        SortedMap<String, ColumnarChunkCodec.ColumnInput> columns = new TreeMap<>();
-        columns.put("value", new ColumnarChunkCodec.ColumnInput(ColumnarChunkCodec.TYPE_DOUBLE_ALP,
-                                                                new ByteBuffer[]{ DoubleType.instance.decompose(1.5),
-                                                                                  null,
-                                                                                  DoubleType.instance.decompose(2.5) }));
-        columns.put("quality", new ColumnarChunkCodec.ColumnInput(ColumnarChunkCodec.TYPE_INT32,
-                                                                  new ByteBuffer[]{ Int32Type.instance.decompose(192),
-                                                                                    Int32Type.instance.decompose(0),
-                                                                                    null }));
-        columns.put("label", new ColumnarChunkCodec.ColumnInput(ColumnarChunkCodec.TYPE_TEXT,
-                                                                new ByteBuffer[]{ UTF8Type.instance.decompose("a"),
-                                                                                  UTF8Type.instance.decompose("b"),
-                                                                                  UTF8Type.instance.decompose("") }));
+        SortedMap<String, ChunkV4Codec.ColumnInput> columns = new TreeMap<>();
+        columns.put("value", input(ChunkV4Directory.TYPE_DOUBLE,
+                                   DoubleType.instance.decompose(1.5),
+                                   null,
+                                   DoubleType.instance.decompose(2.5)));
+        columns.put("quality", input(ChunkV4Directory.TYPE_INT32,
+                                     Int32Type.instance.decompose(192),
+                                     Int32Type.instance.decompose(0),
+                                     null));
+        columns.put("label", input(ChunkV4Directory.TYPE_TEXT,
+                                   UTF8Type.instance.decompose("a"),
+                                   UTF8Type.instance.decompose("b"),
+                                   UTF8Type.instance.decompose("")));
 
         List<Row> rows = decode(ColumnarChunkCodec.encode(ts, 3, columns));
         assertEquals(3, rows.size());
@@ -247,9 +255,8 @@ public class ChunkReadSupportTest
         // it so the range delete would not destroy it. Rebuilt it must still be a live row, or it
         // would be indistinguishable from a row that never existed.
         long[] ts = { BASE };
-        SortedMap<String, ColumnarChunkCodec.ColumnInput> columns = new TreeMap<>();
-        columns.put("value", new ColumnarChunkCodec.ColumnInput(ColumnarChunkCodec.TYPE_DOUBLE_ALP,
-                                                                new ByteBuffer[]{ null }));
+        SortedMap<String, ChunkV4Codec.ColumnInput> columns = new TreeMap<>();
+        columns.put("value", input(ChunkV4Directory.TYPE_DOUBLE, new ByteBuffer[]{ null }));
 
         List<Row> rows = decode(ColumnarChunkCodec.encode(ts, 1, columns));
         assertEquals(1, rows.size());
@@ -265,11 +272,9 @@ public class ChunkReadSupportTest
         // ALTER TABLE ... DROP after the chunk was written: the chunk still carries the column, but
         // there is nowhere to put its cells. It must be dropped silently, not fail the read.
         long[] ts = { BASE };
-        SortedMap<String, ColumnarChunkCodec.ColumnInput> columns = new TreeMap<>();
-        columns.put("value", new ColumnarChunkCodec.ColumnInput(ColumnarChunkCodec.TYPE_DOUBLE_ALP,
-                                                                new ByteBuffer[]{ DoubleType.instance.decompose(7.5) }));
-        columns.put("gone", new ColumnarChunkCodec.ColumnInput(ColumnarChunkCodec.TYPE_TEXT,
-                                                               new ByteBuffer[]{ UTF8Type.instance.decompose("x") }));
+        SortedMap<String, ChunkV4Codec.ColumnInput> columns = new TreeMap<>();
+        columns.put("value", input(ChunkV4Directory.TYPE_DOUBLE, DoubleType.instance.decompose(7.5)));
+        columns.put("gone", input(ChunkV4Directory.TYPE_TEXT, UTF8Type.instance.decompose("x")));
 
         List<Row> rows = decode(ColumnarChunkCodec.encode(ts, 1, columns));
         assertEquals(1, rows.size());
@@ -460,8 +465,8 @@ public class ChunkReadSupportTest
             ts[i] = BASE + i * 1000L;
             gone[i] = UTF8Type.instance.decompose("g" + i);
         }
-        SortedMap<String, ColumnarChunkCodec.ColumnInput> columns = new TreeMap<>();
-        columns.put("gone", new ColumnarChunkCodec.ColumnInput(ColumnarChunkCodec.TYPE_TEXT, gone));
+        SortedMap<String, ChunkV4Codec.ColumnInput> columns = new TreeMap<>();
+        columns.put("gone", input(ChunkV4Directory.TYPE_TEXT, gone));
         ByteBuffer payload = ColumnarChunkCodec.encode(ts, 20, columns);
 
         List<Row> rows = list(ChunkReadSupport.rowsFromChunk(metadata, payload, WRITETIME,
@@ -537,11 +542,11 @@ public class ChunkReadSupportTest
             labels[i] = bare ? null : UTF8Type.instance.decompose(i % 5 == 0 ? "" : "l" + (i % 3));
             gone[i] = UTF8Type.instance.decompose("dropped");
         }
-        SortedMap<String, ColumnarChunkCodec.ColumnInput> columns = new TreeMap<>();
-        columns.put("value", new ColumnarChunkCodec.ColumnInput(ColumnarChunkCodec.TYPE_DOUBLE_ALP, values));
-        columns.put("quality", new ColumnarChunkCodec.ColumnInput(ColumnarChunkCodec.TYPE_INT32, qualities));
-        columns.put("label", new ColumnarChunkCodec.ColumnInput(ColumnarChunkCodec.TYPE_TEXT, labels));
-        columns.put("gone", new ColumnarChunkCodec.ColumnInput(ColumnarChunkCodec.TYPE_TEXT, gone));
+        SortedMap<String, ChunkV4Codec.ColumnInput> columns = new TreeMap<>();
+        columns.put("value", input(ChunkV4Directory.TYPE_DOUBLE, values));
+        columns.put("quality", input(ChunkV4Directory.TYPE_INT32, qualities));
+        columns.put("label", input(ChunkV4Directory.TYPE_TEXT, labels));
+        columns.put("gone", input(ChunkV4Directory.TYPE_TEXT, gone));
         return ColumnarChunkCodec.encode(ts, count, columns);
     }
 }

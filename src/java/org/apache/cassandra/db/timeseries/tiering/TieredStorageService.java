@@ -55,8 +55,10 @@ import org.apache.cassandra.db.marshal.ByteType;
 import org.apache.cassandra.db.marshal.Int32Type;
 import org.apache.cassandra.db.marshal.LongType;
 import org.apache.cassandra.db.marshal.TimestampType;
+import org.apache.cassandra.db.timeseries.ChunkV4Codec;
 import org.apache.cassandra.db.timeseries.ColumnarChunkCodec;
 import org.apache.cassandra.db.timeseries.ColumnarCursor;
+import org.apache.cassandra.db.timeseries.StatOrder;
 import org.apache.cassandra.db.timeseries.UnsupportedChunkFormatException;
 import org.apache.cassandra.dht.Range;
 import org.apache.cassandra.dht.Token;
@@ -81,7 +83,7 @@ import static java.lang.String.format;
 
 /**
  * Background re-encoder that turns closed, hot-window-expired time-series rows into columnar
- * chunks ({@link ColumnarChunkCodec}, format version 3) in a shadow {@code "<table>__chunks"} table
+ * chunks ({@link ColumnarChunkCodec}, format version 4) in a shadow {@code "<table>__chunks"} table
  * (see {@link ChunkTables}), then tombstones the source rows it just encoded.
  * <p>
  * <b>Every regular column is encoded</b>, not a designated value column: one chunk per (partition
@@ -515,13 +517,19 @@ public class TieredStorageService implements TieredStorageServiceMBean
         int valueCount = valueColumns.size();
         String[] valueRawNames = new String[valueCount];
         String[] writetimeAliases = new String[valueCount];
-        byte[] valueTypeCodes = new byte[valueCount];
+        int[] valueTypeCodes = new int[valueCount];
+        // Paired with the type code, never derived independently of it: the order a column may
+        // declare depends on which code carries its bytes (v4 §4), and ChunkColumnTypes.statOrderFor
+        // makes that pairing in one place. A type whose comparator the code cannot express (time:
+        // unsigned comparator, signed INT64 extrema) declares NONE and forgoes pruning.
+        StatOrder[] valueStatOrders = new StatOrder[valueCount];
         String writetimePrefix = writetimeAliasPrefix(base, valueCount);
         for (int c = 0; c < valueCount; c++)
         {
             valueRawNames[c] = valueColumns.get(c).name.toString();
             writetimeAliases[c] = writetimePrefix + c;
             valueTypeCodes[c] = ChunkColumnTypes.typeCodeFor(valueColumns.get(c).type);
+            valueStatOrders[c] = ChunkColumnTypes.statOrderFor(valueColumns.get(c).type);
         }
 
         // Every chunk-table query names the base table's WHOLE partition key: `tagCqlList` for select/
@@ -638,7 +646,7 @@ public class TieredStorageService implements TieredStorageServiceMBean
                     UntypedResultSet.Row existingRow = (existingRs == null || existingRs.isEmpty()) ? null : existingRs.one();
 
                     // ts -> one slot per regular column, in valueColumns order; a null slot is a null
-                    // cell and stays null all the way into the chunk (v3 encodes presence per column).
+                    // cell and stays null all the way into the chunk (presence is encoded per column).
                     TreeMap<Long, ByteBuffer[]> merged = new TreeMap<>();
                     long maxWt = Long.MIN_VALUE;
                     long existingChunkWt = Long.MIN_VALUE;
@@ -745,10 +753,11 @@ public class TieredStorageService implements TieredStorageServiceMBean
                             columnValues[c][idx] = values[c];
                         idx++;
                     }
-                    SortedMap<String, ColumnarChunkCodec.ColumnInput> columns = new TreeMap<>();
+                    SortedMap<String, ChunkV4Codec.ColumnInput> columns = new TreeMap<>();
                     for (int c = 0; c < valueCount; c++)
                         columns.put(valueRawNames[c],
-                                    new ColumnarChunkCodec.ColumnInput(valueTypeCodes[c], columnValues[c]));
+                                    new ChunkV4Codec.ColumnInput(valueTypeCodes[c], valueStatOrders[c],
+                                                                 columnValues[c]));
 
                     // BEFORE the chunk is written and the source rows are deleted: the read path's
                     // fast path is driven by this ledger, so it has to be at least as wide as the
