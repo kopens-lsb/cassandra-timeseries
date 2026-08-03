@@ -84,7 +84,7 @@ public class ColumnarChunkCodecTest
         }
 
         SortedMap<String, ColumnarChunkCodec.ColumnInput> columns = new TreeMap<>();
-        columns.put("c_double", new ColumnarChunkCodec.ColumnInput(ColumnarChunkCodec.TYPE_DOUBLE_CHIMP, doubleValues));
+        columns.put("c_double", new ColumnarChunkCodec.ColumnInput(ColumnarChunkCodec.TYPE_DOUBLE_ALP, doubleValues));
         columns.put("c_bool", new ColumnarChunkCodec.ColumnInput(ColumnarChunkCodec.TYPE_BOOLEAN, boolValues));
         columns.put("c_int32", new ColumnarChunkCodec.ColumnInput(ColumnarChunkCodec.TYPE_INT32, int32Values));
         columns.put("c_int64", new ColumnarChunkCodec.ColumnInput(ColumnarChunkCodec.TYPE_INT64, int64Values));
@@ -151,7 +151,7 @@ public class ColumnarChunkCodecTest
         long[] ts = sequentialTimestamps(n);
         ByteBuffer[] values = new ByteBuffer[n];   // every entry null
         SortedMap<String, ColumnarChunkCodec.ColumnInput> columns = new TreeMap<>();
-        columns.put("maybe_col", new ColumnarChunkCodec.ColumnInput(ColumnarChunkCodec.TYPE_DOUBLE_CHIMP, values));
+        columns.put("maybe_col", new ColumnarChunkCodec.ColumnInput(ColumnarChunkCodec.TYPE_DOUBLE_ALP, values));
 
         ByteBuffer payload = ColumnarChunkCodec.encode(ts, n, columns);
         ColumnarCursor cursor = ColumnarChunkCodec.cursor(payload, null);
@@ -393,8 +393,8 @@ public class ColumnarChunkCodecTest
             bools[i] = bytesOf(i % 2 == 0);
         }
         SortedMap<String, ColumnarChunkCodec.ColumnInput> columns = new TreeMap<>();
-        columns.put("constant", new ColumnarChunkCodec.ColumnInput(ColumnarChunkCodec.TYPE_DOUBLE_CHIMP, constantDouble));
-        columns.put("varying", new ColumnarChunkCodec.ColumnInput(ColumnarChunkCodec.TYPE_DOUBLE_CHIMP, varyingDouble));
+        columns.put("constant", new ColumnarChunkCodec.ColumnInput(ColumnarChunkCodec.TYPE_DOUBLE_ALP, constantDouble));
+        columns.put("varying", new ColumnarChunkCodec.ColumnInput(ColumnarChunkCodec.TYPE_DOUBLE_ALP, varyingDouble));
         columns.put("label", new ColumnarChunkCodec.ColumnInput(ColumnarChunkCodec.TYPE_TEXT, text));
         columns.put("blobish", new ColumnarChunkCodec.ColumnInput(ColumnarChunkCodec.TYPE_OPAQUE, opaque));
         columns.put("counter32", new ColumnarChunkCodec.ColumnInput(ColumnarChunkCodec.TYPE_INT32, ints));
@@ -465,7 +465,7 @@ public class ColumnarChunkCodecTest
             constantValues[i] = bytesOf(0);
         }
         SortedMap<String, ColumnarChunkCodec.ColumnInput> columns = new TreeMap<>();
-        columns.put("readings", new ColumnarChunkCodec.ColumnInput(ColumnarChunkCodec.TYPE_DOUBLE_CHIMP, doubleValues));
+        columns.put("readings", new ColumnarChunkCodec.ColumnInput(ColumnarChunkCodec.TYPE_DOUBLE_ALP, doubleValues));
         columns.put("labels", new ColumnarChunkCodec.ColumnInput(ColumnarChunkCodec.TYPE_TEXT, textValues));
         columns.put("error_code", new ColumnarChunkCodec.ColumnInput(ColumnarChunkCodec.TYPE_INT32, constantValues));
         return columns;
@@ -708,7 +708,7 @@ public class ColumnarChunkCodecTest
         // rejected by name -- for a CONSTANT double column especially, whose raw constBytes would
         // otherwise decode perfectly well under any type code and hide the format change.
         SortedMap<String, ColumnarChunkCodec.ColumnInput> columns = new TreeMap<>();
-        columns.put("d", new ColumnarChunkCodec.ColumnInput(ColumnarChunkCodec.TYPE_DOUBLE_CHIMP,
+        columns.put("d", new ColumnarChunkCodec.ColumnInput(ColumnarChunkCodec.TYPE_DOUBLE_ALP,
                                                              new ByteBuffer[]{ bytesOf(1.5), bytesOf(1.5),
                                                                                bytesOf(1.5) }));
         ByteBuffer payload = ColumnarChunkCodec.encode(new long[]{ 1L, 2L, 3L }, 3, columns);
@@ -716,12 +716,205 @@ public class ColumnarChunkCodecTest
         byte[] bytes = new byte[payload.remaining()];
         payload.duplicate().get(bytes);
         // the first directory entry starts right after the header; its first byte is the type code
-        assertEquals(ColumnarChunkCodec.TYPE_DOUBLE_CHIMP, bytes[ColumnarChunkCodec.HEADER_SIZE]);
+        assertEquals(ColumnarChunkCodec.TYPE_DOUBLE_ALP, bytes[ColumnarChunkCodec.HEADER_SIZE]);
         bytes[ColumnarChunkCodec.HEADER_SIZE] = 0x00;
 
         assertThatThrownBy(() -> ColumnarChunkCodec.cursor(ByteBuffer.wrap(bytes), null))
             .isInstanceOf(UnsupportedChunkFormatException.class)
             .hasMessageContaining("gorilla");
+    }
+
+    @Test
+    public void removedChimpColumnTypeCodeIsRejectedNotMisread()
+    {
+        // Type code 1 was DOUBLE_CHIMP until ALP replaced it as the only double encoding. Same
+        // reasoning as the gorilla case above: a CONSTANT double column stores its value raw in the
+        // directory, so it would decode perfectly under the new code and hide the fact that this
+        // chunk's non-constant double sections are unreadable.
+        SortedMap<String, ColumnarChunkCodec.ColumnInput> columns = new TreeMap<>();
+        columns.put("d", new ColumnarChunkCodec.ColumnInput(ColumnarChunkCodec.TYPE_DOUBLE_ALP,
+                                                             new ByteBuffer[]{ bytesOf(1.5), bytesOf(2.5),
+                                                                               bytesOf(3.5) }));
+        ByteBuffer payload = ColumnarChunkCodec.encode(new long[]{ 1L, 2L, 3L }, 3, columns);
+
+        byte[] bytes = new byte[payload.remaining()];
+        payload.duplicate().get(bytes);
+        assertEquals(ColumnarChunkCodec.TYPE_DOUBLE_ALP, bytes[ColumnarChunkCodec.HEADER_SIZE]);
+        bytes[ColumnarChunkCodec.HEADER_SIZE] = 0x01;
+
+        assertThatThrownBy(() -> ColumnarChunkCodec.cursor(ByteBuffer.wrap(bytes), null))
+            .isInstanceOf(UnsupportedChunkFormatException.class)
+            .hasMessageContaining("chimp128");
+    }
+
+    /**
+     * Doubles carry ALP's type code and nothing else. Which of ALP's two variants a column got is
+     * recorded <em>inside</em> the section, not in the directory, so a distribution ALP-RD wins and
+     * one decimal ALP wins are indistinguishable at this level -- there is exactly one double code.
+     */
+    @Test
+    public void doubleColumnsAlwaysCarryTheAlpTypeCode()
+    {
+        int n = 400;
+        Random random = new Random(17);
+        ByteBuffer[] decimals = new ByteBuffer[n];      // decimal ALP's home ground
+        ByteBuffer[] highEntropy = new ByteBuffer[n];   // nothing decimal here: ALP-RD must win
+        double walk = 20.0;
+        for (int i = 0; i < n; i++)
+        {
+            walk += (random.nextInt(3) - 1) * 0.01;
+            decimals[i] = bytesOf(Math.round(walk * 100.0) / 100.0);
+            highEntropy[i] = ByteBuffer.wrap(rawBytes(random.nextLong()));
+        }
+
+        // One column each, so the directory entry under test is always the first one and no offset
+        // arithmetic over a variable-length name and varint is needed to find it.
+        assertEquals("decimal-like doubles must use the ALP type code",
+                     ColumnarChunkCodec.TYPE_DOUBLE_ALP, firstTypeCodeOf(n, decimals));
+        assertEquals("high-entropy doubles must use the same type code",
+                     ColumnarChunkCodec.TYPE_DOUBLE_ALP, firstTypeCodeOf(n, highEntropy));
+
+        // And the sub-format byte really did differ, i.e. the fixtures exercise both variants.
+        assertTrue("the two fixtures must pick different ALP variants",
+                   alpSubFormatOf(n, decimals) != alpSubFormatOf(n, highEntropy));
+    }
+
+    private static byte firstTypeCodeOf(int n, ByteBuffer[] values)
+    {
+        return payloadBytes(n, values)[ColumnarChunkCodec.HEADER_SIZE];
+    }
+
+    /** The first byte of the sole column's data section, which for an ALP column is its sub-format. */
+    private static byte alpSubFormatOf(int n, ByteBuffer[] values)
+    {
+        byte[] bytes = payloadBytes(n, values);
+        // Data sections are the payload's tail and this payload has exactly one column, so the
+        // section begins exactly sectionLen bytes before the end.
+        ByteBuffer directory = ByteBuffer.wrap(bytes);
+        directory.position(ColumnarChunkCodec.HEADER_SIZE + 3 + 1);   // typeCode, flags, nameLen, "v"
+        long sectionLen = 0;
+        for (int shift = 0; ; shift += 7)
+        {
+            byte b = directory.get();
+            sectionLen |= ((long) (b & 0x7F)) << shift;
+            if ((b & 0x80) == 0)
+                break;
+        }
+        return bytes[(int) (bytes.length - sectionLen)];
+    }
+
+    private static byte[] payloadBytes(int n, ByteBuffer[] values)
+    {
+        SortedMap<String, ColumnarChunkCodec.ColumnInput> columns = new TreeMap<>();
+        columns.put("v", new ColumnarChunkCodec.ColumnInput(ColumnarChunkCodec.TYPE_DOUBLE_ALP, values));
+        ByteBuffer payload = ColumnarChunkCodec.encode(sequentialTimestamps(n), n, columns);
+        byte[] bytes = new byte[payload.remaining()];
+        payload.duplicate().get(bytes);
+        return bytes;
+    }
+
+    /**
+     * The whole columnar path, not just the codec: a double cell's bytes must come back out of a
+     * cursor bit-identical, including the patterns Java's own {@code Double} helpers rewrite.
+     * {@code ByteArrayUtil.bytes(double)} goes through {@code Double.doubleToLongBits}, which
+     * canonicalises every NaN payload -- so a decoder that materialised doubles rather than raw bit
+     * patterns would pass every other test here and still lose data on this one.
+     */
+    @Test
+    public void doubleEdgeCaseBitPatternsSurviveTheWholeColumnarPath()
+    {
+        long[] patterns =
+        {
+            0x0000000000000000L,   // +0.0
+            0x8000000000000000L,   // -0.0
+            0x7FF0000000000000L,   // +Infinity
+            0xFFF0000000000000L,   // -Infinity
+            0x7FF8000000000000L,   // canonical NaN
+            0x7FF8000000000001L,   // quiet NaN with a payload
+            0x7FF0000000000001L,   // signalling NaN
+            0xFFFFFFFFFFFFFFFFL,   // negative NaN, all payload bits set
+            0x0000000000000001L,   // Double.MIN_VALUE
+            0x000FFFFFFFFFFFFFL,   // largest subnormal
+            0x0010000000000000L,   // Double.MIN_NORMAL
+            0x7FEFFFFFFFFFFFFFL,   // Double.MAX_VALUE
+            0xFFEFFFFFFFFFFFFFL,   // -Double.MAX_VALUE
+            Double.doubleToRawLongBits(20.76),
+            Double.doubleToRawLongBits(157.0),
+            Double.doubleToRawLongBits(-0.1),
+        };
+
+        // Every second row null, so the presence bitmap and the scatter back to row indexes are in
+        // play too -- an off-by-one there would shift values onto neighbouring rows.
+        int n = patterns.length * 2;
+        long[] ts = sequentialTimestamps(n);
+        ByteBuffer[] values = new ByteBuffer[n];
+        for (int i = 0; i < patterns.length; i++)
+            values[i * 2] = ByteBuffer.wrap(rawBytes(patterns[i]));
+
+        SortedMap<String, ColumnarChunkCodec.ColumnInput> columns = new TreeMap<>();
+        columns.put("reading", new ColumnarChunkCodec.ColumnInput(ColumnarChunkCodec.TYPE_DOUBLE_ALP, values));
+
+        ColumnarCursor cursor = ColumnarChunkCodec.cursor(ColumnarChunkCodec.encode(ts, n, columns), null);
+        for (int i = 0; i < n; i++)
+        {
+            assertTrue(cursor.advance());
+            if (i % 2 == 1)
+            {
+                assertTrue("row " + i + " must stay null", cursor.isNull("reading"));
+                continue;
+            }
+            long expected = patterns[i / 2];
+            ByteBuffer decoded = cursor.getBytes("reading");
+            assertTrue("row " + i + ": decoded doubles must be array-backed (see the buffer contract)",
+                       decoded.hasArray());
+            assertArrayEquals("row " + i + ": " + String.format("0x%016X", expected),
+                              rawBytes(expected), asBytes(decoded));
+        }
+        assertFalse(cursor.advance());
+    }
+
+    /**
+     * Truncating a payload whose tail is an ALP section must be reported as corruption, the same as
+     * every other section type. The double column sorts last here so its data section really is the
+     * payload's tail.
+     */
+    @Test
+    public void truncatedAlpSectionThrowsIllegalArgument()
+    {
+        int n = 300;
+        long[] ts = sequentialTimestamps(n);
+        ByteBuffer[] head = new ByteBuffer[n];
+        ByteBuffer[] doubles = new ByteBuffer[n];
+        Random random = new Random(23);
+        double walk = 41.5;
+        for (int i = 0; i < n; i++)
+        {
+            head[i] = bytesOf(i);
+            walk += (random.nextInt(3) - 1) * 0.01;
+            doubles[i] = bytesOf(Math.round(walk * 100.0) / 100.0);
+        }
+        SortedMap<String, ColumnarChunkCodec.ColumnInput> columns = new TreeMap<>();
+        columns.put("aaa_int", new ColumnarChunkCodec.ColumnInput(ColumnarChunkCodec.TYPE_INT32, head));
+        columns.put("zzz_double", new ColumnarChunkCodec.ColumnInput(ColumnarChunkCodec.TYPE_DOUBLE_ALP, doubles));
+
+        ByteBuffer payload = ColumnarChunkCodec.encode(ts, n, columns);
+        byte[] bytes = new byte[payload.remaining()];
+        payload.duplicate().get(bytes);
+
+        for (int cut = 1; cut <= 24; cut++)
+        {
+            ByteBuffer truncated = ByteBuffer.wrap(bytes, 0, bytes.length - cut);
+            assertThatThrownBy(() -> ColumnarChunkCodec.cursor(truncated, null))
+                .as("cut=" + cut).isInstanceOf(IllegalArgumentException.class);
+        }
+    }
+
+    private static byte[] rawBytes(long bits)
+    {
+        byte[] out = new byte[8];
+        for (int i = 0; i < 8; i++)
+            out[i] = (byte) (bits >>> (56 - 8 * i));
+        return out;
     }
 
     @Test

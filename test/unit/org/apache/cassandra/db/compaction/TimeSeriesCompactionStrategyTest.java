@@ -24,6 +24,7 @@ import java.util.HashSet;
 import java.util.List;
 import java.util.Map;
 import java.util.Set;
+import java.util.concurrent.atomic.AtomicInteger;
 
 import org.junit.BeforeClass;
 import org.junit.Test;
@@ -99,6 +100,29 @@ public class TimeSeriesCompactionStrategyTest
         when(cfs.getTracker().tryModify(anyCollection(), any(OperationType.class)))
             .thenAnswer(invocation -> {
                 Set<SSTableReader> requested = new HashSet<>((Collection<SSTableReader>) invocation.getArgument(0));
+                LifecycleTransaction txn = mock(LifecycleTransaction.class);
+                when(txn.originals()).thenReturn(requested);
+                when(txn.isOffline()).thenReturn(true);
+                return txn;
+            });
+    }
+
+    /**
+     * As {@link #stubTracker}, but modelling the half of the real {@code Tracker.tryModify} contract the
+     * always-granting stub cannot: a request that touches an sstable somebody else already holds is
+     * refused wholesale. Without this a mock test cannot reproduce head-of-line blocking at all - in
+     * production a freeze candidate containing one compacting sstable is *always* refused, which is
+     * exactly why the round used to hand out nothing.
+     */
+    @SuppressWarnings("unchecked")
+    private static void stubTrackerRefusing(ColumnFamilyStore cfs, Set<SSTableReader> unavailable)
+    {
+        when(cfs.getTracker().tryModify(anyCollection(), any(OperationType.class)))
+            .thenAnswer(invocation -> {
+                Set<SSTableReader> requested = new HashSet<>((Collection<SSTableReader>) invocation.getArgument(0));
+                for (SSTableReader sstable : requested)
+                    if (unavailable.contains(sstable))
+                        return null;
                 LifecycleTransaction txn = mock(LifecycleTransaction.class);
                 when(txn.originals()).thenReturn(requested);
                 when(txn.isOffline()).thenReturn(true);
@@ -957,5 +981,235 @@ public class TimeSeriesCompactionStrategyTest
 
         // 위임 0 + 만료 0 + 동결 0 + 걸침 2 — 분할 백로그도 CSM 정렬에 보여야 기아하지 않는다
         assertEquals(2, tscs.getEstimatedRemainingTasks());
+    }
+
+    // ---------------------------------------------------------------------------------------------
+    // Availability: what the round may start, versus what the window IS.
+    //
+    // Selection now filters out sstables another operation already holds (Tracker.getCompacting()) and
+    // EARLY readers, mirroring UnifiedCompactionStrategy#isSuitableForCompaction + #getCompactableSSTables.
+    // The filter decides ELIGIBILITY ONLY: classification, the backlog counters and the no-progress
+    // guard's signature all keep looking at the whole window, because an sstable being busy right now is
+    // not a change in the window's shape.
+    // ---------------------------------------------------------------------------------------------
+
+    /**
+     * Head-of-line blocking. One sstable of the OLDEST FREEZING window is being compacted by something
+     * else - a delegate compaction that began while the window was still CLOSING, an operator's
+     * user-defined compaction - so the tracker refuses that window. Selection picked the oldest window
+     * unconditionally, so it picked the refused one on every round for the whole length of that
+     * compaction and handed out nothing: every newer freeze waited behind it, and (see
+     * {@code splitIsNotSuppressedByABlockedFreeze}) so did every split.
+     */
+    @Test
+    public void freezeSkipsABlockedWindowAndTakesTheNextEligibleOne()
+    {
+        UnifiedCompactionStrategy delegate = mock(UnifiedCompactionStrategy.class);
+        when(delegate.getNextBackgroundTasks(anyLong())).thenReturn(List.of());
+        when(delegate.getEstimatedRemainingTasks()).thenReturn(0);
+        ColumnFamilyStore cfs = mock(ColumnFamilyStore.class, Mockito.RETURNS_DEEP_STUBS);
+        TimeSeriesCompactionStrategy tscs = new TimeSeriesCompactionStrategy(cfs, options(), delegate);
+
+        SSTableReader older1 = sstableAt(NOW - 20 * HOUR);
+        SSTableReader older2 = sstableAt(NOW - 20 * HOUR + 60_000);
+        SSTableReader newer1 = sstableAt(NOW - 10 * HOUR);
+        SSTableReader newer2 = sstableAt(NOW - 10 * HOUR + 60_000);
+        for (SSTableReader s : List.of(older1, older2, newer1, newer2))
+            tscs.addSSTable(s);
+        when(cfs.getLiveSSTables()).thenReturn(Set.of(older1, older2, newer1, newer2));
+        when(cfs.getTracker().getCompacting()).thenReturn(Set.of(older1));
+        stubTrackerRefusing(cfs, Set.of(older1));
+
+        AbstractCompactionTask task = onlyTask(tscs.getNextBackgroundTasksAt(NOW, 0));
+
+        assertTrue(task instanceof FreezeCompactionTask);
+        assertEquals(Set.of(newer1, newer2), task.transaction.originals());
+        // The blocked window is not done, only unstartable this round: it must still read as pending
+        // work, or the CompactionStrategyManager deprioritises this table while a freeze is waiting.
+        assertEquals(2, tscs.getEstimatedRemainingTasks());
+    }
+
+    /**
+     * The companion to the test above: skipping a blocked window must not degenerate into "take any
+     * eligible window". Three FREEZING windows with the MIDDLE one blocked - the oldest is still the one
+     * selected, so freezes keep coming out in window order and the oldest data still freezes first.
+     */
+    @Test
+    public void oldestEligibleFreezingWindowIsStillTakenOldestFirst()
+    {
+        UnifiedCompactionStrategy delegate = mock(UnifiedCompactionStrategy.class);
+        when(delegate.getNextBackgroundTasks(anyLong())).thenReturn(List.of());
+        when(delegate.getEstimatedRemainingTasks()).thenReturn(0);
+        ColumnFamilyStore cfs = mock(ColumnFamilyStore.class, Mockito.RETURNS_DEEP_STUBS);
+        TimeSeriesCompactionStrategy tscs = new TimeSeriesCompactionStrategy(cfs, options(), delegate);
+
+        SSTableReader oldest1 = sstableAt(NOW - 30 * HOUR);
+        SSTableReader oldest2 = sstableAt(NOW - 30 * HOUR + 60_000);
+        SSTableReader blocked1 = sstableAt(NOW - 20 * HOUR);
+        SSTableReader blocked2 = sstableAt(NOW - 20 * HOUR + 60_000);
+        SSTableReader newest1 = sstableAt(NOW - 10 * HOUR);
+        SSTableReader newest2 = sstableAt(NOW - 10 * HOUR + 60_000);
+        for (SSTableReader s : List.of(oldest1, oldest2, blocked1, blocked2, newest1, newest2))
+            tscs.addSSTable(s);
+        when(cfs.getLiveSSTables()).thenReturn(Set.of(oldest1, oldest2, blocked1, blocked2, newest1, newest2));
+        when(cfs.getTracker().getCompacting()).thenReturn(Set.of(blocked1));
+        stubTrackerRefusing(cfs, Set.of(blocked1));
+
+        AbstractCompactionTask task = onlyTask(tscs.getNextBackgroundTasksAt(NOW, 0));
+
+        assertTrue(task instanceof FreezeCompactionTask);
+        assertEquals(Set.of(oldest1, oldest2), task.transaction.originals());
+        assertEquals(3, tscs.getEstimatedRemainingTasks());          // all three windows are pending work
+    }
+
+    /**
+     * A refused freeze used to set the round's "attempted" flag before calling tryModify, and that flag
+     * gated the split branch - so one freeze candidate the tracker kept refusing silently stopped ALL
+     * split-refreeze work on the table for as long as it stayed stuck. Split is lower priority than
+     * freeze (plan D7); lower priority is not "cancelled by a freeze that did not happen".
+     * <p>
+     * The refusal here is the plain tryModify race (spec section 8), not the compacting filter: the
+     * point is the control flow after a refusal, whatever caused it.
+     */
+    @Test
+    public void splitIsNotSuppressedByABlockedFreeze()
+    {
+        UnifiedCompactionStrategy delegate = mock(UnifiedCompactionStrategy.class);
+        AbstractCompactionTask delegateTask = mock(AbstractCompactionTask.class);
+        when(delegate.getNextBackgroundTasks(anyLong())).thenReturn(List.of(delegateTask));
+        ColumnFamilyStore cfs = mock(ColumnFamilyStore.class, Mockito.RETURNS_DEEP_STUBS);
+        TimeSeriesCompactionStrategy tscs = new TimeSeriesCompactionStrategy(cfs, options(), delegate);
+
+        SSTableReader f1 = sstableAt(NOW - 20 * HOUR);
+        SSTableReader f2 = sstableAt(NOW - 20 * HOUR + 60_000);
+        SSTableReader spanning = sstableSpanning(NOW - 11 * HOUR, NOW - 10 * HOUR);
+        for (SSTableReader s : List.of(f1, f2, spanning))
+            tscs.addSSTable(s);
+        when(cfs.getLiveSSTables()).thenReturn(Set.of(f1, f2, spanning));
+        stubTrackerRefusing(cfs, Set.of(f1, f2));                    // only the freeze window is refused
+
+        AbstractCompactionTask task = onlyTask(tscs.getNextBackgroundTasksAt(NOW, 0));
+
+        assertTrue("a refused freeze must not cancel the split branch", task instanceof SplitRefreezeCompactionTask);
+        assertEquals(Set.of(spanning), task.transaction.originals());
+    }
+
+    /**
+     * The single easiest thing to get wrong in the availability filter, and the most silent.
+     * <p>
+     * {@link TimeSeriesCompactionStrategy#recordCompletedRewrite} chains rewrites by comparing the shape
+     * a rewrite was handed against the shape the previous rewrite left behind; a mismatch means
+     * something outside compaction moved the window, so the chain - and every strike scored on it - is
+     * discarded. If the "before" shape were taken from the eligible subset while the "after" shape is
+     * recomputed from the whole window, then any sstable starting or stopping compaction between
+     * hand-out and completion would break the chain although nothing about the window changed. Nothing
+     * would ever accumulate two strikes, the guard would never park anything, and the freeze/split
+     * livelock it exists to bound would be back - with no symptom other than compaction never stopping.
+     * <p>
+     * Here the window never changes and the freeze achieves nothing (T2-I3's JBOD shape), but a member
+     * becomes compacting between the first hand-out and the second. The window must still be parked.
+     */
+    @Test
+    public void guardSignatureIsComputedOnTheUnfilteredWindow()
+    {
+        UnifiedCompactionStrategy delegate = mock(UnifiedCompactionStrategy.class);
+        AbstractCompactionTask delegateTask = mock(AbstractCompactionTask.class);
+        when(delegate.getNextBackgroundTasks(anyLong())).thenReturn(List.of(delegateTask));
+        ColumnFamilyStore cfs = mock(ColumnFamilyStore.class, Mockito.RETURNS_DEEP_STUBS);
+        stubTracker(cfs);
+        TimeSeriesCompactionStrategy tscs = new TimeSeriesCompactionStrategy(cfs, options(), delegate);
+
+        SSTableReader a = sstableAt(NOW - 10 * HOUR);
+        SSTableReader b = sstableAt(NOW - 10 * HOUR + 60_000);
+        SSTableReader c = sstableAt(NOW - 10 * HOUR + 120_000);
+        setWindow(tscs, cfs, Set.of(a, b, c));
+
+        // Strike 1: the whole window is available, the freeze commits, and the window is unchanged.
+        AbstractCompactionTask first = onlyTask(tscs.getNextBackgroundTasksAt(NOW, 0));
+        assertTrue(first instanceof FreezeCompactionTask);
+        assertEquals(Set.of(a, b, c), first.transaction.originals());
+        complete(first);
+
+        // Now b is busy elsewhere. The window is exactly as it was - 3 sstables, none of them spanning.
+        when(cfs.getTracker().getCompacting()).thenReturn(Set.of(b));
+
+        AbstractCompactionTask second = onlyTask(tscs.getNextBackgroundTasksAt(NOW, 0));
+        assertTrue(second instanceof FreezeCompactionTask);
+        assertEquals("only the available members may be marked", Set.of(a, c), second.transaction.originals());
+        complete(second);
+
+        // Strike 2 landed on the same chain, so the window is parked - keyed, as always, on the shape of
+        // the whole window and not on whatever subset happened to be free.
+        assertTrue("the chain must survive a member becoming compacting mid-flight",
+                   tscs.isParked(oldWindow(), Set.of(a, b, c)));
+        assertEquals(List.of(delegateTask), List.copyOf(tscs.getNextBackgroundTasksAt(NOW, 0)));
+    }
+
+    /**
+     * The eligibility filter, observed at the only place it is allowed to have an effect: the set handed
+     * to the tracker. In production tryModify would simply refuse a set containing a compacting sstable,
+     * so an unfiltered freeze of this window is a round that accomplishes nothing.
+     */
+    @Test
+    public void freezeHandsTheTrackerOnlyTheAvailableMembersOfTheWindow()
+    {
+        UnifiedCompactionStrategy delegate = mock(UnifiedCompactionStrategy.class);
+        when(delegate.getNextBackgroundTasks(anyLong())).thenReturn(List.of());
+        when(delegate.getEstimatedRemainingTasks()).thenReturn(0);
+        ColumnFamilyStore cfs = mock(ColumnFamilyStore.class, Mockito.RETURNS_DEEP_STUBS);
+        TimeSeriesCompactionStrategy tscs = new TimeSeriesCompactionStrategy(cfs, options(), delegate);
+
+        SSTableReader a = sstableAt(NOW - 10 * HOUR);
+        SSTableReader b = sstableAt(NOW - 10 * HOUR + 60_000);
+        SSTableReader c = sstableAt(NOW - 10 * HOUR + 120_000);
+        for (SSTableReader s : List.of(a, b, c))
+            tscs.addSSTable(s);
+        when(cfs.getLiveSSTables()).thenReturn(Set.of(a, b, c));
+        when(cfs.getTracker().getCompacting()).thenReturn(Set.of(b));
+        stubTrackerRefusing(cfs, Set.of(b));
+
+        AbstractCompactionTask task = onlyTask(tscs.getNextBackgroundTasksAt(NOW, 0));
+
+        assertTrue(task instanceof FreezeCompactionTask);
+        assertEquals(Set.of(a, c), task.transaction.originals());
+        // One window, counted once: the filter changed what may be compacted, not what needs freezing.
+        assertEquals(1, tscs.getEstimatedRemainingTasks());
+    }
+
+    /**
+     * getEstimatedRemainingTasks() is how the CompactionStrategyManager ranks this table against every
+     * other one, and the delegate's contribution to it is a field UCS only writes inside its own
+     * getNextCompactionPick. TSCS returns before the delegate on every expired/freeze/split round, so on
+     * exactly the busy rounds - the ones where the ranking decides whether this table gets a compaction
+     * thread at all - the delegate's term was whatever it had been when the delegate last ran. The
+     * freeze and split backlogs were fixed for this in T2-M8; this term was not.
+     * <p>
+     * The delegate here is stubbed to behave like UCS does: the estimate moves only when
+     * getNextCompactionPick runs. Reverting the fix leaves the assertion reading the stale 0.
+     */
+    @Test
+    public void estimatedRemainingTasksIsRefreshedOnRoundsThatReturnEarly()
+    {
+        AtomicInteger delegateEstimate = new AtomicInteger(0);
+        UnifiedCompactionStrategy delegate = mock(UnifiedCompactionStrategy.class);
+        when(delegate.getNextBackgroundTasks(anyLong())).thenReturn(List.of());
+        when(delegate.getEstimatedRemainingTasks()).thenAnswer(invocation -> delegateEstimate.get());
+        when(delegate.getNextCompactionPick(anyLong())).thenAnswer(invocation -> {
+            delegateEstimate.set(7);                                 // UCS's own refresh point, modelled
+            return null;
+        });
+        ColumnFamilyStore cfs = mock(ColumnFamilyStore.class, Mockito.RETURNS_DEEP_STUBS);
+        stubTracker(cfs);
+        TimeSeriesCompactionStrategy tscs = new TimeSeriesCompactionStrategy(cfs, options(), delegate);
+
+        SSTableReader a = sstableAt(NOW - 10 * HOUR);
+        SSTableReader b = sstableAt(NOW - 10 * HOUR + 60_000);
+        setWindow(tscs, cfs, Set.of(a, b));
+
+        AbstractCompactionTask task = onlyTask(tscs.getNextBackgroundTasksAt(NOW, 0));
+        assertTrue(task instanceof FreezeCompactionTask);
+        // The round returned before the delegate, which is the whole point: it must still have refreshed.
+        verify(delegate, Mockito.never()).getNextBackgroundTasks(anyLong());
+        assertEquals(7 + 1, tscs.getEstimatedRemainingTasks());      // delegate 7 + freeze backlog 1
     }
 }

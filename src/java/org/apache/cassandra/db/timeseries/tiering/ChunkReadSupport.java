@@ -19,12 +19,13 @@
 package org.apache.cassandra.db.timeseries.tiering;
 
 import java.nio.ByteBuffer;
-import java.util.ArrayList;
-import java.util.Collections;
+import java.util.Arrays;
 import java.util.Iterator;
-import java.util.List;
+import java.util.NoSuchElementException;
 import java.util.Set;
 import java.util.TreeMap;
+
+import com.google.common.annotations.VisibleForTesting;
 
 import org.apache.cassandra.db.Clustering;
 import org.apache.cassandra.db.LivenessInfo;
@@ -110,14 +111,30 @@ import org.apache.cassandra.utils.btree.UpdateFunction;
  * <h2>Laziness</h2>
  * {@link #rowsFromChunk} hands back an {@link Iterator}, not a list, so a {@code LIMIT} satisfied
  * part-way through a window stops building rows for the rest of it (see {@link ChunkRowSource},
- * which stops pulling). Only the ascending case is genuinely lazy -- {@link ColumnarCursor} is
- * forward-only, so emitting newest-first needs every row of the window in hand.
+ * which stops pulling). <b>Neither direction builds a {@link Row} it does not emit.</b>
+ * <ul>
+ *   <li><b>Ascending</b> streams straight off the cursor: one {@code advance()} per row emitted.</li>
+ *   <li><b>Descending</b> cannot, because {@link ColumnarCursor} is forward-only: nothing in its
+ *       interface addresses a row by index or rewinds, so the last row of a window is reachable only
+ *       by walking to it. What the walk does <em>not</em> have to do is build rows. It captures each
+ *       in-range sample's timestamp and its already-decoded per-column values -- references the
+ *       cursor hands over, one array slot each -- and the {@code Row} itself (clustering, cells,
+ *       BTree) is assembled only when the iterator reaches that index, counting down. A
+ *       {@code LIMIT n} on a 3,600-sample window therefore assembles {@code n} rows rather than
+ *       3,600, and holds strictly less than the list of built rows this replaced.</li>
+ * </ul>
+ * The remaining per-window cost of a newest-first {@code LIMIT 1} is the capture walk and, ahead of
+ * it, {@link ColumnarChunkCodec#cursor}, which decodes every projected column of the whole payload
+ * before it returns. Both are linear in the window and neither can be avoided from here: the cursor
+ * would have to expose a row index (see the {@code descending} branch below) for a reverse read to
+ * touch only the rows it emits.
  * <p>
- * <b>This does not weaken the corrupt-chunk contract.</b> {@link ColumnarChunkCodec#cursor} parses
- * and decodes the <em>whole</em> payload (header, timestamps and every projected column's data
- * section) before it returns, so a corrupt or unreadable chunk throws out of the call below --
- * before a single row has been emitted. A window is therefore still all-or-nothing: the caller's
- * skip-and-warn cannot end up having already published a truncated prefix of it.
+ * <b>None of this weakens the corrupt-chunk contract.</b> That same eager
+ * {@link ColumnarChunkCodec#cursor} parse -- header, timestamps and every projected column's data
+ * section -- is what makes deferred assembly safe: a corrupt or unreadable chunk throws out of the
+ * call below, before a single row has been emitted, and assembling a row afterwards reads only
+ * primitive arrays that decoding already validated. A window is therefore still all-or-nothing: the
+ * caller's skip-and-warn cannot end up having already published a truncated prefix of it.
  */
 public final class ChunkReadSupport
 {
@@ -169,26 +186,132 @@ public final class ChunkReadSupport
 
         if (descending)
         {
-            // The cursor is forward-only, so newest-first is the one order that cannot be streamed:
-            // every row of this window has to be in hand before the first one can be emitted. Exactly
-            // what this method always did, kept bit-for-bit for the order it applies to.
-            List<Row> rows = new ArrayList<>();
-            Row row;
-            while ((row = assembler.next(startMsInclusive, endMsExclusive)) != null)
-                rows.add(row);
-            Collections.reverse(rows);
-            return rows.iterator();
+            // Newest-first is the one order that cannot be streamed off the cursor: ColumnarCursor
+            // is forward-only (advance() is its only positioning operation, and every accessor reads
+            // "the current row"), so the last in-range sample is reachable only by walking past all
+            // the others. The walk still has to happen -- what it no longer does is build a Row per
+            // step. It records each in-range sample's timestamp and its decoded values, and the rows
+            // themselves are assembled on demand, counting down; a LIMIT n assembles n of them.
+            //
+            // Were the cursor to expose the row index its implementation already keys on -- e.g.
+            // `int rowCount()` plus a value accessor taking a row -- even the capture walk would go
+            // away and a reverse read would touch only the rows it emits.
+            return new Descending(assembler, assembler.capture(startMsInclusive, endMsExclusive));
         }
 
-        return new AbstractIterator<Row>()
+        return new Ascending(assembler, startMsInclusive, endMsExclusive);
+    }
+
+    /**
+     * How many rows an iterator handed back by {@link #rowsFromChunk} has actually <em>built</em>.
+     * Nothing in production reads it: early termination is invisible in the rows themselves -- the
+     * same ones come back whether the rest of the window was assembled or not -- so this is the only
+     * honest way for a test to hold the laziness above to its word. Same role, one level down, as
+     * {@code ChunkRowSource.payloadReads}.
+     * <p>
+     * The count lives on the assembler, which is single-threaded by construction (one instance per
+     * {@code rowsFromChunk} call, wrapping a cursor with exactly one consumer), so it is a plain
+     * {@code long} rather than an atomic.
+     */
+    @VisibleForTesting
+    interface RowCounting extends Iterator<Row>
+    {
+        long rowsAssembled();
+    }
+
+    /** Oldest-first: one cursor step per row emitted, and nothing held between them. */
+    private static final class Ascending extends AbstractIterator<Row> implements RowCounting
+    {
+        private final RowAssembler assembler;
+        private final long startMsInclusive;
+        private final long endMsExclusive;
+
+        Ascending(RowAssembler assembler, long startMsInclusive, long endMsExclusive)
         {
-            @Override
-            protected Row computeNext()
-            {
-                Row row = assembler.next(startMsInclusive, endMsExclusive);
-                return row == null ? endOfData() : row;
-            }
-        };
+            this.assembler = assembler;
+            this.startMsInclusive = startMsInclusive;
+            this.endMsExclusive = endMsExclusive;
+        }
+
+        @Override
+        protected Row computeNext()
+        {
+            Row row = assembler.nextRow(startMsInclusive, endMsExclusive);
+            return row == null ? endOfData() : row;
+        }
+
+        @Override
+        public long rowsAssembled()
+        {
+            return assembler.assembled;
+        }
+    }
+
+    /**
+     * Newest-first: walks a {@link Captured} window backwards, assembling each row as it is asked
+     * for. Emits exactly what building every row and reversing the list did -- same rows, same
+     * order, same cells -- for the rows the consumer actually takes.
+     */
+    private static final class Descending implements RowCounting
+    {
+        private final RowAssembler assembler;
+        private final Captured captured;
+        /** Index of the row to emit next, counting down; negative once the window is exhausted. */
+        private int next;
+
+        Descending(RowAssembler assembler, Captured captured)
+        {
+            this.assembler = assembler;
+            this.captured = captured;
+            this.next = captured.count - 1;
+        }
+
+        @Override
+        public boolean hasNext()
+        {
+            return next >= 0;
+        }
+
+        @Override
+        public Row next()
+        {
+            if (next < 0)
+                throw new NoSuchElementException();
+            return assembler.assemble(captured, next--);
+        }
+
+        @Override
+        public long rowsAssembled()
+        {
+            return assembler.assembled;
+        }
+    }
+
+    /**
+     * One forward walk of a chunk, reduced to the least that lets any of its rows be rebuilt later:
+     * the in-range samples' timestamps, and their column values as the cursor handed them over.
+     * <p>
+     * {@link #values} is flat -- row {@code r}'s value for column {@code i} is at
+     * {@code r * stride + i} -- so capturing a row costs {@code stride} array stores and no
+     * allocation, where a built row costs a clustering, a cell per non-null column, a BTree and the
+     * row itself. The values are the same objects the cells would have wrapped (for a constant or
+     * dictionary-encoded column, the one array the decoder shares across every row), so this holds
+     * strictly less than the list of {@code Row}s it replaced.
+     */
+    private static final class Captured
+    {
+        private final long[] timestamps;
+        private final Object[] values;
+        private final int stride;
+        private final int count;
+
+        Captured(long[] timestamps, Object[] values, int stride, int count)
+        {
+            this.timestamps = timestamps;
+            this.values = values;
+            this.stride = stride;
+            this.count = count;
+        }
     }
 
     /**
@@ -202,13 +325,22 @@ public final class ChunkReadSupport
      */
     private static final class RowAssembler
     {
-        private final ColumnarCursor cursor;
+        /**
+         * Nulled once a {@link #capture} has walked it: that walk is the cursor's last use, and
+         * dropping it lets a whole window's decoded columns be collected while the reverse iterator
+         * built on the capture is still alive. Non-null for the whole life of an ascending read.
+         */
+        private ColumnarCursor cursor;
         /**
          * The same cursor's {@code byte[]} view, or {@code null} if it does not offer one. Optional
          * on purpose: the fast path is a representation choice, not a contract change, so a cursor
          * implementation without it still reads correctly through {@link ColumnarCursor#getBytes}.
+         * Released with {@link #cursor}, which is why the branch on it is {@link #byteArrayValues}
+         * and not a null check.
          */
-        private final ColumnarChunkCodec.ArrayValueCursor arrays;
+        private ColumnarChunkCodec.ArrayValueCursor arrays;
+        /** Whether values come from {@link #arrays} ({@code byte[]}) or the cursor ({@link ByteBuffer}). */
+        private final boolean byteArrayValues;
         /** Chunk column names, and the table columns they resolve to, in BTree (ColumnData) order. */
         private final String[] names;
         private final ColumnMetadata[] columns;
@@ -218,6 +350,14 @@ public final class ChunkReadSupport
          * input into the nodes it allocates, so nothing downstream can observe this array.
          */
         private final Object[] scratch;
+        /**
+         * The current cursor row's raw values, for the streaming path. A second array rather than
+         * {@link #scratch} because a build reads values out of one while writing cells into the
+         * other.
+         */
+        private final Object[] rowValues;
+        /** Rows built so far; see {@link RowCounting}. Single-threaded, hence not atomic. */
+        private long assembled;
         /**
          * False if any resolved column is complex, which forces the general builder. A chunk cannot
          * legally carry one -- {@link TieringPolicy#unsupportedSchemaError} refuses to tier a table
@@ -233,6 +373,7 @@ public final class ChunkReadSupport
             this.arrays = cursor instanceof ColumnarChunkCodec.ArrayValueCursor
                           ? (ColumnarChunkCodec.ArrayValueCursor) cursor
                           : null;
+            this.byteArrayValues = this.arrays != null;
             this.cellTimestamp = cellTimestamp;
 
             // Resolve the chunk's column names against the table once, not per row, and keep them in
@@ -253,6 +394,7 @@ public final class ChunkReadSupport
             this.columns = byColumn.keySet().toArray(new ColumnMetadata[0]);
             this.names = byColumn.values().toArray(new String[0]);
             this.scratch = new Object[this.columns.length];
+            this.rowValues = new Object[this.columns.length];
 
             boolean simple = true;
             for (ColumnMetadata column : this.columns)
@@ -266,20 +408,91 @@ public final class ChunkReadSupport
          *
          * @return that row, or {@code null} once the chunk is exhausted
          */
-        Row next(long startMsInclusive, long endMsExclusive)
+        Row nextRow(long startMsInclusive, long endMsExclusive)
+        {
+            if (!advanceToSample(startMsInclusive, endMsExclusive))
+                return null;
+            for (int i = 0; i < columns.length; i++)
+                rowValues[i] = valueOf(i);
+            return buildRow(clusteringAt(cursor.timestamp()), rowValues, 0);
+        }
+
+        /**
+         * Walks the rest of the chunk once, keeping what it takes to rebuild any of its in-range
+         * samples later but building none of them. The cursor is exhausted -- and released -- by the
+         * time this returns.
+         */
+        Captured capture(long startMsInclusive, long endMsExclusive)
+        {
+            int stride = columns.length;
+            // Grown by doubling rather than sized from the chunk's row count: a query whose range
+            // covers three samples of a 200,000-sample window must not pay for 200,000 slots. The
+            // ceiling is one reference per (in-range row, column) plus a long per row -- strictly
+            // less than the Row/Cell/BTree graph the eager build held for the same window, so no
+            // payload can overflow this that did not already exhaust the heap before.
+            int capacity = 16;
+            long[] timestamps = new long[capacity];
+            Object[] values = new Object[capacity * stride];
+            int count = 0;
+
+            while (advanceToSample(startMsInclusive, endMsExclusive))
+            {
+                if (count == capacity)
+                {
+                    capacity <<= 1;
+                    timestamps = Arrays.copyOf(timestamps, capacity);
+                    values = Arrays.copyOf(values, capacity * stride);
+                }
+                timestamps[count] = cursor.timestamp();
+                int base = count * stride;
+                for (int i = 0; i < stride; i++)
+                    values[base + i] = valueOf(i);
+                count++;
+            }
+
+            cursor = null;
+            arrays = null;
+            return new Captured(timestamps, values, stride, count);
+        }
+
+        /** Rebuilds the {@code index}-th captured sample. Identical to the row {@link #nextRow} would have built. */
+        Row assemble(Captured captured, int index)
+        {
+            return buildRow(clusteringAt(captured.timestamps[index]), captured.values, index * captured.stride);
+        }
+
+        /**
+         * Advances to the next sample inside {@code [startMsInclusive, endMsExclusive)}, skipping
+         * the ones outside it.
+         *
+         * @return false once the chunk is exhausted
+         */
+        private boolean advanceToSample(long startMsInclusive, long endMsExclusive)
         {
             while (cursor.advance())
             {
                 long ts = cursor.timestamp();
-                if (ts < startMsInclusive || ts >= endMsExclusive)
-                    continue;
-
-                // fromTimeInMillis is decompose(new Date(ts)) with the Date left out: a timestamp's
-                // serialized form IS the 8-byte epoch-millis long, so the bytes are the same ones.
-                Clustering<?> clustering = Clustering.make(TimestampType.instance.fromTimeInMillis(ts));
-                return allSimple ? buildRow(clustering) : buildViaBuilder(clustering);
+                if (ts >= startMsInclusive && ts < endMsExclusive)
+                    return true;
             }
-            return null;
+            return false;
+        }
+
+        private static Clustering<?> clusteringAt(long ts)
+        {
+            // fromTimeInMillis is decompose(new Date(ts)) with the Date left out: a timestamp's
+            // serialized form IS the 8-byte epoch-millis long, so the bytes are the same ones.
+            return Clustering.make(TimestampType.instance.fromTimeInMillis(ts));
+        }
+
+        /**
+         * @param values raw column values, flat, this row's starting at {@code base}
+         *               (see {@link Captured})
+         */
+        private Row buildRow(Clustering<?> clustering, Object[] values, int base)
+        {
+            assembled++;
+            return allSimple ? buildDirect(clustering, values, base) : buildViaBuilder(clustering, values, base);
         }
 
         /**
@@ -289,12 +502,12 @@ public final class ChunkReadSupport
          * which is what makes {@code minDeletionTime} an O(1) constant instead of an accumulate over
          * the tree. A chunk carries values only; it has no way to express a TTL or a tombstone.
          */
-        private Row buildRow(Clustering<?> clustering)
+        private Row buildDirect(Clustering<?> clustering, Object[] values, int base)
         {
             int n = 0;
             for (int i = 0; i < columns.length; i++)
             {
-                Cell<?> cell = cellFor(i);
+                Cell<?> cell = cellFor(i, values[base + i]);
                 if (cell != null)
                     scratch[n++] = cell;                  // null value: stays null, no cell emitted
             }
@@ -331,14 +544,14 @@ public final class ChunkReadSupport
         }
 
         /** The pre-existing path, kept verbatim for the complex-column case {@link #allSimple} guards. */
-        private Row buildViaBuilder(Clustering<?> clustering)
+        private Row buildViaBuilder(Clustering<?> clustering, Object[] values, int base)
         {
             Row.Builder builder = BTreeRow.unsortedBuilder();
             builder.newRow(clustering);
             boolean anyCell = false;
             for (int i = 0; i < columns.length; i++)
             {
-                Cell<?> cell = cellFor(i);
+                Cell<?> cell = cellFor(i, values[base + i]);
                 if (cell == null)
                     continue;
                 builder.addCell(cell);
@@ -350,21 +563,28 @@ public final class ChunkReadSupport
         }
 
         /**
-         * The current row's cell for column {@code i}, or {@code null} when the sample has no value
-         * there. {@link ArrayCell} over the decoder's {@code byte[]} rather than {@link BufferCell}
-         * over a {@link ByteBuffer}: the value is the same bytes either way, and the buffer was pure
-         * wrapper overhead on a path that only ever reads the value back out through a
-         * {@code ValueAccessor}.
+         * The current cursor row's raw value for column {@code i}, or {@code null} when the sample
+         * has no value there. Kept in the decoder's own representation until a cell is wanted for
+         * it, which is what lets a row be captured without being built.
          */
-        private Cell<?> cellFor(int i)
+        private Object valueOf(int i)
         {
-            if (arrays != null)
-            {
-                byte[] value = arrays.getByteArray(names[i]);
-                return value == null ? null : ArrayCell.live(columns[i], cellTimestamp, value, null);
-            }
-            ByteBuffer value = cursor.getBytes(names[i]);
-            return value == null ? null : BufferCell.live(columns[i], cellTimestamp, value);
+            return byteArrayValues ? arrays.getByteArray(names[i]) : cursor.getBytes(names[i]);
+        }
+
+        /**
+         * A cell over {@code value} as returned by {@link #valueOf}, or {@code null} for a value the
+         * sample does not have. {@link ArrayCell} over the decoder's {@code byte[]} rather than
+         * {@link BufferCell} over a {@link ByteBuffer}: the value is the same bytes either way, and
+         * the buffer was pure wrapper overhead on a path that only ever reads the value back out
+         * through a {@code ValueAccessor}.
+         */
+        private Cell<?> cellFor(int i, Object value)
+        {
+            if (value == null)
+                return null;
+            return byteArrayValues ? ArrayCell.live(columns[i], cellTimestamp, (byte[]) value, null)
+                                   : BufferCell.live(columns[i], cellTimestamp, (ByteBuffer) value);
         }
     }
 }

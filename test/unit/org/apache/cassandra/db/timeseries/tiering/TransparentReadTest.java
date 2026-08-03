@@ -20,12 +20,18 @@ package org.apache.cassandra.db.timeseries.tiering;
 
 import java.util.Collections;
 import java.util.Date;
+import java.util.HashMap;
 import java.util.Iterator;
+import java.util.Map;
 
 import org.junit.Test;
 
+import org.apache.cassandra.cql3.CQLStatement;
 import org.apache.cassandra.cql3.CQLTester;
+import org.apache.cassandra.cql3.QueryHandler;
+import org.apache.cassandra.cql3.QueryProcessor;
 import org.apache.cassandra.cql3.UntypedResultSet;
+import org.apache.cassandra.cql3.statements.SelectStatement;
 import org.apache.cassandra.db.DecoratedKey;
 import org.apache.cassandra.db.EmptyIterators;
 import org.apache.cassandra.db.SinglePartitionReadCommand;
@@ -726,6 +732,177 @@ public class TransparentReadTest extends CQLTester
         // row -- so the merge demonstrably runs on this query shape and the 1 above is termination.
         assertEquals(6, payloadReadsFor("SELECT meta FROM %s WHERE tag = 't1'"));
         assertEquals(18, execute("SELECT meta FROM %s WHERE tag = 't1'").size());
+    }
+
+    /**
+     * @return the chunk-table statements {@code ks.chunkTable} currently has in {@link QueryProcessor}'s
+     *         internal-statement cache, keyed by their CQL text. Reading the cache rather than a
+     *         counter of our own is the point: it is upstream's cache, upstream's key, and upstream's
+     *         schema-change invalidation, so what this asserts is that the chunk statements really are
+     *         being shared -- not that {@code ChunkRowSource} says they are.
+     */
+    private static Map<String, CQLStatement> cachedChunkStatements(String chunkTable)
+    {
+        Map<String, CQLStatement> statements = new HashMap<>();
+        for (Map.Entry<String, QueryHandler.Prepared> entry : QueryProcessor.getInternalStatements().entrySet())
+        {
+            CQLStatement statement = entry.getValue().statement;
+            if (statement instanceof SelectStatement
+                && KEYSPACE.equals(((SelectStatement) statement).keyspace())
+                && chunkTable.equals(((SelectStatement) statement).table()))
+                statements.put(entry.getKey(), statement);
+        }
+        return statements;
+    }
+
+    /**
+     * A tiered read runs two CQL statements per window-bearing partition -- the window listing and one
+     * payload fetch per window decoded -- and both used to be handed to {@code QueryProcessor} as
+     * <b>strings</b>: {@code QueryProcessor.process(String, ConsistencyLevel, List)} calls
+     * {@code parse()} on its way in, and {@code TieredStorageService.pagedSelectLazy} calls it once per
+     * page. So every payload fetch re-ran ANTLR over the query text and re-prepared the statement --
+     * preparation cost {@code O(windows decoded)} per query, on the consistency-level path that every
+     * user SELECT takes, for two statements whose text never changes.
+     * <p>
+     * This has to be measured on the <b>network</b> path. The {@code cl == null} local path executes
+     * through {@code executeInternal}, which has always resolved through the internal-statement cache,
+     * so every other counter test in this class was already looking at the fixed half.
+     * <p>
+     * Nothing about the results changes when this is fixed -- the same rows come back -- which is why
+     * counting is the only way to hold it.
+     */
+    @Test
+    public void chunkStatementsArePreparedOncePerQueryNotOncePerWindow() throws Throwable
+    {
+        requireNetwork();
+        loadSixWindowsAndReencode();
+        String chunkTable = ChunkTables.chunkTableName(currentTable());
+
+        // From here on, every chunk statement in the internal cache was put there by the read below.
+        QueryProcessor.clearInternalStatementsCache();
+
+        long preparationsBefore = ChunkRowSource.statementPreparations.get();
+        long payloadsBefore = ChunkRowSource.payloadReads.get();
+        assertEquals(19, executeNet("SELECT value FROM %s WHERE tag = 't1'").all().size());
+        long payloads = ChunkRowSource.payloadReads.get() - payloadsBefore;
+        long preparations = ChunkRowSource.statementPreparations.get() - preparationsBefore;
+
+        // The shape this test needs: a full scan of one partition, decoding all six windows. Before
+        // the fix that was seven statement preparations (one listing + six payloads); the count must
+        // now depend on how many DISTINCT statements the query has, not on how many windows it reads.
+        assertEquals("the read must decode every window, or it is not the shape this test needs", 6, payloads);
+        assertEquals("one window statement and one payload statement for the whole query, "
+                     + "not one per window", 2, preparations);
+
+        // ...and the preparations above parsed nothing that was not new: both statements are in the
+        // process-wide internal-statement cache. This is the assertion that fails outright on the old
+        // code, which parsed through QueryProcessor.instance.parse and cached nothing at all.
+        Map<String, CQLStatement> cached = cachedChunkStatements(chunkTable);
+        assertEquals("a CL-path tiered read must leave its two chunk statements in the internal-statement "
+                     + "cache: " + cached.keySet(), 2, cached.size());
+
+        // The second query proves the cache is actually load-bearing: same statement OBJECTS, so the
+        // ANTLR parse happened once for this process, not once per query and certainly not per window.
+        preparationsBefore = ChunkRowSource.statementPreparations.get();
+        assertEquals(19, executeNet("SELECT value FROM %s WHERE tag = 't1'").all().size());
+        assertEquals(2, ChunkRowSource.statementPreparations.get() - preparationsBefore);
+        Map<String, CQLStatement> reused = cachedChunkStatements(chunkTable);
+        assertEquals(cached.keySet(), reused.keySet());
+        for (Map.Entry<String, CQLStatement> entry : cached.entrySet())
+            assertSame("a second identical query must reuse the prepared statement, not re-parse it: "
+                       + entry.getKey(), entry.getValue(), reused.get(entry.getKey()));
+    }
+
+    /**
+     * The same invariant across partitions, which is where "prepared once" could most easily have been
+     * faked by a per-source field alone. The coordinator resolves one partition at a time, so an
+     * {@code IN} over two tags builds two {@link ChunkRowSource}s -- but they share the process-wide
+     * cache, so two partitions x six windows is four statement resolutions and <b>zero</b> parses
+     * beyond the first query's, where it used to be fourteen parses.
+     */
+    @Test
+    public void chunkStatementsAreSharedAcrossPartitionsAndQueries() throws Throwable
+    {
+        requireNetwork();
+        createTable("CREATE TABLE %s (tag text, ts timestamp, value double, PRIMARY KEY (tag, ts))");
+        setPolicy("{\"hot_window\":\"2h\",\"chunk_window\":\"1h\"}");
+        long writetime = 100L;
+        for (String tag : new String[]{ "t1", "t2" })
+        {
+            for (int window = 0; window < 6; window++)
+                for (int sample = 0; sample < 3; sample++)
+                    execute("INSERT INTO %s (tag, ts, value) VALUES (?, ?, ?) USING TIMESTAMP ?",
+                            tag, new Date(window * HOUR + sample * 10 * 60_000L),
+                            window * 10.0 + sample, writetime++);
+            // One hot row per tag, so both partitions exist on the hot side too -- the same shape
+            // loadSixWindowsAndReencode builds, and not the untested "partition is cold-only" one.
+            execute("INSERT INTO %s (tag, ts, value) VALUES (?, ?, 99.0) USING TIMESTAMP 200",
+                    tag, new Date(7 * HOUR + 10 * 60_000L));
+        }
+        assertEquals(12L, new TieredStorageService().runOnce(KEYSPACE, currentTable(), 9 * HOUR).windowsEncoded);
+        String chunkTable = ChunkTables.chunkTableName(currentTable());
+
+        QueryProcessor.clearInternalStatementsCache();
+
+        long preparationsBefore = ChunkRowSource.statementPreparations.get();
+        long payloadsBefore = ChunkRowSource.payloadReads.get();
+        assertEquals(38, executeNet("SELECT value FROM %s WHERE tag IN ('t1', 't2')").all().size());
+        assertEquals("both partitions' windows must be decoded, or this is not a two-partition read",
+                     12, ChunkRowSource.payloadReads.get() - payloadsBefore);
+        // A bound rather than an equality, because how many sources the read builds is the read
+        // path's business: the coordinator resolves a partition at a time (two sources, two
+        // statements each), the local path resolves the group at once (one source). Either is at
+        // most four. What must never come back is a count that tracks the twelve windows -- the old
+        // code prepared fourteen statements here.
+        long preparations = ChunkRowSource.statementPreparations.get() - preparationsBefore;
+        assertTrue("statement preparations must scale with partitions read, not with the 12 windows "
+                   + "decoded, but was " + preparations, preparations <= 4);
+        // Two distinct statement texts for the whole thing: the tag is a bind value, not part of the CQL.
+        Map<String, CQLStatement> cached = cachedChunkStatements(chunkTable);
+        assertEquals("the partition key is bound, so both partitions share one pair of statements: "
+                     + cached.keySet(), 2, cached.size());
+
+        // A newest-first LIMIT is the shape the benchmark measures, and the one the lazy window
+        // listing exists for: one window listed, one payload read -- and no new statement parsed.
+        long windowsBefore = ChunkRowSource.windowRowsListed.get();
+        payloadsBefore = ChunkRowSource.payloadReads.get();
+        assertEquals(2, executeNet("SELECT value FROM %s WHERE tag = 't1' ORDER BY ts DESC LIMIT 2").all().size());
+        assertEquals("the lazy newest-first listing must still stop at one window",
+                     1, ChunkRowSource.windowRowsListed.get() - windowsBefore);
+        assertEquals(1, ChunkRowSource.payloadReads.get() - payloadsBefore);
+        // The newest-first listing is a third statement text (it carries ORDER BY window_start DESC);
+        // the payload statement and the ascending listing are the ones already prepared, reused.
+        Map<String, CQLStatement> afterDescending = cachedChunkStatements(chunkTable);
+        assertEquals("a newest-first read adds its own listing text and nothing else: "
+                     + afterDescending.keySet(), 3, afterDescending.size());
+        for (Map.Entry<String, CQLStatement> entry : cached.entrySet())
+            assertSame("the descending listing has its own text, but everything else is reused: "
+                       + entry.getKey(), entry.getValue(), afterDescending.get(entry.getKey()));
+    }
+
+    /**
+     * The cache must not outlive the table it was prepared against. This is the reason
+     * {@link ChunkRowSource} reuses {@code QueryProcessor.prepareInternal} instead of keeping a cache
+     * of its own: dropping the chunk table has to evict the statements, or a chunk table that is
+     * dropped and recreated would be read through a statement prepared against the old one. The
+     * eviction is upstream's {@code StatementInvalidatingListener}; this asserts that the chunk
+     * statements are in fact subject to it.
+     */
+    @Test
+    public void droppingTheChunkTableEvictsItsPreparedStatements() throws Throwable
+    {
+        requireNetwork();
+        loadSixWindowsAndReencode();
+        String chunkTable = ChunkTables.chunkTableName(currentTable());
+
+        QueryProcessor.clearInternalStatementsCache();
+        assertEquals(19, executeNet("SELECT value FROM %s WHERE tag = 't1'").all().size());
+        assertEquals(2, cachedChunkStatements(chunkTable).size());
+
+        schemaChange("DROP TABLE " + KEYSPACE + '.' + chunkTable);
+        assertTrue("statements prepared against a dropped chunk table must not survive it: "
+                   + cachedChunkStatements(chunkTable).keySet(),
+                   cachedChunkStatements(chunkTable).isEmpty());
     }
 
     /** @return what {@link TransparentReads#maybeWrap} does to {@code hot} for a full-partition read of 't1'. */

@@ -798,7 +798,7 @@ public class TieredStorageServiceTest extends CQLTester
         for (int i = 0; i < count; i++)
             cells[i] = DoubleType.instance.decompose(values[i]);
         SortedMap<String, ColumnarChunkCodec.ColumnInput> columns = new TreeMap<>();
-        columns.put("value", new ColumnarChunkCodec.ColumnInput(ColumnarChunkCodec.TYPE_DOUBLE_CHIMP, cells));
+        columns.put("value", new ColumnarChunkCodec.ColumnInput(ColumnarChunkCodec.TYPE_DOUBLE_ALP, cells));
         return ColumnarChunkCodec.encode(timestamps, count, columns);
     }
 

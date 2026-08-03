@@ -23,8 +23,12 @@ import java.util.ArrayList;
 import java.util.Date;
 import java.util.Iterator;
 import java.util.List;
+import java.util.NoSuchElementException;
+import java.util.Set;
 import java.util.SortedMap;
 import java.util.TreeMap;
+
+import com.google.common.collect.ImmutableSet;
 
 import org.junit.BeforeClass;
 import org.junit.Test;
@@ -36,7 +40,9 @@ import org.apache.cassandra.db.marshal.TimestampType;
 import org.apache.cassandra.db.marshal.UTF8Type;
 import org.apache.cassandra.db.rows.Cell;
 import org.apache.cassandra.db.rows.Row;
+import org.apache.cassandra.db.timeseries.Chimp128Codec;
 import org.apache.cassandra.db.timeseries.ColumnarChunkCodec;
+import org.apache.cassandra.db.timeseries.UnsupportedChunkFormatException;
 import org.apache.cassandra.dht.Murmur3Partitioner;
 import org.apache.cassandra.schema.ColumnMetadata;
 import org.apache.cassandra.schema.TableMetadata;
@@ -95,7 +101,7 @@ public class ChunkReadSupportTest
             values[i] = DoubleType.instance.decompose(20.0 + i * 0.1);
         }
         SortedMap<String, ColumnarChunkCodec.ColumnInput> columns = new TreeMap<>();
-        columns.put("value", new ColumnarChunkCodec.ColumnInput(ColumnarChunkCodec.TYPE_DOUBLE_CHIMP, values));
+        columns.put("value", new ColumnarChunkCodec.ColumnInput(ColumnarChunkCodec.TYPE_DOUBLE_ALP, values));
         return ColumnarChunkCodec.encode(ts, count, columns);
     }
 
@@ -170,6 +176,28 @@ public class ChunkReadSupportTest
         assertEquals(5, rows.size());
         assertRow(rows.get(0), BASE + 4000, 20.4);
         assertRow(rows.get(4), BASE, 20.0);
+        // Every row, not just the ends: newest-first is assembled back-to-front from a captured
+        // window rather than built forwards and reversed, so an off-by-one in the walk would show up
+        // in the middle while both ends still looked right.
+        for (int i = 0; i < 5; i++)
+            assertRow(rows.get(i), BASE + (4 - i) * 1000L, 20.0 + (4 - i) * 0.1);
+    }
+
+    @Test
+    public void reversedOverAnEmptyRangeIsExhaustedImmediately()
+    {
+        Iterator<Row> rows = ChunkReadSupport.rowsFromChunk(metadata, chunk(10, 1000), WRITETIME,
+                                                            BASE + 100_000, BASE + 200_000, true, null);
+        assertFalse(rows.hasNext());
+        try
+        {
+            rows.next();
+            fail("expected NoSuchElementException from an exhausted descending iterator");
+        }
+        catch (NoSuchElementException expected)
+        {
+            // the hand-written reverse iterator must end like the list iterator it replaced
+        }
     }
 
     @Test
@@ -180,7 +208,7 @@ public class ChunkReadSupportTest
         // NO cell rather than a zero/empty one.
         long[] ts = { BASE, BASE + 1000, BASE + 2000 };
         SortedMap<String, ColumnarChunkCodec.ColumnInput> columns = new TreeMap<>();
-        columns.put("value", new ColumnarChunkCodec.ColumnInput(ColumnarChunkCodec.TYPE_DOUBLE_CHIMP,
+        columns.put("value", new ColumnarChunkCodec.ColumnInput(ColumnarChunkCodec.TYPE_DOUBLE_ALP,
                                                                 new ByteBuffer[]{ DoubleType.instance.decompose(1.5),
                                                                                   null,
                                                                                   DoubleType.instance.decompose(2.5) }));
@@ -220,7 +248,7 @@ public class ChunkReadSupportTest
         // would be indistinguishable from a row that never existed.
         long[] ts = { BASE };
         SortedMap<String, ColumnarChunkCodec.ColumnInput> columns = new TreeMap<>();
-        columns.put("value", new ColumnarChunkCodec.ColumnInput(ColumnarChunkCodec.TYPE_DOUBLE_CHIMP,
+        columns.put("value", new ColumnarChunkCodec.ColumnInput(ColumnarChunkCodec.TYPE_DOUBLE_ALP,
                                                                 new ByteBuffer[]{ null }));
 
         List<Row> rows = decode(ColumnarChunkCodec.encode(ts, 1, columns));
@@ -238,7 +266,7 @@ public class ChunkReadSupportTest
         // there is nowhere to put its cells. It must be dropped silently, not fail the read.
         long[] ts = { BASE };
         SortedMap<String, ColumnarChunkCodec.ColumnInput> columns = new TreeMap<>();
-        columns.put("value", new ColumnarChunkCodec.ColumnInput(ColumnarChunkCodec.TYPE_DOUBLE_CHIMP,
+        columns.put("value", new ColumnarChunkCodec.ColumnInput(ColumnarChunkCodec.TYPE_DOUBLE_ALP,
                                                                 new ByteBuffer[]{ DoubleType.instance.decompose(7.5) }));
         columns.put("gone", new ColumnarChunkCodec.ColumnInput(ColumnarChunkCodec.TYPE_TEXT,
                                                                new ByteBuffer[]{ UTF8Type.instance.decompose("x") }));
@@ -254,22 +282,266 @@ public class ChunkReadSupportTest
      * <b>out of the call itself</b>, not out of the returned iterator. That is what keeps a corrupt
      * window all-or-nothing now that rows are built lazily: if the failure could surface mid-iteration
      * the caller's "skip this window" would have already published a truncated prefix of it.
+     * <p>
+     * Both directions and both shapes of corruption, because laziness moved for both: a header that
+     * names no known format is caught by the first bytes {@code ColumnarChunkCodec.cursor} looks at,
+     * while a payload whose data sections do not fit is only caught once the cursor has walked the
+     * directory and the timestamp stream -- and that whole-payload decode is precisely what makes it
+     * safe to defer building the rows.
      */
     @Test
     public void corruptPayloadThrowsBeforeTheFirstRowIsEmitted()
     {
-        ByteBuffer payload = chunk(10, 1000);
-        ByteBuffer corrupt = payload.duplicate();
-        corrupt.put(0, (byte) 99);                                   // unknown version byte
+        ByteBuffer unknownVersion = chunk(10, 1000).duplicate();
+        unknownVersion.put(0, (byte) 99);                            // names no known chunk format
+
+        ByteBuffer truncated = chunk(10, 1000).duplicate();
+        truncated.limit(truncated.limit() - 8);                      // data sections now overrun it
+
+        for (boolean descending : new boolean[]{ false, true })
+        {
+            assertFailsFromTheCall(unknownVersion, descending, IllegalArgumentException.class);
+            assertFailsFromTheCall(truncated, descending, IllegalArgumentException.class);
+        }
+    }
+
+    /**
+     * The one failure a caller must never swallow (see {@code ChunkRowSource}): it is systematic, so
+     * skipping it would silently truncate history on every read. Deferring row assembly must not let
+     * it turn into anything else, in either direction.
+     */
+    @Test
+    public void anUnsupportedFormatPropagatesFromTheCall()
+    {
+        ByteBuffer payload = chunk(10, 1000).duplicate();
+        payload.put(0, Chimp128Codec.VERSION);        // a known chunk format, but not this decoder's
+
+        for (boolean descending : new boolean[]{ false, true })
+            assertFailsFromTheCall(payload, descending, UnsupportedChunkFormatException.class);
+    }
+
+    private static void assertFailsFromTheCall(ByteBuffer payload, boolean descending,
+                                               Class<? extends RuntimeException> expected)
+    {
+        String what = expected.getSimpleName() + (descending ? " (descending)" : " (ascending)");
         try
         {
-            Iterator<Row> rows = ChunkReadSupport.rowsFromChunk(metadata, corrupt, WRITETIME,
-                                                               Long.MIN_VALUE, Long.MAX_VALUE, false, null);
-            fail("expected IllegalArgumentException from the call, got an iterator: " + rows);
+            Iterator<Row> rows = ChunkReadSupport.rowsFromChunk(metadata, payload, WRITETIME,
+                                                                Long.MIN_VALUE, Long.MAX_VALUE, descending, null);
+            fail("expected " + what + " from the call, got an iterator: " + rows);
         }
-        catch (IllegalArgumentException expected)
+        catch (RuntimeException e)
         {
             // the point: thrown by rowsFromChunk, not by a later hasNext()/next()
+            if (!expected.isInstance(e))
+                throw new AssertionError("expected " + what + ", got " + e, e);
         }
+    }
+
+    // ---------------------------------------------------------------------------------------------
+    // Laziness. rowsFromChunk builds a Row only for the samples the consumer actually takes, in both
+    // directions -- which is invisible in the rows themselves, so these assert on the assembler's own
+    // count (ChunkReadSupport.RowCounting).
+    // ---------------------------------------------------------------------------------------------
+
+    /**
+     * The fix this suite exists for. A newest-first {@code LIMIT 1} over a window used to decode,
+     * build and reverse every row in it; against the eager implementation the first assertion below
+     * reports 1,000 instead of 1.
+     * <p>
+     * The reverse walk is not free -- {@link org.apache.cassandra.db.timeseries.ColumnarCursor} is
+     * forward-only, so the samples still have to be walked past to reach the newest one -- but
+     * walking is array reads, and what is asserted here is that no {@code Row}, clustering, cell or
+     * BTree is built for a sample that is never emitted.
+     */
+    @Test
+    public void descendingBuildsOnlyTheRowsItEmits()
+    {
+        ChunkReadSupport.RowCounting rows = counting(chunk(1000, 1000), Long.MIN_VALUE, Long.MAX_VALUE, true);
+
+        assertEquals("no row may be built before the first pull", 0, rows.rowsAssembled());
+        assertTrue(rows.hasNext());
+        assertEquals("hasNext() must not build a row either", 0, rows.rowsAssembled());
+
+        assertRow(rows.next(), BASE + 999_000, 20.0 + 999 * 0.1);
+        assertEquals("a newest-first LIMIT 1 must cost exactly one row", 1, rows.rowsAssembled());
+
+        assertRow(rows.next(), BASE + 998_000, 20.0 + 998 * 0.1);
+        assertEquals(2, rows.rowsAssembled());
+
+        // ...and the window is still whole: taking the rest builds the rest, exactly once each.
+        int taken = 2;
+        while (rows.hasNext())
+        {
+            rows.next();
+            taken++;
+        }
+        assertEquals(1000, taken);
+        assertEquals(1000, rows.rowsAssembled());
+    }
+
+    /** The same guarantee for the streaming direction, which has always had it. */
+    @Test
+    public void ascendingBuildsOnlyTheRowsItEmits()
+    {
+        ChunkReadSupport.RowCounting rows = counting(chunk(1000, 1000), Long.MIN_VALUE, Long.MAX_VALUE, false);
+
+        assertEquals("no row may be built before the first pull", 0, rows.rowsAssembled());
+        assertRow(rows.next(), BASE, 20.0);
+        assertEquals("an oldest-first LIMIT 1 must cost exactly one row", 1, rows.rowsAssembled());
+    }
+
+    /**
+     * Samples outside {@code [startMs, endMs)} must not be built either, in either direction: the
+     * range filter runs on the walk, ahead of assembly, so a narrow range over a wide window costs
+     * the rows it selects and no others.
+     */
+    @Test
+    public void outOfRangeSamplesAreNeverBuilt()
+    {
+        for (boolean descending : new boolean[]{ false, true })
+        {
+            ChunkReadSupport.RowCounting rows = counting(chunk(1000, 1000), BASE + 10_000, BASE + 13_000, descending);
+            assertEquals(3, list(rows).size());
+            assertEquals("direction " + descending, 3, rows.rowsAssembled());
+        }
+    }
+
+    private static ChunkReadSupport.RowCounting counting(ByteBuffer payload, long startMs, long endMsExcl,
+                                                         boolean descending)
+    {
+        return (ChunkReadSupport.RowCounting) ChunkReadSupport.rowsFromChunk(metadata, payload, WRITETIME,
+                                                                            startMs, endMsExcl, descending, null);
+    }
+
+    // ---------------------------------------------------------------------------------------------
+    // Round-trip equality: whatever the two directions do internally, one must be the other reversed.
+    // ---------------------------------------------------------------------------------------------
+
+    /**
+     * A window with holes in two columns, samples with no value at all, a column the table has since
+     * dropped, and a range that selects only part of it -- decoded both ways. Descending must be the
+     * exact reverse of ascending, row for row and cell for cell.
+     * <p>
+     * The sizes straddle the growth points of the capture buffer the reverse walk fills (it starts at
+     * 16 slots and doubles), and 1 sample with the range below selecting none of it covers the empty
+     * case.
+     */
+    @Test
+    public void descendingIsTheExactReverseOfAscending()
+    {
+        for (int count : new int[]{ 1, 15, 16, 17, 33, 1000 })
+            assertMirrored(mixedChunk(count), BASE + 3_000, BASE + 40_000, null, "count " + count);
+    }
+
+    /** The same, decoding only some of the columns: projection must not skew either direction. */
+    @Test
+    public void descendingIsTheExactReverseOfAscendingUnderProjection()
+    {
+        ByteBuffer payload = mixedChunk(200);
+        assertMirrored(payload, BASE + 3_000, BASE + 40_000, ImmutableSet.of("value"), "one column");
+        assertMirrored(payload, BASE + 3_000, BASE + 40_000, ImmutableSet.of("value", "label"), "two columns");
+        // Nothing the table still has: every row falls back to primary-key liveness, both ways.
+        assertMirrored(payload, BASE + 3_000, BASE + 40_000, ImmutableSet.of("gone"), "only a dropped column");
+    }
+
+    /**
+     * Every column the chunk carries has been dropped from the table, so no row has a cell to build
+     * and the reverse walk captures timestamps only. The rows must still come back -- newest first,
+     * live, and one per sample -- because their existence is exactly what tiering chunked them for.
+     */
+    @Test
+    public void descendingSurvivesAChunkWhoseColumnsWereAllDropped()
+    {
+        long[] ts = new long[20];                                    // > 16, so the capture buffer grows
+        ByteBuffer[] gone = new ByteBuffer[20];
+        for (int i = 0; i < 20; i++)
+        {
+            ts[i] = BASE + i * 1000L;
+            gone[i] = UTF8Type.instance.decompose("g" + i);
+        }
+        SortedMap<String, ColumnarChunkCodec.ColumnInput> columns = new TreeMap<>();
+        columns.put("gone", new ColumnarChunkCodec.ColumnInput(ColumnarChunkCodec.TYPE_TEXT, gone));
+        ByteBuffer payload = ColumnarChunkCodec.encode(ts, 20, columns);
+
+        List<Row> rows = list(ChunkReadSupport.rowsFromChunk(metadata, payload, WRITETIME,
+                                                             Long.MIN_VALUE, Long.MAX_VALUE, true, null));
+        assertEquals(20, rows.size());
+        for (int i = 0; i < 20; i++)
+        {
+            Row row = rows.get(i);
+            assertEquals(TimestampType.instance.decompose(new Date(BASE + (19 - i) * 1000L)),
+                         row.clustering().bufferAt(0));
+            assertEquals(0, row.columnCount());
+            assertFalse("a row with no buildable cells must still be live", row.isEmpty());
+            assertEquals(CELL_WRITETIME, row.primaryKeyLivenessInfo().timestamp());
+        }
+        assertMirrored(payload, Long.MIN_VALUE, Long.MAX_VALUE, null, "all columns dropped");
+    }
+
+    private static void assertMirrored(ByteBuffer payload, long startMs, long endMsExcl,
+                                       Set<String> projection, String what)
+    {
+        List<Row> ascending = list(ChunkReadSupport.rowsFromChunk(metadata, payload, WRITETIME,
+                                                                  startMs, endMsExcl, false, projection));
+        List<Row> descending = list(ChunkReadSupport.rowsFromChunk(metadata, payload, WRITETIME,
+                                                                   startMs, endMsExcl, true, projection));
+        assertEquals(what + ": row count", ascending.size(), descending.size());
+        for (int i = 0; i < ascending.size(); i++)
+        {
+            Row expected = ascending.get(ascending.size() - 1 - i);
+            Row actual = descending.get(i);
+            String where = what + ", descending row " + i;
+            // Spelled out before the whole-row comparison so a failure names what differs.
+            assertEquals(where + ": clustering", expected.clustering().bufferAt(0), actual.clustering().bufferAt(0));
+            assertEquals(where + ": cell count", expected.columnCount(), actual.columnCount());
+            assertEquals(where + ": primary key liveness",
+                         expected.primaryKeyLivenessInfo(), actual.primaryKeyLivenessInfo());
+            for (ColumnMetadata column : new ColumnMetadata[]{ valueColumn, qualityColumn, labelColumn })
+            {
+                Cell<?> expectedCell = expected.getCell(column);
+                Cell<?> actualCell = actual.getCell(column);
+                if (expectedCell == null)
+                {
+                    assertNull(where + ": " + column.name + " must have no cell", actualCell);
+                    continue;
+                }
+                assertNotNull(where + ": " + column.name + " lost its cell", actualCell);
+                assertEquals(where + ": " + column.name, expectedCell.buffer(), actualCell.buffer());
+                assertEquals(where + ": " + column.name + " writetime",
+                             expectedCell.timestamp(), actualCell.timestamp());
+            }
+            assertEquals(where, expected, actual);
+        }
+    }
+
+    /**
+     * A window that exercises what the two directions have to agree on: holes in a fixed-width and a
+     * variable-width column, samples with nothing on them at all (which decode to a live row with no
+     * cells), a low-cardinality text column (dictionary-encoded, so its values are arrays the decoder
+     * shares between rows), and a column the table has dropped since the chunk was written.
+     */
+    private static ByteBuffer mixedChunk(int count)
+    {
+        long[] ts = new long[count];
+        ByteBuffer[] values = new ByteBuffer[count];
+        ByteBuffer[] qualities = new ByteBuffer[count];
+        ByteBuffer[] labels = new ByteBuffer[count];
+        ByteBuffer[] gone = new ByteBuffer[count];
+        for (int i = 0; i < count; i++)
+        {
+            ts[i] = BASE + i * 1000L;
+            boolean bare = i % 7 == 3;                     // no value on any column the table has
+            values[i] = bare || i % 3 == 0 ? null : DoubleType.instance.decompose(20.0 + i * 0.1);
+            qualities[i] = bare || i % 4 == 1 ? null : Int32Type.instance.decompose(i);
+            labels[i] = bare ? null : UTF8Type.instance.decompose(i % 5 == 0 ? "" : "l" + (i % 3));
+            gone[i] = UTF8Type.instance.decompose("dropped");
+        }
+        SortedMap<String, ColumnarChunkCodec.ColumnInput> columns = new TreeMap<>();
+        columns.put("value", new ColumnarChunkCodec.ColumnInput(ColumnarChunkCodec.TYPE_DOUBLE_ALP, values));
+        columns.put("quality", new ColumnarChunkCodec.ColumnInput(ColumnarChunkCodec.TYPE_INT32, qualities));
+        columns.put("label", new ColumnarChunkCodec.ColumnInput(ColumnarChunkCodec.TYPE_TEXT, labels));
+        columns.put("gone", new ColumnarChunkCodec.ColumnInput(ColumnarChunkCodec.TYPE_TEXT, gone));
+        return ColumnarChunkCodec.encode(ts, count, columns);
     }
 }

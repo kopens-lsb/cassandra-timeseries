@@ -38,8 +38,10 @@ import org.apache.cassandra.db.timeseries.ColumnarChunkCodec;
  * {@code ByteBuffer} Cassandra stored, so nothing here needs to know how a type is composed or
  * decomposed, and a column decoded out of a chunk is byte-identical to the cell that went in:
  * <ul>
- *   <li>{@code double} -> {@link ColumnarChunkCodec#TYPE_DOUBLE_CHIMP} (8-byte IEEE-754 payload,
- *       fed through the chimp128 value stream)</li>
+ *   <li>{@code double} -> {@link ColumnarChunkCodec#TYPE_DOUBLE_ALP} (8-byte IEEE-754 payload, fed
+ *       through ALP, which encodes decimal-like values as scaled integers and everything else --
+ *       including {@code -0.0}, NaN payloads, the infinities and subnormals -- either as verbatim
+ *       exceptions or through its ALP-RD bit-split variant; lossless for every bit pattern)</li>
  *   <li>{@code boolean} -> {@link ColumnarChunkCodec#TYPE_BOOLEAN} (1 byte, bit-packed)</li>
  *   <li>{@code int} and {@code date} -> {@link ColumnarChunkCodec#TYPE_INT32} (both are exactly 4
  *       bytes big-endian; {@code date} is an <em>unsigned</em> day count, so it is read back as a
@@ -87,7 +89,7 @@ public final class ChunkColumnTypes
     {
         AbstractType<?> unwrapped = type.unwrap();
         if (unwrapped instanceof DoubleType)
-            return ColumnarChunkCodec.TYPE_DOUBLE_CHIMP;
+            return ColumnarChunkCodec.TYPE_DOUBLE_ALP;
         if (unwrapped instanceof BooleanType)
             return ColumnarChunkCodec.TYPE_BOOLEAN;
         if (unwrapped instanceof Int32Type || unwrapped instanceof SimpleDateType)

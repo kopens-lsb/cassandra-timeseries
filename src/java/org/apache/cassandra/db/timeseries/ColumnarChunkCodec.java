@@ -45,8 +45,17 @@ import org.apache.cassandra.utils.ByteArrayUtil;
  * Per-column encoding is picked to make constant and all-null columns cost O(1) bytes regardless
  * of row count: a column whose present values are all identical stores the value once in the
  * directory (0-byte data section); a column with no present values at all stores nothing. Double
- * columns use {@link Chimp128Codec}'s value-only stream; text/opaque columns dictionary-encode
- * when at most 256 distinct present values occur, else fall back to length-prefixed raw bytes.
+ * columns use {@link AlpCodec} (which internally picks between decimal ALP and ALP-RD, both
+ * lossless, and records which in the section); text/opaque columns dictionary-encode when at most
+ * 256 distinct present values occur, else fall back to length-prefixed raw bytes.
+ * <p>
+ * <b>Doubles travel as raw bit patterns, never as {@code double}s.</b> A double cell's serialized
+ * form is its 8 big-endian IEEE-754 bytes, and that is what the encoder reads
+ * ({@code ByteBuffer.getLong}) and what the decoder hands back ({@link ByteArrayUtil#bytes(long)}).
+ * Nothing on the path calls {@code Double.longBitsToDouble} as a way of <em>carrying</em> a value,
+ * so no NaN payload can be quietly canonicalised in transit and no {@code -0.0} can be flattened;
+ * {@link AlpCodec} views the bits as a number only inside its own arithmetic, whose result it
+ * verifies against the original pattern.
  * <p>
  * Layout: {@code HEADER_SIZE}-byte header (version, row count, first/last timestamp, column
  * count, directory size) -- column directory (one entry per column, sorted by name) -- null
@@ -96,12 +105,36 @@ public final class ColumnarChunkCodec
      */
     static final byte TYPE_DOUBLE_GORILLA_REMOVED = 0x00;
 
-    public static final byte TYPE_DOUBLE_CHIMP = 0x01;
+    /**
+     * Type code {@code 0x01} was DOUBLE_CHIMP, dropped when {@link AlpCodec} became the only double
+     * encoding. Permanently reserved for the same reason as {@link #TYPE_DOUBLE_GORILLA_REMOVED}:
+     * a chunk written by the pre-removal build must fail by name rather than be decoded as
+     * something else. That matters most for a CONSTANT double column, whose raw {@code constBytes}
+     * would round-trip perfectly under any type code and so would hide the format change entirely.
+     * <p>
+     * The header, directory, null bitmap and timestamp axis are byte-for-byte what they were, and
+     * every non-double column type is untouched, so the format <em>version</em> stays 3 and a v3
+     * chunk with no double columns still reads. Only a section written by the retired double codec
+     * is unreadable, which is exactly what a per-column reservation expresses and what a version
+     * bump would have over-stated.
+     */
+    static final byte TYPE_DOUBLE_CHIMP_REMOVED = 0x01;
+
     public static final byte TYPE_BOOLEAN = 0x02;
     public static final byte TYPE_INT32 = 0x03;
     public static final byte TYPE_INT64 = 0x04;
     public static final byte TYPE_TEXT = 0x05;
     public static final byte TYPE_OPAQUE = 0x06;
+    /** The one double encoding: {@link AlpCodec}, decimal ALP or ALP-RD per its own sub-format byte. */
+    public static final byte TYPE_DOUBLE_ALP = 0x07;
+
+    /**
+     * The live type-code range, {@code [TYPE_BOOLEAN, TYPE_DOUBLE_ALP]}. Codes below it
+     * ({@code 0x00}, {@code 0x01}) are the two permanently-reserved removed double codecs, checked
+     * by name before this range test; codes above it are unallocated and read as corruption.
+     */
+    private static final byte MIN_TYPE_CODE = TYPE_BOOLEAN;
+    private static final byte MAX_TYPE_CODE = TYPE_DOUBLE_ALP;
 
     private static final byte FLAG_ALL_PRESENT = 0x01;
     private static final byte FLAG_ALL_NULL = 0x02;
@@ -206,7 +239,7 @@ public final class ColumnarChunkCodec
     private static void encodeColumn(String name, ColumnInput input, int count, ByteArrayOutputStream directory,
                                       ByteArrayOutputStream nullBitmaps, List<byte[]> dataSections)
     {
-        if (input.typeCode < TYPE_DOUBLE_CHIMP || input.typeCode > TYPE_OPAQUE)
+        if (input.typeCode < MIN_TYPE_CODE || input.typeCode > MAX_TYPE_CODE)
             throw new IllegalArgumentException("column " + name + ": unknown type code " + input.typeCode);
         if (input.values.length < count)
             throw new IllegalArgumentException("column " + name + ": values array shorter than count " + count);
@@ -307,7 +340,7 @@ public final class ColumnarChunkCodec
     {
         switch (typeCode)
         {
-            case TYPE_DOUBLE_CHIMP:
+            case TYPE_DOUBLE_ALP:
             case TYPE_INT64:
                 return 8;
             case TYPE_INT32:
@@ -335,12 +368,15 @@ public final class ColumnarChunkCodec
     {
         switch (typeCode)
         {
-            case TYPE_DOUBLE_CHIMP:
+            case TYPE_DOUBLE_ALP:
             {
-                double[] values = new double[n];
+                // getLong, not getDouble: the raw bit pattern is the value here (see the class
+                // javadoc). Reading it as a double first would put a longBitsToDouble in the path,
+                // which the spec allows to quiet a signalling NaN.
+                long[] rawBits = new long[n];
                 for (int i = 0; i < n; i++)
-                    values[i] = ByteBuffer.wrap(presentBytes[i]).getDouble();
-                return encodeDoubleSection(values, n);
+                    rawBits[i] = ByteBuffer.wrap(presentBytes[i]).getLong();
+                return AlpCodec.encode(rawBits, n);
             }
             case TYPE_BOOLEAN:
             {
@@ -369,15 +405,6 @@ public final class ColumnarChunkCodec
             default:
                 throw new IllegalArgumentException("column " + name + ": unknown type code " + typeCode);
         }
-    }
-
-    private static byte[] encodeDoubleSection(double[] values, int n)
-    {
-        BitWriter chimp = new BitWriter();
-        Chimp128Codec.encodeValues(chimp, values, n);
-        ByteBuffer buffer = ByteBuffer.allocate(chimp.sizeInBytes());
-        chimp.writeTo(buffer);
-        return buffer.array();
     }
 
     private static byte[] encodeBooleanSection(boolean[] values, int n)
@@ -468,7 +495,11 @@ public final class ColumnarChunkCodec
             out.write((int) (value >>> shift) & 0xFF);
     }
 
-    private static void writeVarLong(ByteArrayOutputStream out, long value)
+    // The four primitives below are package-private rather than private so {@link AlpCodec} builds
+    // its section with the same varint and zigzag encoding as the rest of the format, instead of
+    // carrying a second copy that could drift from this one.
+
+    static void writeVarLong(ByteArrayOutputStream out, long value)
     {
         while (true)
         {
@@ -483,12 +514,12 @@ public final class ColumnarChunkCodec
         }
     }
 
-    private static long zigzagEncode(long value)
+    static long zigzagEncode(long value)
     {
         return (value << 1) ^ (value >> 63);
     }
 
-    private static long zigzagDecode(long value)
+    static long zigzagDecode(long value)
     {
         return (value >>> 1) ^ -(value & 1);
     }
@@ -602,8 +633,14 @@ public final class ColumnarChunkCodec
                                                       TYPE_DOUBLE_GORILLA_REMOVED + " (gorilla) was removed when " +
                                                       "chimp128 became the only double codec; chunks written by " +
                                                       "that build cannot be read by this one (type code " +
-                                                      TYPE_DOUBLE_CHIMP + " is the only double codec now)");
-        if (typeCode < TYPE_DOUBLE_CHIMP || typeCode > TYPE_OPAQUE)
+                                                      TYPE_DOUBLE_ALP + ", ALP, is the only double codec now)");
+        if (typeCode == TYPE_DOUBLE_CHIMP_REMOVED)
+            throw new UnsupportedChunkFormatException("Unsupported columnar chunk: double column type code " +
+                                                      TYPE_DOUBLE_CHIMP_REMOVED + " (chimp128) was removed when " +
+                                                      "ALP became the only double encoding; chunks written by " +
+                                                      "that build cannot be read by this one (type code " +
+                                                      TYPE_DOUBLE_ALP + ", ALP, is the only double codec now)");
+        if (typeCode < MIN_TYPE_CODE || typeCode > MAX_TYPE_CODE)
             throw new IllegalArgumentException("Corrupt columnar chunk: unknown column type code " + typeCode);
         byte flags = buffer.get();
         int nameLen = buffer.get() & 0xFF;
@@ -643,9 +680,9 @@ public final class ColumnarChunkCodec
     }
 
     /**
-     * Decodes one column into the primitive form its codec already produces -- {@code double[]},
-     * {@code long[]}, {@code boolean[]}, {@code byte[][]} -- instead of boxing every present value
-     * into a {@code ByteBuffer[rowCount]}.
+     * Decodes one column into the primitive form its codec already produces -- {@code long[]} (both
+     * integers and double bit patterns), {@code boolean[]}, {@code byte[][]} -- instead of boxing
+     * every present value into a {@code ByteBuffer[rowCount]}.
      * <p>
      * The boxing this replaced was the dominant cost of the cold read path: a heap {@link ByteBuffer}
      * (~48 B) per present value, retained for the whole life of the cursor on top of the value's own
@@ -683,9 +720,9 @@ public final class ColumnarChunkCodec
 
         switch (meta.typeCode)
         {
-            case TYPE_DOUBLE_CHIMP:
-                return DecodedColumn.doubles(scatter(decodeDoubleSection(section, presentCount), presence, rowCount),
-                                             presence);
+            case TYPE_DOUBLE_ALP:
+                return DecodedColumn.doubleBits(scatter(AlpCodec.decode(section, presentCount), presence, rowCount),
+                                                presence);
             case TYPE_BOOLEAN:
                 return DecodedColumn.booleans(scatter(decodeBooleanSection(section, presentCount), presence, rowCount),
                                               presence);
@@ -707,18 +744,6 @@ public final class ColumnarChunkCodec
 
     // Present-index -> row-index expansion. An all-present column is already row-indexed and is
     // returned untouched, which is the common case and the one worth keeping allocation-free.
-
-    private static double[] scatter(double[] compact, boolean[] presence, int rowCount)
-    {
-        if (presence == null)
-            return compact;
-        double[] out = new double[rowCount];
-        int p = 0;
-        for (int r = 0; r < rowCount; r++)
-            if (presence[r])
-                out[r] = compact[p++];
-        return out;
-    }
 
     private static long[] scatter(long[] compact, boolean[] presence, int rowCount)
     {
@@ -763,16 +788,6 @@ public final class ColumnarChunkCodec
             if (b)
                 n++;
         return n;
-    }
-
-    private static double[] decodeDoubleSection(ByteBuffer section, int n)
-    {
-        BitReader bits = new BitReader(section);
-        double[] out = new double[n];
-        Chimp128Codec.ValueDecoder decoder = new Chimp128Codec.ValueDecoder();
-        for (int i = 0; i < n; i++)
-            out[i] = Double.longBitsToDouble(decoder.readBits(bits));
-        return out;
     }
 
     private static boolean[] decodeBooleanSection(ByteBuffer section, int n)
@@ -873,7 +888,7 @@ public final class ColumnarChunkCodec
         return presence;
     }
 
-    private static long readVarLong(ByteBuffer buffer)
+    static long readVarLong(ByteBuffer buffer)
     {
         long result = 0;
         int shift = 0;
@@ -999,23 +1014,22 @@ public final class ColumnarChunkCodec
         private static final int KIND_INT64 = 5;
         private static final int KIND_BYTES = 6;
 
-        private static final DecodedColumn ALL_NULL = new DecodedColumn(KIND_ALL_NULL, null, null, null, null, null, null);
+        private static final DecodedColumn ALL_NULL = new DecodedColumn(KIND_ALL_NULL, null, null, null, null, null);
 
         private final int kind;
         private final boolean[] presence;
         private final byte[] constant;
-        private final double[] doubles;
+        /** Doubles live here too, as their raw IEEE-754 bit patterns -- see {@link #doubleBits}. */
         private final long[] longs;
         private final boolean[] booleans;
         private final byte[][] blobs;
 
         private DecodedColumn(int kind, boolean[] presence, byte[] constant,
-                              double[] doubles, long[] longs, boolean[] booleans, byte[][] blobs)
+                              long[] longs, boolean[] booleans, byte[][] blobs)
         {
             this.kind = kind;
             this.presence = presence;
             this.constant = constant;
-            this.doubles = doubles;
             this.longs = longs;
             this.booleans = booleans;
             this.blobs = blobs;
@@ -1028,32 +1042,40 @@ public final class ColumnarChunkCodec
 
         static DecodedColumn constant(byte[] value, boolean[] presence)
         {
-            return new DecodedColumn(KIND_CONSTANT, presence, value, null, null, null, null);
+            return new DecodedColumn(KIND_CONSTANT, presence, value, null, null, null);
         }
 
-        static DecodedColumn doubles(double[] values, boolean[] presence)
+        /**
+         * A double column, held as {@code Double.doubleToRawLongBits} patterns rather than
+         * {@code double}s. That is not an optimisation: a {@code double} field would force a
+         * {@code longBitsToDouble}/{@code doubleToRawLongBits} pair on the way through, and the
+         * former is specified as permitted to quiet a signalling NaN. Holding the pattern makes the
+         * column bit-exact by construction, and makes materialisation identical to
+         * {@link #KIND_INT64} -- a double cell's serialized form is exactly its 8 big-endian bits.
+         */
+        static DecodedColumn doubleBits(long[] rawBits, boolean[] presence)
         {
-            return new DecodedColumn(KIND_DOUBLE, presence, null, values, null, null, null);
+            return new DecodedColumn(KIND_DOUBLE, presence, null, rawBits, null, null);
         }
 
         static DecodedColumn booleans(boolean[] values, boolean[] presence)
         {
-            return new DecodedColumn(KIND_BOOLEAN, presence, null, null, null, values, null);
+            return new DecodedColumn(KIND_BOOLEAN, presence, null, null, values, null);
         }
 
         static DecodedColumn int32s(long[] values, boolean[] presence)
         {
-            return new DecodedColumn(KIND_INT32, presence, null, null, values, null, null);
+            return new DecodedColumn(KIND_INT32, presence, null, values, null, null);
         }
 
         static DecodedColumn int64s(long[] values, boolean[] presence)
         {
-            return new DecodedColumn(KIND_INT64, presence, null, null, values, null, null);
+            return new DecodedColumn(KIND_INT64, presence, null, values, null, null);
         }
 
         static DecodedColumn blobs(byte[][] values, boolean[] presence)
         {
-            return new DecodedColumn(KIND_BYTES, presence, null, null, null, null, values);
+            return new DecodedColumn(KIND_BYTES, presence, null, null, null, values);
         }
 
         boolean isPresent(int row)
@@ -1074,12 +1096,16 @@ public final class ColumnarChunkCodec
             {
                 case KIND_CONSTANT: return constant;
                 case KIND_BYTES:    return blobs[row];
-                case KIND_DOUBLE:   return ByteArrayUtil.bytes(doubles[row]);
+                // KIND_DOUBLE and KIND_INT64 are deliberately the same expression: both hold a
+                // 64-bit pattern whose serialized form is those 8 bytes big-endian. Routing the
+                // double through ByteArrayUtil.bytes(double) instead would push it through
+                // Double.doubleToLongBits, which canonicalises every NaN payload to one value.
+                case KIND_DOUBLE:
+                case KIND_INT64:    return ByteArrayUtil.bytes(longs[row]);
                 case KIND_BOOLEAN:  return new byte[]{ (byte) (booleans[row] ? 1 : 0) };
                 case KIND_INT32:    return ByteArrayUtil.bytes((int) longs[row]);
-                case KIND_INT64:    return ByteArrayUtil.bytes(longs[row]);
-                // unreachable: readColumnMeta rejects every type code outside TYPE_DOUBLE_CHIMP..
-                // TYPE_OPAQUE before a section is ever decoded, and decodeColumn covers all of them
+                // unreachable: readColumnMeta rejects every type code outside MIN_TYPE_CODE..
+                // MAX_TYPE_CODE before a section is ever decoded, and decodeColumn covers all of them
                 default: throw new IllegalArgumentException("Corrupt columnar chunk: unknown column kind " + kind);
             }
         }

@@ -29,6 +29,7 @@ import java.util.NavigableSet;
 import java.util.concurrent.ConcurrentSkipListMap;
 import java.util.concurrent.atomic.AtomicLong;
 import java.util.concurrent.atomic.LongAdder;
+import java.util.concurrent.locks.ReentrantLock;
 
 import com.google.common.annotations.VisibleForTesting;
 
@@ -69,6 +70,7 @@ import org.apache.cassandra.schema.TableMetadataRef;
 import org.apache.cassandra.utils.BulkIterator;
 import org.apache.cassandra.utils.ByteArrayUtil;
 import org.apache.cassandra.utils.ByteBufferUtil;
+import org.apache.cassandra.utils.Clock;
 import org.apache.cassandra.utils.btree.BTree;
 import org.apache.cassandra.utils.btree.UpdateFunction;
 import org.apache.cassandra.utils.concurrent.OpOrder;
@@ -105,7 +107,9 @@ import org.apache.cassandra.utils.memory.MemtableAllocator;
  * tail is folded in lazily, on read or flush — in-order ingest never sorts. The tail is bounded
  * ({@link #MAX_UNSORTED_TAIL}) only so the duplicate-clustering probe a write performs stays cheap.
  *
- * <p><b>Concurrency: the slots are append-only.</b> Writes synchronise on this object; reads do not.
+ * <p><b>Concurrency: the slots are append-only.</b> Writes hold {@link #writeLock} for their whole
+ * duration; a read takes it only for the instant it captures a walk, and holds nothing while it
+ * iterates.
  * A slot's row data is immutable once written: a re-write of a clustering the arrays already hold
  * appends a <em>new</em> slot with the merged row and marks the old slot {@link #FLAG_SUPERSEDED} —
  * a one-shot 0&rarr;1 flag that is never cleared — and a promotion to the overflow tier inserts into
@@ -156,6 +160,54 @@ public final class TimeSeriesColumnarPartition implements TimeSeriesMemtable.Sha
     @VisibleForTesting
     public static final LongAdder rowsAssembled = new LongAdder();
 
+    /**
+     * Write-lock acquisitions that found the lock free, acquisitions that had to wait, and the total
+     * nanoseconds the waiting ones spent blocked — across every columnar partition of every table in
+     * the process, like {@link #rowsAssembled} above.
+     *
+     * <p><b>Why they exist.</b> After 6d5f2a3156 took ingest on this memtable from 93.6k to 155.6k
+     * rows/s, nothing outside the process could say whether what remains is CPU in the write path or
+     * threads queueing on one hot partition — the object monitor these replaced cannot be asked. The
+     * ratio {@code contendedWrites / (contendedWrites + uncontendedWrites)} answers the first
+     * question and {@code writeContentionNanos} sizes it; a low ratio means further work belongs in
+     * the per-row cost, a high one means it belongs in the locking granularity.
+     *
+     * <p>Process-wide {@link LongAdder}s rather than a metrics MBean: this is a profiling counter for
+     * a specific optimisation question, the class already publishes {@link #rowsAssembled} exactly
+     * this way, and a per-table {@code MetricsView} would need a lifecycle (creation, release on drop)
+     * that a static counter does not. Tests sample deltas, never absolutes.
+     */
+    @VisibleForTesting
+    public static final LongAdder uncontendedWrites = new LongAdder();
+    @VisibleForTesting
+    public static final LongAdder contendedWrites = new LongAdder();
+    @VisibleForTesting
+    public static final LongAdder writeContentionNanos = new LongAdder();
+
+    /**
+     * The one lock. <b>Every</b> mutation of the arrays and every probe that must not see them
+     * half-written takes it — the write path, {@link #captureWalk()}, {@link #readView()},
+     * {@link #mayContainRowsIn} and the observability accessors — because the append-only slot
+     * protocol is only safe if a reader either holds this lock or reads a capture made under it.
+     * Two locks would be no lock at all: the walk a reader captured could then be torn by a
+     * concurrent {@link #consolidate()} replacing the arrays underneath it.
+     *
+     * <p><b>Why not the object monitor it replaces.</b> A monitor cannot report contention, which is
+     * the question above. {@link ReentrantLock} answers it and gives back everything the monitor
+     * gave: the same happens-before on acquire/release, and reentrancy — which this class relies on
+     * ({@link #put} holds it across {@link #apply} → {@link #replaceSlot} → {@link #materializeRow}).
+     * Nothing in this class ever used {@code wait}/{@code notify}, and nothing outside it ever
+     * synchronised on a partition instance, so the monitor had no other users to strand.
+     *
+     * <p>{@code @Unmetered} as {@code TrieMemtable}'s write lock is, and for a second reason here:
+     * a held lock's AQS keeps an {@code exclusiveOwnerThread} reference, and TimeSeriesMemtableHeapTest
+     * walks this object graph with jamm — a deep measurement that stepped into a live {@code Thread}
+     * would measure the runtime, not the memtable.
+     */
+    @Unmetered
+    @VisibleForTesting
+    final ReentrantLock writeLock = new ReentrantLock();
+
     @Unmetered
     private final TableMetadataRef metadata;
     @Unmetered
@@ -173,7 +225,7 @@ public final class TimeSeriesColumnarPartition implements TimeSeriesMemtable.Sha
      */
     private final boolean reversedLongKeys;
 
-    // ---- row-major parallel arrays; all mutation is guarded by 'this' ----
+    // ---- row-major parallel arrays; all mutation is guarded by writeLock ----
     private int capacity;
     private int size;
     /** Rows [0, sortedCount) are in clustering order; rows [sortedCount, size) arrived out of order. */
@@ -187,17 +239,17 @@ public final class TimeSeriesColumnarPartition implements TimeSeriesMemtable.Sha
     /** Per-column stores, kept sorted by column so a materialized row's cells are already in order. */
     private final List<ColumnStore> stores = new ArrayList<>(4);
 
-    /** Slots carrying {@link #FLAG_SUPERSEDED}; feeds the degradation valve. Guarded by 'this'. */
+    /** Slots carrying {@link #FLAG_SUPERSEDED}; feeds the degradation valve. Guarded by {@link #writeLock}. */
     private int supersededCount;
 
-    /** Appends admitted by the certainly-new bounds shortcut, i.e. without a slot search. Guarded by 'this'. */
+    /** Appends admitted by the certainly-new bounds shortcut, i.e. without a slot search. Guarded by {@link #writeLock}. */
     private long certainNewAppends;
 
     /**
      * Index of the unsorted tail for long-keyed clusterings: clustering key → the newest slot
      * holding it, so the duplicate probe a write performs is one map lookup instead of a linear
      * scan of up to {@link #MAX_UNSORTED_TAIL} slots inside the lock. Writer-only state, guarded
-     * by 'this' like every array mutation; readers never see it. Cleared whenever
+     * by {@link #writeLock} like every array mutation; readers never see it. Cleared whenever
      * {@link #consolidate()} folds the tail into the sorted prefix (slot indices change there).
      * Bounded by the tail bound, so at most ~{@value #MAX_UNSORTED_TAIL} entries.
      */
@@ -273,7 +325,8 @@ public final class TimeSeriesColumnarPartition implements TimeSeriesMemtable.Sha
         if (demoted == null)
         {
             Put put = new Put(cloner, indexer);
-            synchronized (this)
+            lockForWrite();
+            try
             {
                 demoted = demotedTo;
                 if (demoted == null && size >= INITIAL_CAPACITY && supersededCount * 2 > size)
@@ -307,6 +360,10 @@ public final class TimeSeriesColumnarPartition implements TimeSeriesMemtable.Sha
                     }
                 }
             }
+            finally
+            {
+                writeLock.unlock();
+            }
             if (demoted == null)
             {
                 // Outside the lock: acquiring memtable space may block on a flush, and the flush path
@@ -319,6 +376,33 @@ public final class TimeSeriesColumnarPartition implements TimeSeriesMemtable.Sha
         // Demoted: the object tier owns every write from here on. Also outside the lock, for the
         // same allocation-under-lock reason as above.
         return demoted.put(update, indexer, cloner, opGroup, liveDataSize);
+    }
+
+    /**
+     * Takes {@link #writeLock} and records whether it was free. {@code tryLock()} first and only then
+     * the blocking acquire, with the wait timed — {@code TrieMemtable.MemtableShard.put}'s pattern
+     * verbatim, so the two memtables' contention numbers mean the same thing and can be compared.
+     * The uncontended path is one CAS and one increment; nothing here reads the clock unless a
+     * thread actually blocked, because {@code nanoTime} on the hot path would be part of the cost it
+     * is meant to measure.
+     *
+     * <p>Only the write path is instrumented. A read-side probe holding the lock still shows up here
+     * — as blocked nanos on the writer it delayed — which is the number that matters; counting the
+     * probes themselves would mix a flush's one acquisition per partition into the write ratio.
+     */
+    private void lockForWrite()
+    {
+        // Reentrant, so this also succeeds (and counts as uncontended) if this thread already holds
+        // the lock — the same thing the monitor did for a nested acquisition.
+        if (writeLock.tryLock())
+        {
+            uncontendedWrites.increment();
+            return;
+        }
+        contendedWrites.increment();
+        long lockStartTime = Clock.Global.nanoTime();
+        writeLock.lock();
+        writeContentionNanos.add(Clock.Global.nanoTime() - lockStartTime);
     }
 
     /** Mirrors {@code BTreePartitionUpdater#merge(DeletionInfo, DeletionInfo)}, including the indexer events. */
@@ -400,7 +484,9 @@ public final class TimeSeriesColumnarPartition implements TimeSeriesMemtable.Sha
             certainNewAppends++;
             append(row, shape, longKey, null, put);
             put.indexer.onInserted(row);
-            put.dataDelta += row.dataSize();
+            // shape.dataSize, not row.dataSize(): the same number, already summed by classify()
+            // above out of a walk this path was making anyway.
+            put.dataDelta += shape.dataSize;
             return;
         }
 
@@ -415,7 +501,7 @@ public final class TimeSeriesColumnarPartition implements TimeSeriesMemtable.Sha
         {
             append(row, shape, longKey, null, put);
             put.indexer.onInserted(row);
-            put.dataDelta += row.dataSize();
+            put.dataDelta += shape.dataSize;
         }
         else
         {
@@ -431,6 +517,23 @@ public final class TimeSeriesColumnarPartition implements TimeSeriesMemtable.Sha
      * deletion, a cell tombstone, an expired liveness, a cell whose value does not fit its column's
      * fixed width, a complex column, or cells that do not all share one (timestamp, ttl,
      * localDeletionTime).
+     *
+     * <p>The row's {@code dataSize} rides along in the answer. On the columnar fast path a row was
+     * being walked four times per write — {@code TimeSeriesMemtable.maxTimestamp} to route it, here,
+     * {@link #append} to store it, and then {@code row.dataSize()} purely to account for it — and
+     * this pass is already over exactly the cells that last walk visits, so the sum is free here and
+     * one whole walk is not.
+     *
+     * <p><b>The accounting must not drift:</b> {@code liveDataSize} feeds the flush size estimate.
+     * The sum below reproduces {@code BTreeRow.dataSize()}'s decomposition exactly — clustering plus
+     * primary-key liveness plus <em>deletion, which is {@code time.dataSize() + 1} even when LIVE</em>,
+     * plus every {@code ColumnData} — which is safe because it is computed from the same four parts
+     * of the same row. The {@code instanceof} is the guard for the one thing that could break it: a
+     * {@code Row} implementation whose {@code dataSize()} is not that decomposition. Today there are
+     * only two in the tree ({@code BTreeRow}, and SAI's {@code RowWithSource}, a pure delegating
+     * wrapper built only on the read path), and everything reaching a memtable write is a
+     * {@code BTreeRow} — but a memtable is not the place to bet on that staying true, and the
+     * fallback costs exactly what today costs.
      */
     private RowShape classify(Row row)
     {
@@ -442,8 +545,13 @@ public final class TimeSeriesColumnarPartition implements TimeSeriesMemtable.Sha
         long ldt = 0;
         boolean seen = false;
         boolean hasLiveness = false;
-
         LivenessInfo liveness = row.primaryKeyLivenessInfo();
+
+        boolean fusedSize = row instanceof BTreeRow;
+        long dataSize = fusedSize
+                        ? row.clustering().dataSize() + liveness.dataSize() + row.deletion().dataSize()
+                        : 0;
+
         if (!liveness.isEmpty())
         {
             if (liveness.ttl() == LivenessInfo.EXPIRED_LIVENESS_TTL)
@@ -462,6 +570,8 @@ public final class TimeSeriesColumnarPartition implements TimeSeriesMemtable.Sha
             Cell<?> cell = (Cell<?>) data;
             if (cell.isTombstone())
                 return null;
+
+            dataSize += cell.dataSize();
 
             int width = fixedWidthOf(cell.column().type);
             if (width > 0)
@@ -484,7 +594,9 @@ public final class TimeSeriesColumnarPartition implements TimeSeriesMemtable.Sha
             }
         }
 
-        return seen ? new RowShape(ts, ttl, ldt, hasLiveness) : null;
+        if (!seen)
+            return null;
+        return new RowShape(ts, ttl, ldt, hasLiveness, fusedSize ? dataSize : row.dataSize());
     }
 
     /**
@@ -573,6 +685,9 @@ public final class TimeSeriesColumnarPartition implements TimeSeriesMemtable.Sha
         Row existing = materializeRow(slot);
         Row merged = Rows.merge(existing, update, put);
         put.indexer.onUpdated(existing, merged);
+        // A delta, not a size: the slot's old row is being replaced, so what leaves must be subtracted
+        // and classify()'s fused size (below, and only when the merged row still fits the arrays)
+        // cannot express it. This is the re-write path, not the ingest path it was fused for.
         put.dataDelta += merged.dataSize() - existing.dataSize();
 
         RowShape shape = classify(merged);
@@ -863,9 +978,17 @@ public final class TimeSeriesColumnarPartition implements TimeSeriesMemtable.Sha
      * later writes append past the captured count or replace the arrays wholesale — except the flag
      * bytes, whose only possible change is the one-shot supersede the reader double-checks for.
      */
-    synchronized Walk captureWalk()
+    Walk captureWalk()
     {
-        return captureWalkLocked();
+        writeLock.lock();
+        try
+        {
+            return captureWalkLocked();
+        }
+        finally
+        {
+            writeLock.unlock();
+        }
     }
 
     /**
@@ -933,9 +1056,14 @@ public final class TimeSeriesColumnarPartition implements TimeSeriesMemtable.Sha
     private Partition readView()
     {
         Partition base;
-        synchronized (this)
+        writeLock.lock();
+        try
         {
             base = buildSnapshot();
+        }
+        finally
+        {
+            writeLock.unlock();
         }
         TimeSeriesMemtable.ObjectShardPartition demoted = demotedTo;
         return demoted == null
@@ -987,9 +1115,14 @@ public final class TimeSeriesColumnarPartition implements TimeSeriesMemtable.Sha
     public DeletionTime partitionLevelDeletion()
     {
         DeletionTime own;
-        synchronized (this)
+        writeLock.lock();
+        try
         {
             own = deletionInfo.getPartitionDeletion();
+        }
+        finally
+        {
+            writeLock.unlock();
         }
         TimeSeriesMemtable.ObjectShardPartition demoted = demotedTo;
         if (demoted != null)
@@ -1005,9 +1138,14 @@ public final class TimeSeriesColumnarPartition implements TimeSeriesMemtable.Sha
     public RegularAndStaticColumns columns()
     {
         RegularAndStaticColumns own;
-        synchronized (this)
+        writeLock.lock();
+        try
         {
             own = columns;
+        }
+        finally
+        {
+            writeLock.unlock();
         }
         TimeSeriesMemtable.ObjectShardPartition demoted = demotedTo;
         return demoted == null ? own : own.mergeTo(demoted.columns());
@@ -1024,11 +1162,16 @@ public final class TimeSeriesColumnarPartition implements TimeSeriesMemtable.Sha
     @Override
     public boolean isEmpty()
     {
-        synchronized (this)
+        writeLock.lock();
+        try
         {
             if (!deletionInfo.isLive() || !staticRow.isEmpty() || size > supersededCount
                 || (overflow != null && !overflow.isEmpty()))
                 return false;
+        }
+        finally
+        {
+            writeLock.unlock();
         }
         TimeSeriesMemtable.ObjectShardPartition demoted = demotedTo;
         return demoted == null || demoted.isEmpty();
@@ -1037,10 +1180,15 @@ public final class TimeSeriesColumnarPartition implements TimeSeriesMemtable.Sha
     @Override
     public boolean hasRows()
     {
-        synchronized (this)
+        writeLock.lock();
+        try
         {
             if (size > supersededCount || (overflow != null && !overflow.isEmpty()))
                 return true;
+        }
+        finally
+        {
+            writeLock.unlock();
         }
         TimeSeriesMemtable.ObjectShardPartition demoted = demotedTo;
         return demoted != null && demoted.hasRows();
@@ -1106,8 +1254,9 @@ public final class TimeSeriesColumnarPartition implements TimeSeriesMemtable.Sha
      * after the first because only page one carries {@code Slices.ALL}.
      */
     @Override
-    public synchronized boolean mayContainRowsIn(Slices slices)
+    public boolean mayContainRowsIn(Slices slices)
     {
+        writeLock.lock();
         try
         {
             TimeSeriesMemtable.ObjectShardPartition demoted = demotedTo;
@@ -1145,36 +1294,76 @@ public final class TimeSeriesColumnarPartition implements TimeSeriesMemtable.Sha
         {
             return TimeSeriesMemtable.pruneFailedOpen(e);
         }
+        finally
+        {
+            writeLock.unlock();
+        }
     }
 
     // ------------------------------------------------------------------------------ observability
 
+    // Each of these reads writer-owned state and so takes the same lock the writer does — the whole
+    // point of there being exactly one lock. They are not instrumented: they are test and diagnostic
+    // calls, and counting them as "writes" would pollute the contention ratio above.
+
     /** Rows currently live in the primitive arrays (the fast path): slots not yet superseded. */
     @VisibleForTesting
-    public synchronized int fastPathRowCount()
+    public int fastPathRowCount()
     {
-        return size - supersededCount;
+        writeLock.lock();
+        try
+        {
+            return size - supersededCount;
+        }
+        finally
+        {
+            writeLock.unlock();
+        }
     }
 
     /** Appends that proved the clustering new by a bounds check alone, skipping {@link #findSlot}. */
     @VisibleForTesting
-    public synchronized long certainNewAppends()
+    public long certainNewAppends()
     {
-        return certainNewAppends;
+        writeLock.lock();
+        try
+        {
+            return certainNewAppends;
+        }
+        finally
+        {
+            writeLock.unlock();
+        }
     }
 
     /** Rows in the object-tier overflow map — promoted rows plus rows the arrays never fit. */
     @VisibleForTesting
-    public synchronized int overflowRowCount()
+    public int overflowRowCount()
     {
-        return overflow == null ? 0 : overflow.size();
+        writeLock.lock();
+        try
+        {
+            return overflow == null ? 0 : overflow.size();
+        }
+        finally
+        {
+            writeLock.unlock();
+        }
     }
 
     /** Slots dead-weighted by an append-only re-write or a promotion; feeds the degradation valve. */
     @VisibleForTesting
-    public synchronized int supersededSlotCount()
+    public int supersededSlotCount()
     {
-        return supersededCount;
+        writeLock.lock();
+        try
+        {
+            return supersededCount;
+        }
+        finally
+        {
+            writeLock.unlock();
+        }
     }
 
     /** Whether the degradation valve moved this partition's future writes to the object tier. */
@@ -1191,6 +1380,20 @@ public final class TimeSeriesColumnarPartition implements TimeSeriesMemtable.Sha
         return longClusterings;
     }
 
+    /**
+     * The key instance this partition actually holds — <b>not</b> {@link #partitionKey()}, which puts
+     * it through {@code allocator.ensureOnHeap()} and therefore returns a copy under a native or
+     * off-heap-objects allocator. The one-instance-per-key invariant
+     * ({@code TimeSeriesMemtable.keys} holds the single cloned key every shard shares) can only be
+     * asserted against the stored reference, so a test that used the accessor would pass vacuously on
+     * heap buffers and be unwritable off heap.
+     */
+    @VisibleForTesting
+    public DecoratedKey storedKey()
+    {
+        return key;
+    }
+
     // ------------------------------------------------------------------------------ inner classes
 
     private static final class RowShape
@@ -1199,13 +1402,21 @@ public final class TimeSeriesColumnarPartition implements TimeSeriesMemtable.Sha
         final int ttl;
         final long localDeletionTime;
         final boolean hasLiveness;
+        /**
+         * What {@code row.dataSize()} would have answered, summed by {@code classify} out of the
+         * walk it was already doing. A {@code long}, though {@code Row.dataSize()} is an {@code int}
+         * checked-cast from a long accumulation: the caller adds it to a {@code long} delta, so
+         * widening here drops an overflow check that no row on a write path can reach.
+         */
+        final long dataSize;
 
-        RowShape(long timestamp, int ttl, long localDeletionTime, boolean hasLiveness)
+        RowShape(long timestamp, int ttl, long localDeletionTime, boolean hasLiveness, long dataSize)
         {
             this.timestamp = timestamp;
             this.ttl = ttl;
             this.localDeletionTime = localDeletionTime;
             this.hasLiveness = hasLiveness;
+            this.dataSize = dataSize;
         }
     }
 

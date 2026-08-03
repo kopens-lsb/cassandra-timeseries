@@ -1,5 +1,45 @@
 # Chunk codec bake-off: Gorilla (v1) vs Chimp128 (v2)
 
+> ## 최신 결론 (2026-08-03) — **ALP가 유일한 double 인코딩**
+>
+> Chimp128도 v3 컬럼 지향 청크에서 **은퇴**했습니다. double 컬럼은 이제
+> [`AlpCodec`](../../src/java/org/apache/cassandra/db/timeseries/AlpCodec.java) 하나만 씁니다
+> (타입 코드 `0x07`, 십진 ALP / ALP-RD 두 변형). 타입 코드 `0x01`은 `0x00`(Gorilla)과 같은
+> 이유로 **영구 예약**됩니다. `Chimp128Codec`은 v2 단일 컬럼 포맷으로 남아 있고, 아래 크기 비교의
+> 기준선으로도 계속 쓰입니다(`AlpCodecTest`).
+>
+> **실측 (3,600 값/컬럼 = 1시간 × 1초 간격, `AlpCodecTest`가 매 실행마다 출력):**
+>
+> | 분포 | 변형 | ALP B/값 | Chimp128 B/값 | ALP/Chimp |
+> | --- | --- | ---: | ---: | ---: |
+> | 운영 `value_numeric` 소수 2자리 워크 | ALP | **0.752** | 1.351 | **0.56×** |
+> | 운영 `value_numeric` 정수 워크 | ALP | **0.752** | 1.905 | **0.40×** |
+> | near-constant (997행마다 1회 변화) | ALP | **0.013** | 1.130 | **0.011×** |
+> | quantized-walk-0.1 | ALP | 0.752 | 1.269 | 0.59× |
+> | quantized-sine | ALP | 1.377 | 3.179 | 0.43× |
+> | 소수 3자리 압력 워크 | ALP | 0.753 | 1.330 | 0.57× |
+> | 단조 증가 정수 카운터 | ALP | 1.627 | 2.320 | 0.70× |
+> | uniform [0,1) double | ALP-RD | 6.893 | 7.220 | 0.96× |
+> | random 64비트 패턴 | ALP-RD | 8.002 | 8.251 | 0.97× |
+> | **full-precision 가우시안 워크** | ALP-RD | 6.627 | **6.532** | **1.015×** |
+> | **full-precision 사인** | ALP-RD | 7.038 | **6.773** | **1.039×** |
+>
+> **알려진 손해**: 굵게 표시한 두 줄 — 소수점이 잘리지 **않은**, 매끄럽게 변하는 double —
+> 에서는 Chimp128이 1.5~3.9% 더 작습니다. 튜닝 실패가 아니라 구조적입니다. Chimp는 각 값을
+> 비슷한 최근 값과 XOR해 **순차 상관**을 먹지만, ALP-RD는 비트 패턴의 정적 분포만 모델링하고
+> 모든 값을 같은 자리에서 자릅니다. ALP-RD 사전을 8개 이상으로 키워도 개선되지 않습니다 —
+> 그런 계열의 하위 ~53 맨티사 비트는 순차 모델 없이는 사실상 비압축이고, 그것이 ALP-RD의
+> 하한(53 bits/값)을 정합니다.
+>
+> 이 두 형태는 **측정된 운영 분포에는 없습니다**(`docker/scale-workload.py` — 운영 판독값은
+> 전부 십진 양자화되어 있습니다). 순차 상관이 없는 full-precision 데이터에서는 오히려 ALP-RD가
+> 더 작습니다. `AlpCodecTest.fullPrecisionColumnsStayWithinTheRecordedMarginOfChimp128`이 이
+> 손해를 **수치로 고정**해 두므로, 몇 %에서 조용히 커지는 일은 없습니다.
+>
+> **재현**: `.build/sh/ai-ci-test org.apache.cassandra.db.timeseries.AlpCodecTest` — 위 표는
+> 테스트 표준출력에 그대로 찍힙니다.
+
+
 > ## 결론 (2026-08-01, SP4 Task 1.5) — **Chimp128이 유일한 코덱**
 >
 > 이 bake-off 이후 **Gorilla는 삭제됐고 Chimp128이 유일한 double 코덱**이 됐습니다. 정책의

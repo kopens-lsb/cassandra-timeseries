@@ -263,6 +263,17 @@ public class TimeSeriesMemtable extends AbstractAllocatorMemtable
         return shards;
     }
 
+    /**
+     * The interned key index, for tests of the one-instance-per-key invariant and of the ordering
+     * rule in {@link #putSingleWindow} (a key must never be missing here while a shard holds its
+     * partition).
+     */
+    @VisibleForTesting
+    public ConcurrentNavigableMap<PartitionPosition, DecoratedKey> keys()
+    {
+        return keys;
+    }
+
     // ------------------------------------------------------------------------------------- writes
 
     /**
@@ -273,7 +284,6 @@ public class TimeSeriesMemtable extends AbstractAllocatorMemtable
     public long put(PartitionUpdate update, UpdateTransaction indexer, OpOrder.Group opGroup, boolean assumeMissing)
     {
         Cloner cloner = allocator.cloner(opGroup);
-        DecoratedKey key = internKey(update.partitionKey(), cloner, opGroup);
         TimeSeriesCompactionStrategyOptions opts = options;
 
         // An UpdateTransaction is scoped to one partition update and guarantees start() before
@@ -286,9 +296,14 @@ public class TimeSeriesMemtable extends AbstractAllocatorMemtable
         try
         {
             long window = singleWindowOf(update, opts);
-            colUpdateTimeDelta = window != NO_SINGLE_WINDOW
-                                 ? shardFor(window).put(key, update, scoped, cloner, opGroup, assumeMissing, liveDataSize)
-                                 : putSplitByWindow(key, update, scoped, cloner, opGroup, opts);
+            colUpdateTimeDelta =
+                window != NO_SINGLE_WINDOW
+                ? putSingleWindow(window, update, scoped, cloner, opGroup, assumeMissing)
+                // The split path writes the same key into several shards, so it interns up front:
+                // there is no single shard to probe first, and the alternative would be a probe per
+                // window.
+                : putSplitByWindow(internKey(update.partitionKey(), cloner, opGroup),
+                                   update, scoped, cloner, opGroup, opts);
         }
         finally
         {
@@ -303,6 +318,58 @@ public class TimeSeriesMemtable extends AbstractAllocatorMemtable
         statsCollector.update(update.stats());
         currentOperations.addAndGet(update.operationCount());
         return colUpdateTimeDelta;
+    }
+
+    /**
+     * The whole-update fast path: everything in {@code update} belongs to window {@code window}, so
+     * it goes to one shard, whole.
+     *
+     * <p><b>One skip-list probe per write, not two.</b> Every write used to probe {@link #keys} (to
+     * intern the key) and then the shard's {@code partitions} map (to find the partition) with the
+     * same key. On a shard hit the interned key is not wanted for anything —
+     * {@link WindowShard#put} uses it only to construct a partition that is missing — so the shard
+     * is probed first and a hit writes straight through, interning nothing.
+     *
+     * <p>The interned key is deliberately <b>not</b> taken from {@code partition.partitionKey()} on
+     * that path: for a {@link TimeSeriesColumnarPartition} that accessor goes through
+     * {@code allocator.ensureOnHeap().applyToPartitionKey(...)}, which <em>copies</em> under a
+     * native or off-heap-objects allocator — an allocation on the path being optimised, and a second
+     * key instance for a key that is supposed to have exactly one.
+     *
+     * <p><b>The miss branch's order is load-bearing:</b> {@code keys.putIfAbsent} (inside
+     * {@link #internKey}) strictly before {@code partitions.putIfAbsent} (inside
+     * {@link WindowShard#put}). {@link #isClean()} answers from {@code keys} alone, and
+     * {@code ColumnFamilyStore} <em>discards a clean memtable without flushing it</em> — so a
+     * partition visible in a shard whose key is not yet in {@code keys} is not a slow read, it is
+     * silent data loss. In this order a reader that sees the partition sees the key too: the
+     * {@code keys} write precedes the {@code partitions} write in program order, and the concurrent
+     * map's publication carries it. {@link #partitionCount()}, {@link #lastToken()} and the flush
+     * set's key-size estimate all read {@code keys} the same way and inherit the same guarantee.
+     */
+    private long putSingleWindow(long window,
+                                 PartitionUpdate update,
+                                 UpdateTransaction indexer,
+                                 Cloner cloner,
+                                 OpOrder.Group opGroup,
+                                 boolean assumeMissing)
+    {
+        WindowShard shard = shardFor(window);
+        DecoratedKey updateKey = update.partitionKey();
+
+        // assumeMissing is the caller's assertion that this key is new, which is exactly the licence
+        // to skip this probe (Memtable#put: "MAY clone the key and attempt putIfAbsent without first
+        // looking for the keys' presence").
+        if (!assumeMissing)
+        {
+            ShardPartition existing = shard.partitions.get(updateKey);
+            if (existing != null)
+                return existing.put(update, indexer, cloner, opGroup, liveDataSize);
+        }
+
+        // A miss here has established absence — or the caller asserted it — so the shard is told not
+        // to look a third time; its putIfAbsent still settles any race with a concurrent writer.
+        return shard.put(internKey(updateKey, cloner, opGroup),
+                         update, indexer, cloner, opGroup, true, liveDataSize);
     }
 
     /**
@@ -494,6 +561,11 @@ public class TimeSeriesMemtable extends AbstractAllocatorMemtable
         return opts.windowStartFor(TimeUnit.MILLISECONDS.convert(writeTimestamp, opts.timestampResolution));
     }
 
+    /**
+     * The one instance of {@code key} every shard shares, cloned into memtable memory on first sight.
+     * Called only when a partition may have to be <em>created</em> — a shard hit needs no key at all
+     * (see {@link #putSingleWindow}) — so on the steady-state ingest path this map is not touched.
+     */
     private DecoratedKey internKey(DecoratedKey key, Cloner cloner, OpOrder.Group opGroup)
     {
         DecoratedKey existing = keys.get(key);
@@ -685,6 +757,11 @@ public class TimeSeriesMemtable extends AbstractAllocatorMemtable
 
     // --------------------------------------------------------------------------------- statistics
 
+    /**
+     * Answered from {@link #keys} alone, which is why a key is always published <em>before</em> the
+     * partition it belongs to (see {@link #putSingleWindow}): {@code ColumnFamilyStore} discards a
+     * memtable that says it is clean without flushing it.
+     */
     @Override
     public boolean isClean()
     {

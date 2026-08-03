@@ -22,7 +22,7 @@
 `<테이블>__chunks`로 옮기고, 원본 행은 삭제하는 서버 내장 계층화 엔진입니다. 최근 데이터(핫 구간)는
 행 단위로 그대로 남아 쓰기·조회 모두 기존과 동일하고, 오래된 데이터는 행당 수 바이트 수준으로
 압축된 청크로 보관됩니다. 청크 1개는 한 창의 타임스탬프 축 하나에 **일반 컬럼 전부**를 컬럼별 독립
-섹션으로 담습니다(§3.1.2). `double` 컬럼에 쓰이는 Chimp128의 압축 특성은
+섹션으로 담습니다(§3.1.2). `double` 컬럼에 쓰이는 ALP의 압축 특성은
 [bake-off 결과](codec-bakeoff.md)를 참고하세요.
 
 > **투명 읽기(SP3) 포함**: 베이스 테이블 `SELECT`가 핫 로우와 청크 디코드 로우를 **자동 병합**해
@@ -80,7 +80,7 @@ CREATE TABLE pp.tm_tag_point (
     quality       int,                           -- 항상 192 → CONSTANT
     value         text,                          -- 판독값의 문자열 사본 (사전/raw)
     value_boolean boolean,                       -- type=boolean 태그에서만 채워짐 (1비트 팩)
-    value_numeric double,                        -- type이 숫자형일 때만 채워짐 (Chimp128)
+    value_numeric double,                        -- type이 숫자형일 때만 채워짐 (ALP)
     PRIMARY KEY (tag_id, timestamp)
 ) WITH CLUSTERING ORDER BY (timestamp DESC);
 ```
@@ -92,7 +92,7 @@ CREATE TABLE pp.tm_tag_point (
 `type`이 **static**, 즉 태그 단위로 고정된 속성이라는 점이 여기서 그대로 이득이 됩니다. 청크 1개는
 태그 1개 × 창 1개이므로, 한 청크 안에서 각 값 컬럼은 **전부 채워져 있거나 전부 비어 있거나** 둘 중
 하나이지 섞이지 않습니다. 즉 어느 청크든 깨끗하게 한쪽 경우에 떨어집니다 — 쓰이는 쪽은 전용 코덱
-(Chimp128 / 1비트 팩)을 타고, 쓰이지 않는 쪽은 ALL_NULL로 **0바이트**입니다.
+(ALP / 1비트 팩)을 타고, 쓰이지 않는 쪽은 ALL_NULL로 **0바이트**입니다.
 
 `value`(text)는 그 판독값의 **문자열 사본**입니다 — 같은 값이 타입 컬럼에 한 번, 텍스트로 또 한 번
 저장됩니다(`value_numeric = 20.76` ↔ `value = '20.76'`). 조금 놀랍지만 실제 스키마의 성질이며,
@@ -213,8 +213,8 @@ ALTER TABLE pp.tm_tag_point WITH extensions = {
 
 ### 2.2 코덱
 
-고를 것이 없습니다. 컬럼 타입이 인코딩을 결정하고(§3.1.2), `double` 컬럼의 값 코덱은 **Chimp128
-하나뿐**입니다 — 양자화된 워크/주기 신호(소수점이 잘린 실제 산업 센서값)에서 1.4~2.5 B/샘플이며,
+고를 것이 없습니다. 컬럼 타입이 인코딩을 결정하고(§3.1.2), `double` 컬럼의 값 코덱은 **ALP
+하나뿐**입니다 — 양자화된 워크/주기 신호(소수점이 잘린 실제 산업 센서값)에서 0.75~1.4 B/샘플이며,
 값이 전혀 변하지 않는 컬럼은 코덱을 타기 전에 CONSTANT 플래그가 행 수와 무관하게 O(1) 바이트로
 처리합니다. 페이로드에는 여전히 버전 바이트가 있어 디코딩은 자동입니다.
 
@@ -274,7 +274,7 @@ ALTER TABLE pp.tm_tag_point WITH extensions = {
 
 | 베이스 컬럼 타입 | 청크 인코딩 |
 | --- | --- |
-| `double` | Chimp128 값 스트림 |
+| `double` | ALP (십진 ALP 또는 ALP-RD, 섹션 첫 바이트가 지목) |
 | `boolean` | 1비트 팩 |
 | `int`, `date` | 4바이트 고정폭 + zigzag varint 델타 (`date`는 부호 없는 일수지만 4바이트 그대로 왕복) |
 | `bigint`, `timestamp`, `time` | 8바이트 고정폭 + zigzag varint 델타 (정규화 없음: 각각 원값·epoch millis·자정 이후 나노초) |

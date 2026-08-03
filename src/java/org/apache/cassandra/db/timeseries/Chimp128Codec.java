@@ -37,8 +37,12 @@ import java.util.Arrays;
  * {@link java.nio.BufferUnderflowException} -- callers must treat all three as "corrupt chunk".
  * Buffers are read big-endian regardless of the caller's configured byte order.
  *
- * <p>The value stream alone ({@link #encodeValues} / {@link ValueDecoder}) is also the only double
- * codec of the columnar chunk format, {@link ColumnarChunkCodec} (version 3).
+ * <p><b>No longer the columnar format's double codec.</b> {@link ColumnarChunkCodec} (version 3)
+ * encoded its DOUBLE columns with the value stream below until {@link AlpCodec} replaced it; the
+ * v3 type code that named it, {@code 0x01}, is now permanently reserved and rejected on read. This
+ * class survives as the version-2 single-column format (still reachable through
+ * {@link ChunkCodecs}) and as the recorded size baseline ALP is measured against in
+ * {@code AlpCodecTest} -- which is the only remaining caller of {@link #encodeValues}.
  */
 public final class Chimp128Codec
 {
@@ -109,9 +113,12 @@ public final class Chimp128Codec
     /**
      * Encodes only the value stream (ring-XOR deltas) with no timestamps interleaved -- the
      * counterpart to the per-sample loop inside {@link #encode}, minus the
-     * {@link TimestampCodec#writeDod} calls. Used by {@link ColumnarChunkCodec} (chunk format
-     * version 3) to store a DOUBLE_CHIMP column section against the chunk's shared timestamp axis
-     * instead of duplicating it per column. See {@link ValueDecoder} for the matching reader.
+     * {@link TimestampCodec#writeDod} calls. This was how {@link ColumnarChunkCodec} stored a
+     * DOUBLE_CHIMP column section against the chunk's shared timestamp axis; {@link AlpCodec}
+     * replaced it, and the sole remaining caller is the size-regression baseline in
+     * {@code AlpCodecTest}, which must keep measuring ALP against what chimp128 actually achieved.
+     * Retained for that reason -- deleting it would leave the "ALP is not a regression" number with
+     * nothing to compare to. See {@link ValueDecoder} for the matching reader.
      */
     static void encodeValues(BitWriter bits, double[] values, int count)
     {
