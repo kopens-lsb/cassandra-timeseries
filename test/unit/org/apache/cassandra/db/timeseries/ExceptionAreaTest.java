@@ -138,19 +138,38 @@ public class ExceptionAreaTest
     }
 
     /**
-     * §5 rule 3 in its cheapest form: {@link BitPacking#EXCEPTION_AREA_OVERHEAD} is the number the
-     * width chooser scores an area with, and it is 16 where the layout is 8. The discrepancy is
-     * documented on {@link ExceptionArea#encodedLength}; it is asserted here so that a later commit
-     * reconciling the two finds a red test rather than a silent change to every chunk's bytes.
+     * §5 rule 3 in its cheapest form: the number the width chooser scores an exception area with
+     * must be the number of bytes the area actually occupies.
+     *
+     * <p>This once pinned a <em>disagreement</em>. §5's prose gave the cost formula a fixed term of
+     * 16 while giving the layout an eight-byte header, and the code followed both -- so
+     * {@link BitPacking#chooseWidth} over-charged every width carrying exceptions by exactly eight
+     * bytes. That was conservative and reproducible, but it could pick a width one step wider than
+     * the true minimum, which is real bytes on every chunk in the cluster. The layout won, the doc's
+     * formula was corrected, and this test now protects the fix in both directions: that
+     * {@link BitPacking#EXCEPTION_AREA_OVERHEAD} is the layout's own header size (it is
+     * {@link ExceptionArea#HEADER_BYTES} by reference, so this asserts the reference has not been
+     * re-literalised), and that {@code widthCost}'s whole exception term equals
+     * {@link ExceptionArea#encodedLength} at every count and every {@code W}.
+     *
+     * <p>A width-0 lane costs no lane bytes, so {@code widthCost(n, 0, count, W)} <em>is</em> the
+     * exception term with nothing else in it -- which is what makes the comparison exact rather than
+     * a subtraction that could hide an error in either operand.
      */
     @Test
-    public void widthChooserOverheadDisagreesWithTheLayoutByEightBytes()
+    public void widthChooserOverheadIsTheLayoutsOwnHeaderSize()
     {
-        assertEquals(16, BitPacking.EXCEPTION_AREA_OVERHEAD);
+        assertEquals(ExceptionArea.HEADER_BYTES, BitPacking.EXCEPTION_AREA_OVERHEAD);
+        assertEquals(8, BitPacking.EXCEPTION_AREA_OVERHEAD);
         for (int width : new int[]{ 2, 4, 8 })
             for (int count = 1; count < 40; count++)
-                assertEquals(BitPacking.widthCost(64, 0, count, width),
-                             ExceptionArea.encodedLength(count, width) + 8);
+                assertEquals("count " + count + " W " + width,
+                             BitPacking.widthCost(64, 0, count, width),
+                             ExceptionArea.encodedLength(count, width));
+        // And no area at all when there are no exceptions: the cost function must not charge a
+        // header for a block whose blockFlags bit 4 stays clear.
+        for (int width : new int[]{ 2, 4, 8 })
+            assertEquals(0L, BitPacking.widthCost(64, 0, 0, width));
     }
 
     // -----------------------------------------------------------------------------------------

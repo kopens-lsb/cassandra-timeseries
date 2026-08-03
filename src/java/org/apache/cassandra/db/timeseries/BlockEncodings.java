@@ -81,18 +81,20 @@ import java.util.Arrays;
  * as the value descends, so {@code rawBits(v) - rawBits(min)} is not a residual at all. Doubles are
  * ALP's or they are {@code RAW}.
  *
- * <p><b>The ALP seam.</b> {@code 0x20} and {@code 0x21} are declared, routed and never produced by
- * this layer; {@link DoubleBlockCodec} is the interface the later phase implements over the existing
- * {@code AlpCodec}. What it must supply is on that interface, and one requirement is worth repeating
- * here because it is not local to it: the codec must be a build-time constant, identical on every
- * node. A codec that is present on some replicas and absent on others is a byte-determinism break of
- * exactly the shape §12 calls the format's largest risk.
+ * <p><b>The ALP seam.</b> {@code 0x20} and {@code 0x21} are declared and routed here and framed
+ * there: {@link DoubleBlockCodec} is the interface, {@link AlpBlockCodec} the implementation over
+ * the existing {@code AlpCodec}. What a codec must supply is on that interface, and one requirement
+ * is worth repeating here because it is not local to it: the codec must be a build-time constant,
+ * identical on every node. A codec that is present on some replicas and absent on others is a
+ * byte-determinism break of exactly the shape §12 calls the format's largest risk -- which is why
+ * {@link AlpBlockCodec#INSTANCE} is the only way to obtain one and there is no switch that removes
+ * it.
  *
- * <p>Corruption is {@link IllegalArgumentException} (§11), including an ALP code arriving while no
- * codec is installed -- no encoder in this build can emit one, so inside a v4 payload it is a
- * flipped bit. The scalar decode path allocates nothing per value: lanes unpack into a
- * caller-supplied {@code long[]}, width choice reuses a caller-supplied histogram, and the exception
- * buffers live in a caller-supplied {@link Scratch}.
+ * <p>Corruption is {@link IllegalArgumentException} (§11), including an ALP code arriving on a
+ * caller that passed no codec: a v4 payload's encoding byte is only meaningful to a build that can
+ * decode it, so inside one it is a flipped bit. The scalar decode path allocates nothing per value:
+ * lanes unpack into a caller-supplied {@code long[]}, width choice reuses a caller-supplied
+ * histogram, and the exception buffers live in a caller-supplied {@link Scratch}.
  */
 public final class BlockEncodings
 {
@@ -105,17 +107,17 @@ public final class BlockEncodings
     // -----------------------------------------------------------------------------------------
 
     /**
-     * What a later phase must supply to make {@code 0x20 ALP} and {@code 0x21 ALP_RD} live. The
-     * existing {@code AlpCodec} already has the parameter search, the exception extraction and the
-     * strictfp discipline; the work is a body layout that obeys §5 and §6 and an adapter to this
-     * interface.
+     * What makes {@code 0x20 ALP} and {@code 0x21 ALP_RD} live. {@link AlpBlockCodec} is the
+     * implementation; this is the contract it is held to, kept here because it is a property of the
+     * seam rather than of one codec.
      *
-     * <p>The contract, in the order it will bite:
+     * <p>The contract, in the order it bites:
      *
      * <ul>
      * <li>{@link #payloadLength} must be an <b>exact closed form</b> computed from a parameter
      *     search, not a trial encode. §5 rule 3 forbids encode-and-compare, and the argmin here
-     *     calls it before any bytes exist.</li>
+     *     calls it before any bytes exist -- the section lays out every following block's
+     *     {@code bodyOffset} from the number it returns.</li>
      * <li>The parameter search must be reproducible: {@code strictfp}, a table of exact powers of
      *     ten rather than {@code Math.pow}, and a <b>specified</b> tie-break over {@code (e, f)}
      *     candidates. §12 names the unspecified tie-break as a concrete risk.</li>
@@ -125,11 +127,29 @@ public final class BlockEncodings
      * <li>Every payload must be a multiple of 8 bytes and every pad byte 0x00, verified on decode
      *     (§5 rule 5, §6).</li>
      * <li>Exceptions go in the shared {@link ExceptionArea}, {@code W} 8 for ALP and
-     *     {@link ExceptionArea#VALUE_BYTES_ALP_RD_LEFT} for ALP-RD's left parts, and
-     *     {@code blockFlags} bit 4 must agree with whether one was written.</li>
+     *     {@link ExceptionArea#VALUE_BYTES_ALP_RD_LEFT} for ALP-RD's left parts.</li>
      * <li>NaN payloads, -0.0, subnormals and the infinities must survive bit-exactly; a port that
      *     normalises NaN passes a round-trip test on ordinary data and corrupts a real column.</li>
+     * <li>The codec is a build-time constant. One that is present on some replicas and absent on
+     *     others makes identical input produce different bytes, which §12 calls the format's largest
+     *     risk.</li>
      * </ul>
+     *
+     * <p><b>An ALP block leaves {@code blockFlags} bit 4 clear even when it carries an exception
+     * area</b>, and {@link #decodeFixed} rejects one that has it set. The bit is how
+     * {@code FOR_BITPACK} and {@code DELTA_FOR_BITPACK} say "an area follows the lane", and those
+     * two publish their exception count into {@link Choice} so the section's layout can set it. This
+     * interface has no such channel -- {@link #payloadLength} returns a length and nothing else --
+     * and {@link #decode} is handed the derived body length rather than the flag, so a codec could
+     * neither set the bit nor read it.
+     *
+     * <p>A codec that carries exceptions must therefore say so <em>inside its payload</em>, and must
+     * check that against the length it was handed; {@link AlpBlockCodec#FLAG_HAS_EXCEPTIONS} is how.
+     * Length arithmetic alone is not enough and the difference is not academic: a body length
+     * corrupted downwards by exactly an area's size makes the block parse as a shorter,
+     * self-consistent one whose exception rows come back as whatever their filler lane slot decodes
+     * to -- wrong values, no throw. Bit 4 is what stops the same thing happening to
+     * {@code FOR_BITPACK}.
      */
     public interface DoubleBlockCodec
     {
@@ -926,6 +946,13 @@ public final class BlockEncodings
                 requireNonEmpty(count, encoding);
                 if (typeCode != ChunkV4Directory.TYPE_DOUBLE)
                     throw new IllegalArgumentException("Corrupt v4 chunk: ALP encoding on a non-double column");
+                // An ALP block's exception area is located by arithmetic on payloadLength, not by
+                // this flag -- see the DoubleBlockCodec javadoc. Bit 4 is therefore always clear on
+                // one, and a set bit is a flipped bit rather than a variant spelling.
+                if (hasExceptions)
+                    throw new IllegalArgumentException("Corrupt v4 chunk: blockFlags bit 4 set on encoding 0x" +
+                                                       Integer.toHexString(encoding) + "; an ALP block locates its " +
+                                                       "exception area by payload length and leaves the bit clear");
                 requireAlp(alp, encoding).decode(encoding, payload, payloadLength, count, dst);
                 break;
             }
@@ -1225,12 +1252,13 @@ public final class BlockEncodings
 
     private static DoubleBlockCodec requireAlp(DoubleBlockCodec alp, int encoding)
     {
-        // Not UnsupportedOperationException: no encoder in this build emits 0x20 or 0x21, so inside
-        // a v4 payload the byte is a flipped bit and §11 says corruption is skipped, not propagated.
+        // Not UnsupportedOperationException: a v4 encoder and a v4 reader are the same build (§9),
+        // so a reader that was handed no codec cannot be looking at bytes one wrote -- inside a v4
+        // payload the byte is a flipped bit, and §11 says corruption is skipped, not propagated.
         if (alp == null)
             throw new IllegalArgumentException("Corrupt v4 chunk: block encoding 0x" + Integer.toHexString(encoding) +
-                                               " but this build has no ALP codec installed, so no v4 encoder can " +
-                                               "have written one");
+                                               " but no ALP codec was passed, so no v4 encoder this reader shares a " +
+                                               "build with can have written one");
         return alp;
     }
 

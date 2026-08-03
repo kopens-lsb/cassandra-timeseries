@@ -76,10 +76,17 @@ public class BlockEncodingsTest
 
     /**
      * The same encoding with the shared exception area, and the reason §5 made it shared. Seven
-     * values need two bits and one needs forty; the exception costs 24 bytes where widening the lane
-     * to 40 bits would cost 32 more than the two-bit lane. §5's argmin scores both at 40 (its
-     * exception term is 8 bytes over-stated -- see {@code ExceptionAreaTest}), so the tie goes to
-     * the smaller width, and the emitted body really is 40 bytes.
+     * values need two bits and one needs forty.
+     *
+     * <p>The argmin scores the two-bit lane at {@code 8 lane + 8 area header + 16 area body} = 32
+     * against the forty-bit lane's 40, so the exception wins outright. It used to win it as a tie:
+     * while {@code EXCEPTION_AREA_OVERHEAD} was 16 both candidates scored 40 and the §5 smallest-w
+     * rule decided it. Reconciling the constant with the layout turned the tie into a strict win and
+     * left the chosen width, and therefore every byte below, unchanged -- but that had to be
+     * recomputed rather than assumed, since a width move here would silently rewrite the vector.
+     *
+     * <p>The <em>emitted</em> body is 40 bytes either way: the cost function is what picks the
+     * width, and the width it picked is the one the bytes are packed at.
      */
     @Test
     public void goldenVectorForFrameOfReferenceWithAnException()
@@ -89,6 +96,11 @@ public class BlockEncodingsTest
         assertEquals(ChunkV4BlockTable.ENC_FOR_BITPACK, encoded.choice.encoding);
         assertEquals(2, encoded.choice.width);
         assertEquals(1, encoded.choice.exceptionCount);
+
+        // The two scores the width chooser compared, stated as numbers so a change to either the
+        // lane sizing or the exception term shows up here rather than as a moved golden vector.
+        assertEquals(32L, BitPacking.widthCost(8, 2, 1, 8));
+        assertEquals(40L, BitPacking.widthCost(8, 40, 0, 8));
 
         // lane: the outlier's slot carries the specified filler 0, the rest pack at two bits.
         assertEquals(0x24E4L, 0L | (1L << 2) | (2L << 4) | (3L << 6) | (0L << 8) | (1L << 10) | (2L << 12));
@@ -419,7 +431,45 @@ public class BlockEncodingsTest
             .isInstanceOf(IllegalArgumentException.class);
     }
 
-    /** The seam routes by exact size like every other candidate, and only for doubles. */
+    /**
+     * The seam with its real occupant: {@link AlpBlockCodec} displaces {@code RAW} on decimal data,
+     * through the same argmin as everything else.
+     *
+     * <p>The exhaustive behaviour of the codec -- bit-exactness, framing, the variant choice -- is
+     * {@code DoubleBlockCodecTest}'s. What belongs here is only that this layer routes to it and that
+     * the routing is a size decision.
+     */
+    @Test
+    public void theRealAlpCodecDisplacesRawForADoubleBlock()
+    {
+        long[] values = new long[256];
+        for (int i = 0; i < values.length; i++)
+            values[i] = Double.doubleToRawLongBits(20.0 + (i % 97) * 0.01);
+
+        Encoded withoutCodec = encodeFixed(ChunkV4Directory.TYPE_DOUBLE, values, null, null);
+        assertEquals(ChunkV4BlockTable.ENC_RAW, withoutCodec.choice.encoding);
+
+        Encoded withCodec = encodeFixed(ChunkV4Directory.TYPE_DOUBLE, values, null, AlpBlockCodec.INSTANCE);
+        assertEquals(ChunkV4BlockTable.ENC_ALP, withCodec.choice.encoding);
+        assertTrue(withCodec.bytes.length < withoutCodec.bytes.length);
+        assertEquals(0, withCodec.bytes.length % 8);
+        // An ALP block signals its exception area inside the payload, so it never sets bit 4.
+        assertEquals(0, withCodec.choice.exceptionCount);
+
+        long[] decoded = new long[values.length];
+        BlockEncodings.decodeFixed(withCodec.choice.encoding, false, ByteBuffer.wrap(withCodec.bytes),
+                                   withCodec.bytes.length, ChunkV4Directory.TYPE_DOUBLE, values.length, 0, null,
+                                   AlpBlockCodec.INSTANCE, new BlockEncodings.Scratch(256), decoded);
+        assertArrayEquals(values, decoded);
+    }
+
+    /**
+     * The seam routes by exact size like every other candidate, and only for doubles.
+     *
+     * <p>This one deliberately uses a stub rather than {@link AlpBlockCodec}: it is about the routing
+     * arithmetic in {@link BlockEncodings}, and a stub with a trivially predictable size keeps the
+     * assertion about the argmin rather than about ALP's compression.
+     */
     @Test
     public void theAlpSeamIsRoutedToWhenItIsSmaller()
     {
@@ -692,7 +742,7 @@ public class BlockEncodingsTest
                                                ChunkV4Directory.TYPE_INT32, ChunkV4Directory.TYPE_INT64,
                                                ChunkV4Directory.TYPE_DATE32 };
 
-    /** A stand-in for the later ALP phase: 8 verbatim bytes per value, exact and 8-aligned. */
+    /** A stub with a trivially predictable size: 8 verbatim bytes per value, exact and 8-aligned. */
     private static final class VerbatimDoubleCodec implements BlockEncodings.DoubleBlockCodec
     {
         public long payloadLength(int encoding, long[] rawBits, int count)

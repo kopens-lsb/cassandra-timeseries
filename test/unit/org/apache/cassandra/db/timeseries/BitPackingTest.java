@@ -341,26 +341,35 @@ public class BitPackingTest
     }
 
     /**
-     * An input constructed so that two widths cost exactly the same number of bytes: 64 values, 52
-     * of them 8 bits wide and 12 of them 16, with 2-byte exception values.
+     * An input constructed so that two widths cost exactly the same number of bytes: 64 values, 50
+     * of them 8 bits wide and 14 of them 16, with 2-byte exception values.
      *
-     * <p>Width 8 pays 64 lane bytes plus a 16-byte exception header plus {@code roundUp8(12*4)} =
-     * 48, so 128. Width 16 pays 128 lane bytes and no exceptions, so 128. §5 says the smaller width
-     * wins, and it is a determinism rule rather than a size preference: a replica resolving this
-     * tie the other way writes a byte-different chunk, {@code chunkUnchanged} sees a difference, and
-     * every chunk is rewritten every cycle.
+     * <p>Width 8 pays 64 lane bytes plus the exception area's 8-byte header plus
+     * {@code roundUp8(14*4)} = 56, so 128. Width 16 pays 128 lane bytes and no exceptions, so 128.
+     * §5 says the smaller width wins, and it is a determinism rule rather than a size preference: a
+     * replica resolving this tie the other way writes a byte-different chunk,
+     * {@code chunkUnchanged} sees a difference, and every chunk is rewritten every cycle.
+     *
+     * <p><b>The split was 52/12 while {@code EXCEPTION_AREA_OVERHEAD} was 16</b>, which cost width 8
+     * exactly the same 128 under the old constant. Reconciling the constant with the layout made
+     * that input a strict win for width 8 (120 against 128) and so no tie at all -- a test that
+     * would still have passed while testing nothing, which is why the numbers were recomputed rather
+     * than assumed. Two exceptions more restore an exact tie under the corrected term.
      */
     @Test
     public void chooseWidthBreaksAnExactTieTowardsTheSmallerWidth()
     {
         long[] values = new long[64];
-        Arrays.fill(values, 0, 52, 0xFFL);
-        Arrays.fill(values, 52, 64, 0xFFFFL);
+        Arrays.fill(values, 0, 50, 0xFFL);
+        Arrays.fill(values, 50, 64, 0xFFFFL);
 
-        assertEquals(128L, BitPacking.widthCost(64, 8, 12, 2));
+        assertEquals(128L, BitPacking.widthCost(64, 8, 14, 2));
         assertEquals(128L, BitPacking.widthCost(64, 16, 0, 2));
-        assertEquals(12, BitPacking.exceptionCount(values, 64, 8));
+        assertEquals(14, BitPacking.exceptionCount(values, 64, 8));
         assertEquals(0, BitPacking.exceptionCount(values, 64, 16));
+        // The tie is between these two and nothing narrower: every width below 8 makes all 64
+        // values exceptions and costs at least 264.
+        assertEquals(264L, BitPacking.widthCost(64, 0, 64, 2));
 
         assertEquals(8, BitPacking.chooseWidth(values, 64, 2));
         assertEquals(8, bruteForceWidth(values, 64, 2));
@@ -383,10 +392,12 @@ public class BitPackingTest
         // no exceptions: lane bytes only
         assertEquals(8L, BitPacking.widthCost(64, 1, 0, 8));
         assertEquals(8192L, BitPacking.widthCost(1024, 64, 0, 8));
-        // one exception: fixed 16 plus roundUp8(1 * (2 + 8)) = 16
-        assertEquals(1024L + 16 + 16, BitPacking.widthCost(1024, 8, 1, 8));
+        // one exception: the area's own 8-byte header plus roundUp8(1 * (2 + 8)) = 16
+        assertEquals(1024L + 8 + 16, BitPacking.widthCost(1024, 8, 1, 8));
         // the exception body rounds up to 8
-        assertEquals(1024L + 16 + 24, BitPacking.widthCost(1024, 8, 2, 8));
+        assertEquals(1024L + 8 + 24, BitPacking.widthCost(1024, 8, 2, 8));
+        // and the fixed term really is the area's header rather than a number of its own
+        assertEquals(8, BitPacking.EXCEPTION_AREA_OVERHEAD);
     }
 
     @Test
@@ -420,8 +431,10 @@ public class BitPackingTest
                     exceptions++;
             long lanes = (((long) count * width + 63) / 64) * 8;
             long cost = lanes;
+            // 8, not 16: §5's fixed term is the exception area's own header, excCount u16 | pad u16
+            // | pad u32. See ExceptionAreaTest.widthChooserOverheadIsTheLayoutsOwnHeaderSize.
             if (exceptions > 0)
-                cost += 16 + ((((long) exceptions * (2 + exceptionValueBytes)) + 7) / 8) * 8;
+                cost += 8 + ((((long) exceptions * (2 + exceptionValueBytes)) + 7) / 8) * 8;
             if (cost < bestCost)
             {
                 bestCost = cost;

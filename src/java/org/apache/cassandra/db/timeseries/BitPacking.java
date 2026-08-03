@@ -78,15 +78,23 @@ public final class BitPacking
 
     /**
      * Fixed overhead §5 charges to a block that carries any exception at all, on top of the
-     * {@code roundUp8(excCount * (2 + W))} body. §5 states the constant as 16 and the layout as
-     * {@code excCount u16 | pad | (position u16, value W bytes)*} padded to 8.
+     * {@code roundUp8(excCount * (2 + W))} body: the exception area's own header,
+     * {@code excCount u16 | pad u16 | pad u32}.
+     *
+     * <p><b>It is {@link ExceptionArea#HEADER_BYTES} by reference rather than by repetition</b>,
+     * because the two numbers must be one number. §5's prose stated the cost term as 16 while
+     * stating the layout as an eight-byte header; the layout is what describes bytes on disk, so it
+     * won, and the doc's formula was corrected with the commit that changed this constant. Writing
+     * the reference instead of the literal is what stops that contradiction from being reachable a
+     * second time: a later phase that re-lays the area out changes one field and the width chooser
+     * follows it.
      *
      * <p>This number is not decorative: it is one of the two terms of the argmin, so it must equal
-     * what the encoder actually emits. If a later phase lays the exception area out with a
-     * different header size, it must change this constant in the same commit, or the width chooser
-     * silently optimises a size function that no longer describes the bytes on disk.
+     * what the encoder actually emits. When it was 16 the chooser over-charged every width carrying
+     * exceptions by exactly eight bytes -- conservative and reproducible, but able to pick a width
+     * one step wider than the true minimum, which is real bytes on every chunk in the cluster.
      */
-    public static final int EXCEPTION_AREA_OVERHEAD = 16;
+    public static final int EXCEPTION_AREA_OVERHEAD = ExceptionArea.HEADER_BYTES;
 
     private BitPacking()
     {
@@ -264,6 +272,10 @@ public final class BitPacking
      * §5 width cost: {@code ceil(n*w/64)*8} lane bytes plus, if the block carries any exception at
      * all, {@link #EXCEPTION_AREA_OVERHEAD} plus {@code roundUp8(excCount * (2 + W))} for the
      * shared exception area, where {@code W} is the verbatim value width in bytes.
+     *
+     * <p>The exception term is exactly {@link ExceptionArea#encodedLength(int, int)}, and
+     * {@code ExceptionAreaTest} asserts that equality rather than leaving it to inspection: the
+     * argmin is only meaningful while the size it scores is the size that gets written.
      */
     public static long widthCost(int count, int width, int exceptionCount, int exceptionValueBytes)
     {

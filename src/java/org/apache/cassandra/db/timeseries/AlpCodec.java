@@ -76,12 +76,22 @@ import java.util.Arrays;
  *       {@code strictfp}-sensitive code here must be treated as a determinism regression.</b></li>
  * </ul>
  *
+ * <p><b>The class is declared {@code strictfp} even though, from Java 17, that is redundant.</b>
+ * chunk-format-v4 §5 rule 8 names {@code strictfp} on ALP as a rule and §12 names a non-strict
+ * baseline as a concrete risk; the modifier costs nothing, and it is the only thing that keeps the
+ * guarantee true if this arithmetic is ever moved to a class or a baseline where it is not free.
+ * The value math -- {@link #tryEncode} and {@link #decodeOne} -- lives here and nowhere else, so
+ * this is the class the modifier has to be on.
+ *
  * <p>Corruption surfaces as {@link IllegalArgumentException}, matching
  * {@link ColumnarChunkCodec}'s uniform policy: every length and index read out of the payload is
  * bounds-checked before it sizes an allocation, and a body that runs off the end of the section is
  * rewrapped rather than escaping as {@link IndexOutOfBoundsException}.
  */
-final class AlpCodec
+// The modifier is redundant from Java 17 and javac says so; §5 rule 8 asks for it anyway, so the
+// note is suppressed rather than the rule dropped. See the class javadoc.
+@SuppressWarnings("strictfp")
+final strictfp class AlpCodec
 {
     /** Decimal ALP: scaled integers, frame-of-reference'd and bit-packed, plus verbatim exceptions. */
     static final byte SUBFORMAT_ALP = 0x00;
@@ -213,19 +223,52 @@ final class AlpCodec
     }
 
     /** The value a scaled integer stands for: {@code i * 10^f * 10^-e}. Never NaN or infinite. */
-    private static double decodeOne(long encoded, int e, int f)
+    static double decodeOne(long encoded, int e, int f)
     {
         return encoded * POW10[f] * INV_POW10[e];
     }
 
     static AlpPlan planAlp(long[] rawBits, int count)
     {
-        // Stage 1: score every (e, f) pair on a fixed-stride sample. `ceil` rather than `floor` so
-        // the sample spans the whole block for every count, instead of clustering at the head for
-        // counts just above SAMPLE_LIMIT.
-        int stride = Math.max(1, (count + SAMPLE_LIMIT - 1) / SAMPLE_LIMIT);
+        // Stage 1: the shared (e, f) search, below.
         int[] candidateE = new int[CANDIDATE_LIMIT];
         int[] candidateF = new int[CANDIDATE_LIMIT];
+        int candidates = exponentCandidates(rawBits, count, candidateE, candidateF);
+
+        // Stage 2: measure each surviving candidate exactly over the whole block. Ranked by
+        // (bytes asc, e asc, f asc) -- candidates are already in (score, e, f) order, so a strict
+        // `<` on size keeps the first of any tie, which is the (e, f)-smallest.
+        AlpPlan best = null;
+        for (int c = 0; c < candidates; c++)
+        {
+            AlpPlan plan = measureAlp(rawBits, count, candidateE[c], candidateF[c]);
+            if (best == null || plan.sizeInBytes < best.sizeInBytes)
+                best = plan;
+        }
+        return best;
+    }
+
+    /**
+     * Stage 1 of the {@code (e, f)} search: score every {@code 0 <= f <= e <= 18} pair on a
+     * fixed-stride sample and return the best {@link #CANDIDATE_LIMIT} under the strict total order
+     * (estimated bits asc, {@code e} asc, {@code f} asc), written into {@code candidateE}/
+     * {@code candidateF} in that order.
+     *
+     * <p><b>This is the only implementation of the search, on purpose.</b> Two callers measure its
+     * candidates under two different exact cost functions -- {@link #measureAlp} for the v3 section
+     * layout, {@code AlpBlockCodec} for the v4 block layout -- but the candidate set itself is the
+     * delicate part: it is where the sampling rule, the fixed stride and the tie-break live, and §12
+     * names an unspecified {@code (e, f)} tie-break as a concrete determinism risk. A second copy of
+     * this loop is how two replicas start disagreeing about which exponent pair a block uses, which
+     * is a byte difference, which is every chunk rewritten every cycle.
+     *
+     * @return the number of candidates written, always at least one
+     */
+    static int exponentCandidates(long[] rawBits, int count, int[] candidateE, int[] candidateF)
+    {
+        // `ceil` rather than `floor` so the sample spans the whole block for every count, instead of
+        // clustering at the head for counts just above SAMPLE_LIMIT.
+        int stride = Math.max(1, (count + SAMPLE_LIMIT - 1) / SAMPLE_LIMIT);
         long[] candidateScore = new long[CANDIDATE_LIMIT];
         int candidates = 0;
 
@@ -257,18 +300,7 @@ final class AlpCodec
                 candidates = offer(candidateE, candidateF, candidateScore, candidates, e, f, score);
             }
         }
-
-        // Stage 2: measure each surviving candidate exactly over the whole block. Ranked by
-        // (bytes asc, e asc, f asc) -- candidates are already in (score, e, f) order, so a strict
-        // `<` on size keeps the first of any tie, which is the (e, f)-smallest.
-        AlpPlan best = null;
-        for (int c = 0; c < candidates; c++)
-        {
-            AlpPlan plan = measureAlp(rawBits, count, candidateE[c], candidateF[c]);
-            if (best == null || plan.sizeInBytes < best.sizeInBytes)
-                best = plan;
-        }
-        return best;
+        return candidates;
     }
 
     /**
@@ -416,37 +448,10 @@ final class AlpCodec
     {
         int rightBitWidth = Long.SIZE - leftBits;
         int slots = 1 << leftBits;
-        Arrays.fill(histogram, 0, slots, 0);
         Arrays.fill(codeOf, 0, slots, -1);
-        for (int i = 0; i < count; i++)
-            histogram[(int) (rawBits[i] >>> rightBitWidth)]++;
 
-        // The dictionary is the top RD_MAX_DICTIONARY left parts under (frequency desc, value asc).
-        // Selection scans the histogram array in ascending value order and only displaces an
-        // incumbent on a STRICTLY greater frequency, which realises that order exactly -- and, being
-        // an array scan, cannot inherit a hash table's unspecified iteration order.
         int[] dictionary = new int[RD_MAX_DICTIONARY];
-        int[] frequencies = new int[RD_MAX_DICTIONARY];
-        int dictionarySize = 0;
-        for (int value = 0; value < slots; value++)
-        {
-            int frequency = histogram[value];
-            if (frequency == 0)
-                continue;
-            int position = dictionarySize;
-            while (position > 0 && frequency > frequencies[position - 1])
-                position--;
-            if (position >= RD_MAX_DICTIONARY)
-                continue;
-            for (int i = Math.min(dictionarySize, RD_MAX_DICTIONARY - 1); i > position; i--)
-            {
-                dictionary[i] = dictionary[i - 1];
-                frequencies[i] = frequencies[i - 1];
-            }
-            dictionary[position] = value;
-            frequencies[position] = frequency;
-            dictionarySize = Math.min(dictionarySize + 1, RD_MAX_DICTIONARY);
-        }
+        int dictionarySize = selectRdDictionary(rawBits, count, leftBits, histogram, dictionary);
         // count >= 1 guarantees at least one non-zero bucket, so dictionarySize >= 1 and codeBits is
         // well defined (0 when the whole block shares one left part -- then no code is stored at all).
         for (int code = 0; code < dictionarySize; code++)
@@ -471,6 +476,56 @@ final class AlpCodec
                    + exceptionBytes
                    + packedBytes((long) count * (codeBits + rightBitWidth));
         return new RdPlan(size, leftBits, Arrays.copyOf(dictionary, dictionarySize), exceptions);
+    }
+
+    /**
+     * The ALP-RD dictionary for one {@code leftBits} cut: the top {@link #RD_MAX_DICTIONARY} left
+     * parts under (frequency desc, value asc), written into {@code dictionary} in <b>that</b> order,
+     * i.e. code order, most frequent first.
+     *
+     * <p>Selection scans the histogram array in ascending value order and only displaces an
+     * incumbent on a STRICTLY greater frequency, which realises that total order exactly -- and,
+     * being an array scan, cannot inherit a hash table's unspecified iteration order (§5 rule 7).
+     *
+     * <p><b>This is the only implementation of the dictionary, on purpose</b>, for the reason given
+     * on {@link #exponentCandidates}: the v3 section and the v4 block frame these bytes differently
+     * and cost them differently, but they must agree on <em>which</em> left parts are in the
+     * dictionary, or two replicas encoding the same block disagree byte for byte.
+     *
+     * @param histogram scratch of at least {@code 1 << leftBits} entries; zeroed here, not by the
+     *                  caller, so a reused buffer cannot leak a previous cut's counts into this one
+     * @return the dictionary size, at least 1 whenever {@code count >= 1}
+     */
+    static int selectRdDictionary(long[] rawBits, int count, int leftBits, int[] histogram, int[] dictionary)
+    {
+        int rightBitWidth = Long.SIZE - leftBits;
+        int slots = 1 << leftBits;
+        Arrays.fill(histogram, 0, slots, 0);
+        for (int i = 0; i < count; i++)
+            histogram[(int) (rawBits[i] >>> rightBitWidth)]++;
+
+        int[] frequencies = new int[RD_MAX_DICTIONARY];
+        int dictionarySize = 0;
+        for (int value = 0; value < slots; value++)
+        {
+            int frequency = histogram[value];
+            if (frequency == 0)
+                continue;
+            int position = dictionarySize;
+            while (position > 0 && frequency > frequencies[position - 1])
+                position--;
+            if (position >= RD_MAX_DICTIONARY)
+                continue;
+            for (int i = Math.min(dictionarySize, RD_MAX_DICTIONARY - 1); i > position; i--)
+            {
+                dictionary[i] = dictionary[i - 1];
+                frequencies[i] = frequencies[i - 1];
+            }
+            dictionary[position] = value;
+            frequencies[position] = frequency;
+            dictionarySize = Math.min(dictionarySize + 1, RD_MAX_DICTIONARY);
+        }
+        return dictionarySize;
     }
 
     /** Bits needed to address {@code dictionarySize} codes; 0 for a single-entry dictionary. */
@@ -754,7 +809,7 @@ final class AlpCodec
     }
 
     /** Bits needed to hold {@code span} as an unsigned value; 0 when the span is 0. */
-    private static int bitWidthOf(long span)
+    static int bitWidthOf(long span)
     {
         return Long.SIZE - Long.numberOfLeadingZeros(span);
     }

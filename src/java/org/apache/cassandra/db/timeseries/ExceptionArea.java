@@ -129,17 +129,15 @@ public final class ExceptionArea
      * Zero for {@code count == 0}, because §5 gives the area no representation at all when the
      * block carries no exceptions -- {@code blockFlags} bit 4 is clear and no bytes are written.
      *
-     * <p><b>This does not agree with {@link BitPacking#EXCEPTION_AREA_OVERHEAD}, which is 16.</b>
-     * §5 writes the width-cost formula with a fixed term of 16 and the layout with a header of
-     * {@code excCount u16 | pad u16 | pad u32}, which is 8; the two cannot both be right and the
-     * layout is the one that describes bytes on disk, so the layout wins here. The consequence is
-     * confined and worth stating: {@link BitPacking#chooseWidth} over-charges any width that carries
-     * exceptions by exactly 8 bytes, so it is conservative -- it can pick a width one step wider
-     * than the true minimum, never a wrong or an unstable one, because it is still a pure function
-     * of the input and §5 rule 3's determinism requirement is about reproducibility, not optimality.
-     * Every size this class and {@link BlockEncodings} report for a *body* is the exact emitted
-     * length. Reconciling the two belongs in the commit that owns {@code BitPacking}, since changing
-     * the constant changes chosen widths and therefore every chunk's bytes.
+     * <p><b>This is the same number {@link BitPacking#chooseWidth} scores an exception area at</b>:
+     * {@link BitPacking#EXCEPTION_AREA_OVERHEAD} is {@link #HEADER_BYTES} by reference, so
+     * {@code widthCost}'s exception term is exactly this function. It has not always been: §5's
+     * prose gave the cost formula a fixed term of 16 while giving the layout an eight-byte header,
+     * and until the two were reconciled the chooser over-charged every width carrying exceptions by
+     * eight bytes -- conservative and reproducible, but able to pick a width one step wider than the
+     * true minimum. The layout is what describes bytes on disk, so the layout won and the doc's
+     * formula was corrected. Every size this class and {@link BlockEncodings} report for a *body* is
+     * the exact emitted length, and the argmin now scores exactly those sizes.
      */
     public static int encodedLength(int count, int valueBytes)
     {
