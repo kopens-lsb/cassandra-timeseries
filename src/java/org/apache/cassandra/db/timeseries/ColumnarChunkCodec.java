@@ -36,57 +36,57 @@ import java.util.TreeSet;
 import org.apache.cassandra.utils.ByteArrayUtil;
 
 /**
- * Chunk codec version 3: a columnar format storing many named columns per chunk against one
- * shared timestamp axis, instead of the one-column-per-chunk layout of {@link Chimp128Codec}
- * (version 2). Column values are grouped by column (not interleaved by row) so a reader projecting
- * a subset of columns can skip the rest without decoding them -- every column's data section
- * records its own byte length in the directory for exactly this purpose.
+ * The columnar chunk codec entry point the tiering tree consumes: many named columns per chunk
+ * against one shared timestamp axis, instead of the one-column-per-chunk layout of
+ * {@link Chimp128Codec} (version 2).
  * <p>
- * Per-column encoding is picked to make constant and all-null columns cost O(1) bytes regardless
- * of row count: a column whose present values are all identical stores the value once in the
- * directory (0-byte data section); a column with no present values at all stores nothing. Double
- * columns use {@link AlpCodec} (which internally picks between decimal ALP and ALP-RD, both
- * lossless, and records which in the section); text/opaque columns dictionary-encode when at most
- * 256 distinct present values occur, else fall back to length-prefixed raw bytes.
+ * <b>As of chunk format v4 this class is a routing layer over {@link ChunkV4Codec}</b>, which owns
+ * the block-based layout (see doc/timeseries/chunk-format-v4.md). {@link #encode} and
+ * {@link #cursor} delegate to it, and {@link #VERSION} is v4's version byte. The class survives as
+ * the entry point -- rather than every reader learning a new name -- because its <em>contracts</em>
+ * are unchanged and v4 was built to slot in behind them:
+ * <ul>
+ *   <li>{@link ChunkV4Codec.Cursor} implements both {@link ColumnarCursor} and
+ *       {@link ArrayValueCursor}, so {@code ChunkReadSupport}, {@code TieredStorageService} and
+ *       {@code ColdWindowChunkFlush} consume it without a shape change;</li>
+ *   <li>the header peeks below read offsets 0/1/5/13, which v4 deliberately kept at v3's
+ *       positions (v4 §3) precisely so these stay O(1) header lookups;</li>
+ *   <li>corruption is {@link IllegalArgumentException} and the read path skips the one chunk; a
+ *       version byte naming a real-but-removed format (1, 2, and now 3) is an
+ *       {@link UnsupportedChunkFormatException} that must never be swallowed. The classification
+ *       lives in {@link ChunkCodecs#unsupportedVersion}, in one place;</li>
+ *   <li>encoding is byte-deterministic: identical input encodes to identical bytes on every node,
+ *       JVM and JIT tier, which is what lets the re-encoder's {@code chunkUnchanged} compare
+ *       payload bytes (v4 §5).</li>
+ * </ul>
  * <p>
- * <b>Doubles travel as raw bit patterns, never as {@code double}s.</b> A double cell's serialized
- * form is its 8 big-endian IEEE-754 bytes, and that is what the encoder reads
- * ({@code ByteBuffer.getLong}) and what the decoder hands back ({@link ByteArrayUtil#bytes(long)}).
- * Nothing on the path calls {@code Double.longBitsToDouble} as a way of <em>carrying</em> a value,
- * so no NaN payload can be quietly canonicalised in transit and no {@code -0.0} can be flattened;
- * {@link AlpCodec} views the bits as a number only inside its own arithmetic, whose result it
- * verifies against the original pattern.
- * <p>
- * Layout: {@code HEADER_SIZE}-byte header (version, row count, first/last timestamp, column
- * count, directory size) -- column directory (one entry per column, sorted by name) -- null
- * presence bitmaps (RLE, skipped for columns that are all-present or all-null) -- timestamps
- * (first value raw, then a {@link TimestampCodec#writeDod}/{@link TimestampCodec#readDod}
- * delta-of-delta bitstream) -- column data sections, one per column, each exactly the
- * {@code sectionLen} bytes recorded for it in the directory.
- * <p>
- * Corruption surfaces as {@link IllegalArgumentException} (stricter than version 2, which may
- * also throw {@link IndexOutOfBoundsException} or {@link java.nio.BufferUnderflowException}):
- * every parsing path here is wrapped so truncated/malformed payloads are reported uniformly.
- * Buffers are read big-endian and never mutated.
- * <p>
- * <b>Buffer contract for decoded values.</b> The {@link ByteBuffer}s a {@link ColumnarCursor} hands
- * back are read-only <em>by contract, not by type</em> ({@code asReadOnlyBuffer()} is deliberately
- * not used -- a read-only heap buffer reports {@code hasArray() == false}, which sends Cassandra's
+ * <b>Buffer contract for decoded values</b> (unchanged from v3, restated because every caller
+ * depends on it). The {@link ByteBuffer}s a {@link ColumnarCursor} hands back are read-only
+ * <em>by contract, not by type</em> ({@code asReadOnlyBuffer()} is deliberately not used -- a
+ * read-only heap buffer reports {@code hasArray() == false}, which sends Cassandra's
  * {@code FastByteOperations} down its direct-buffer branch and segfaults the JVM on the first
- * comparison). A caller must therefore treat every returned buffer as immutable, because within one
- * cursor <b>backing arrays are shared</b>: a constant column returns buffers over a single array,
- * and a dictionary-encoded text/opaque column returns one array per distinct value shared by every
- * row that uses it. Sharing rather than copying is the point of those two encodings -- a constant
- * column over 10k rows would otherwise allocate 10k identical arrays, which is exactly the cost the
- * O(1) encoding exists to avoid -- and it is safe because cursors are per-decode and Cassandra never
- * mutates a cell value. (Fixed-width columns happen to serialize afresh on every access; do not rely
- * on that.) The same contract governs {@link ArrayValueCursor#getByteArray}, which is the same value
- * without the wrapper.
+ * comparison). A caller must treat every returned buffer as immutable, because within one cursor
+ * <b>backing arrays are shared</b>: a constant column returns buffers over a single array, and a
+ * dictionary-encoded text/opaque column returns one array per distinct value shared by every row
+ * that uses it. The same contract governs {@link ArrayValueCursor#getByteArray}, which is the same
+ * value without the wrapper.
+ * <p>
+ * <b>The v3 implementation is retained below, private and unreachable</b> -- the delta-of-delta
+ * timestamp bitstream, the RLE null bitmaps, the 25-byte-header encode/decode -- pending the
+ * separate cleanup commit that deletes it together with {@link BitWriter}/{@link BitReader},
+ * {@link TimestampCodec}, {@link Chimp128Codec} and {@link AlpCodec}'s v3 container framing.
+ * Nothing routes to it: v3 is a removed format, no v3 chunk was ever written by a production
+ * deployment (tiering was never enabled), and a v3 payload is rejected by version byte as
+ * {@link UnsupportedChunkFormatException}. Only the varint/zigzag primitives near the middle of
+ * this file are still live -- {@link AlpCodec} shares them.
  */
 public final class ColumnarChunkCodec
 {
-    public static final byte VERSION = 3;
-    public static final int HEADER_SIZE = 25;
+    /** The one format written and read: v4 (§9: the byte means "the entire layout is v4"). */
+    public static final byte VERSION = ChunkV4Codec.VERSION;
+
+    /** v3's 25-byte header, referenced only by the unreachable v3 implementation below. */
+    static final int V3_HEADER_SIZE = 25;
 
     /**
      * Hard per-chunk row limit. The format itself would take any positive {@code int}, but a chunk
@@ -120,13 +120,16 @@ public final class ColumnarChunkCodec
      */
     static final byte TYPE_DOUBLE_CHIMP_REMOVED = 0x01;
 
-    public static final byte TYPE_BOOLEAN = 0x02;
-    public static final byte TYPE_INT32 = 0x03;
-    public static final byte TYPE_INT64 = 0x04;
-    public static final byte TYPE_TEXT = 0x05;
-    public static final byte TYPE_OPAQUE = 0x06;
-    /** The one double encoding: {@link AlpCodec}, decimal ALP or ALP-RD per its own sub-format byte. */
-    public static final byte TYPE_DOUBLE_ALP = 0x07;
+    // v3's type codes, referenced only by the unreachable v3 implementation below. The live (v4)
+    // codes are ChunkV4Directory.TYPE_* and are NOT the same numbers: v4 moved DOUBLE to 0x01 and
+    // TEXT/OPAQUE up by one to make room for DATE32 (v4 §4).
+    static final byte TYPE_BOOLEAN = 0x02;
+    static final byte TYPE_INT32 = 0x03;
+    static final byte TYPE_INT64 = 0x04;
+    static final byte TYPE_TEXT = 0x05;
+    static final byte TYPE_OPAQUE = 0x06;
+    /** v3's one double encoding: {@link AlpCodec}, decimal ALP or ALP-RD per its own sub-format byte. */
+    static final byte TYPE_DOUBLE_ALP = 0x07;
 
     /**
      * The live type-code range, {@code [TYPE_BOOLEAN, TYPE_DOUBLE_ALP]}. Codes below it
@@ -151,23 +154,41 @@ public final class ColumnarChunkCodec
     }
 
     /**
-     * One column's input to {@link #encode}: its type and its values, in row order (null = absent).
-     * The type code is authoritative -- it is the code written to the directory verbatim, so it must
-     * be one of the {@code TYPE_*} constants above.
+     * One column's input to the retired {@link #encodeV3}: its v3 type code and its values, in row
+     * order (null = absent). Unreachable -- the live input type is {@link ChunkV4Codec.ColumnInput},
+     * which additionally declares the {@link StatOrder} the column's pruning statistics are computed
+     * under.
      */
-    public static final class ColumnInput
+    static final class ColumnInput
     {
-        public final byte typeCode;
-        public final ByteBuffer[] values;
+        final byte typeCode;
+        final ByteBuffer[] values;
 
-        public ColumnInput(byte typeCode, ByteBuffer[] values)
+        ColumnInput(byte typeCode, ByteBuffer[] values)
         {
             this.typeCode = typeCode;
             this.values = values;
         }
     }
 
-    public static ByteBuffer encode(long[] timestamps, int count, SortedMap<String, ColumnInput> columns)
+    /**
+     * Encodes one chunk in the v4 layout: routes to {@link ChunkV4Codec#encode} at v4.0's block
+     * size. The returned payload spans exactly one chunk from position 0 to its limit, is
+     * heap-backed and big-endian, and is a total function of the input -- identical rows encode to
+     * identical bytes on every node and JIT tier, which the re-encoder's {@code chunkUnchanged}
+     * byte comparison depends on (v4 §5).
+     *
+     * @param columns one {@link ChunkV4Codec.ColumnInput} per column. Any {@link SortedMap} is
+     *                accepted and its comparator is ignored: the encoder re-sorts into natural
+     *                {@code String} order itself (§5 rule 1), so the directory's determinism does
+     *                not depend on how the caller built the map.
+     */
+    public static ByteBuffer encode(long[] timestamps, int count, SortedMap<String, ChunkV4Codec.ColumnInput> columns)
+    {
+        return ChunkV4Codec.encode(timestamps, count, columns);
+    }
+
+    private static ByteBuffer encodeV3(long[] timestamps, int count, SortedMap<String, ColumnInput> columns)
     {
         if (count < 1)
             throw new IllegalArgumentException("count must be >= 1, got " + count);
@@ -216,11 +237,11 @@ public final class ColumnarChunkCodec
         for (byte[] section : dataSections)
             dataSize += section.length;
 
-        int totalSize = HEADER_SIZE + dirSize + nullBitmaps.size() +
+        int totalSize = V3_HEADER_SIZE + dirSize + nullBitmaps.size() +
                          Long.BYTES + timestampBits.sizeInBytes() + dataSize;
 
         ByteBuffer out = ByteBuffer.allocate(totalSize).order(ByteOrder.BIG_ENDIAN);
-        out.put(VERSION);
+        out.put(ChunkCodecs.COLUMNAR_V3_VERSION_REMOVED);
         out.putInt(count);
         out.putLong(timestamps[0]);
         out.putLong(timestamps[count - 1]);
@@ -524,7 +545,25 @@ public final class ColumnarChunkCodec
         return (value >>> 1) ^ -(value & 1);
     }
 
+    /**
+     * A forward-only cursor over the chunk's rows, restricted to {@code projection} ({@code null} =
+     * every column): routes to {@link ChunkV4Codec#cursor}. Unprojected columns' sections are never
+     * parsed. The returned cursor also implements {@link ArrayValueCursor}, and its buffers carry
+     * the immutability contract in the class javadoc.
+     * <p>
+     * A corrupt payload throws {@link IllegalArgumentException}; a version byte naming a removed
+     * format (1, 2, 3) throws {@link UnsupportedChunkFormatException}, which callers must never
+     * swallow. Note that v4 opens sections lazily, so corruption <em>inside a column's blocks</em>
+     * can also surface from a later {@code advance()} -- a caller that needs the whole window
+     * validated up front (the transparent-read path's all-or-nothing skip contract) must walk the
+     * cursor before emitting anything, as {@code ChunkReadSupport} does.
+     */
     public static ColumnarCursor cursor(ByteBuffer payload, Set<String> projection)
+    {
+        return ChunkV4Codec.cursor(payload, projection);
+    }
+
+    private static ColumnarCursor cursorV3(ByteBuffer payload, Set<String> projection)
     {
         try
         {
@@ -546,7 +585,7 @@ public final class ColumnarChunkCodec
         ByteBuffer buffer = payload.duplicate();
         buffer.order(ByteOrder.BIG_ENDIAN);
         byte version = buffer.get();
-        if (version != VERSION)
+        if (version != ChunkCodecs.COLUMNAR_V3_VERSION_REMOVED)
             throw ChunkCodecs.unsupportedVersion(version, "columnar chunk");
         int rowCount = buffer.getInt();
         // Even in the cheapest legitimate encoding (all-zero delta-of-delta, 1 bit/row), rowCount
@@ -962,6 +1001,13 @@ public final class ColumnarChunkCodec
      * callers above, not here -- {@link #rowCount}/{@link #firstTimestamp}/{@link #lastTimestamp}
      * each read further into the header after this call returns, so the header peeks need one
      * wrapping layer around their whole body, not just around this version check.
+     * <p>
+     * The peeks above did not need re-routing when v4 was wired in: v4 §3 deliberately kept
+     * {@code version}/{@code rowCount}/{@code firstTimestamp}/{@code lastTimestamp} at offsets
+     * 0/1/5/13, so the same arithmetic reads a v4 header verbatim -- and unlike
+     * {@link ChunkV4Header}'s own peeks, going through {@link ChunkCodecs#unsupportedVersion} here
+     * keeps the removed-format dispatch (v1/v2/v3 propagate as {@link UnsupportedChunkFormatException},
+     * an unknown byte skips as corruption) on these entry points too.
      */
     private static ByteBuffer checkedHeader(ByteBuffer payload)
     {

@@ -29,14 +29,15 @@ import java.nio.ByteOrder;
  * to; version 1 (the removed gorilla codec) is just another unrecognised version.
  * <p>
  * <b>Nothing in the tiering path uses the single-column format any more</b>: the re-encoder writes
- * and transparent reads decode {@link ColumnarChunkCodec} (version 3) exclusively, so the methods
- * below have no production callers left and survive only as the still-tested library the removed
- * path was built on. {@link #unsupportedVersion} is the exception -- {@link ColumnarChunkCodec}
- * shares it so that "which version bytes are a format vs. corruption" is decided in one place.
+ * and transparent reads decode the columnar format (version 4, {@link ChunkV4Codec} behind
+ * {@link ColumnarChunkCodec}'s entry points) exclusively, so the methods below have no production
+ * callers left and survive only as the still-tested library the removed path was built on.
+ * {@link #unsupportedVersion} is the exception -- the columnar codecs share it so that "which
+ * version bytes are a format vs. corruption" is decided in one place.
  * <p>
- * Version 3 ({@link ColumnarChunkCodec}, the many-columns-per-chunk format) is a different shape
- * entirely -- many named columns instead of one {@link SampleCursor}-style value stream -- so it is
- * out of scope for the methods here, which assume a single value per timestamp. {@link #cursor}
+ * The columnar many-columns-per-chunk format ({@link ColumnarChunkCodec}, version 4) is a different
+ * shape entirely -- many named columns instead of one {@link SampleCursor}-style value stream -- so
+ * it is out of scope for the methods here, which assume a single value per timestamp. {@link #cursor}
  * rejects it with a clear error pointing at {@link ColumnarChunkCodec#cursor} instead.
  * <p>
  * Payloads must span exactly one chunk (position..limit); corruption surfaces as
@@ -56,6 +57,17 @@ public final class ChunkCodecs
      */
     static final byte GORILLA_VERSION_REMOVED = 1;
 
+    /**
+     * Version byte 3 was the delta-of-delta/RLE columnar format, replaced outright by the
+     * block-based v4 layout (v4 spec §0, §10) before tiering was ever enabled on a production
+     * table, so no v3 read path was kept. Never reassigned: a v3 payload must be reported as an
+     * unreadable <em>format</em> -- systematic, propagated, never swallowed -- rather than skipped
+     * as one corrupt chunk. Without this branch a v3 payload would fall through to the
+     * names-no-format {@link IllegalArgumentException} below, and the read path would silently skip
+     * every chunk a v3 build wrote.
+     */
+    static final byte COLUMNAR_V3_VERSION_REMOVED = 3;
+
     private ChunkCodecs()
     {
     }
@@ -72,7 +84,7 @@ public final class ChunkCodecs
             case Chimp128Codec.VERSION:
                 return Chimp128Codec.cursor(payload);
             case ColumnarChunkCodec.VERSION:
-                throw new UnsupportedChunkFormatException("ChunkCodecs.cursor() does not support columnar (v3) " +
+                throw new UnsupportedChunkFormatException("ChunkCodecs.cursor() does not support columnar (v4) " +
                                                           "payloads -- use ColumnarChunkCodec.cursor() instead");
             default:
                 throw unsupportedVersion(versionByte(payload), "chunk codec");
@@ -98,8 +110,8 @@ public final class ChunkCodecs
      * Builds the exception for a version byte this decoder will not read, choosing its <em>type</em>
      * by whether the byte names a format at all.
      * <p>
-     * A byte naming a known format (1, 2, 3) means the payload is real and this build cannot decode
-     * it -- systematic, affecting every chunk written that way, so it is an
+     * A byte naming a known format (1, 2, 3, 4) means the payload is real and this build cannot
+     * decode it -- systematic, affecting every chunk written that way, so it is an
      * {@link UnsupportedChunkFormatException} that callers must not swallow. A byte naming nothing
      * is exactly what a header corrupted in its first byte looks like, so it stays a plain
      * {@link IllegalArgumentException} and the read path keeps skipping it as one bad chunk. There
@@ -112,6 +124,11 @@ public final class ChunkCodecs
             return new UnsupportedChunkFormatException(
                 "Unsupported " + what + " version: 1 -- version 1 was the gorilla single-column format, removed " +
                 "when chimp128 became the only chunk codec; chunks written by that build cannot be read by this one");
+        if (version == COLUMNAR_V3_VERSION_REMOVED)
+            return new UnsupportedChunkFormatException(
+                "Unsupported " + what + " version: 3 -- version 3 was the columnar chunk format replaced outright " +
+                "by the block-based v4 layout, and no v3 read path was kept (tiering was never enabled in " +
+                "production, so no v3 chunk should exist); chunks written by a v3 build cannot be read by this one");
         if (version == Chimp128Codec.VERSION || version == ColumnarChunkCodec.VERSION)
             return new UnsupportedChunkFormatException(
                 "Unsupported " + what + " version: " + version + " -- that is a known chunk format, but not one " +

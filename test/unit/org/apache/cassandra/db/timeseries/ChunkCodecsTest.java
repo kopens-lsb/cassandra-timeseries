@@ -29,9 +29,9 @@ import static org.junit.Assert.assertTrue;
 
 /**
  * Tests the {@link ChunkCodecs} entry point -- the only one the chunk store is meant to consume for
- * the single-column format. Chimp128 (v2) is the sole single-column codec; the removed gorilla
- * codec's version byte (1) is now just an unknown version, and columnar (v3) payloads are rejected
- * with a pointer at {@link ColumnarChunkCodec}.
+ * the single-column format. Chimp128 (v2) is the sole single-column codec; the removed gorilla (1)
+ * and columnar-v3 (3) version bytes are recognised as unreadable formats, and live columnar (v4)
+ * payloads are rejected with a pointer at {@link ColumnarChunkCodec}.
  */
 public class ChunkCodecsTest
 {
@@ -92,14 +92,26 @@ public class ChunkCodecsTest
     @Test
     public void cursorRejectsColumnarPayloadsWithAPointer()
     {
-        SortedMap<String, ColumnarChunkCodec.ColumnInput> columns = new TreeMap<>();
-        columns.put("v", new ColumnarChunkCodec.ColumnInput(ColumnarChunkCodec.TYPE_INT32,
-                                                            new ByteBuffer[]{ intBytes(1), intBytes(2), intBytes(3) }));
+        SortedMap<String, ChunkV4Codec.ColumnInput> columns = new TreeMap<>();
+        columns.put("v", new ChunkV4Codec.ColumnInput(ChunkV4Directory.TYPE_INT32, StatOrder.SIGNED_INT,
+                                                      new ByteBuffer[]{ intBytes(1), intBytes(2), intBytes(3) }));
         ByteBuffer payload = ColumnarChunkCodec.encode(new long[]{ 1L, 2L, 3L }, 3, columns);
 
         assertThatThrownBy(() -> ChunkCodecs.cursor(payload))
             .isInstanceOf(UnsupportedChunkFormatException.class)
             .hasMessageContaining("ColumnarChunkCodec.cursor()");
+    }
+
+    @Test
+    public void removedColumnarV3VersionIsReportedAsAnUnsupportedFormat()
+    {
+        // Version byte 3 was the columnar format v4 replaced outright. Like gorilla it names a real
+        // format, so it must propagate as unsupported -- never be skipped as one corrupt chunk.
+        ByteBuffer payload = ChunkCodecs.encode(new long[]{ 1L }, new double[]{ 1.0 }, 1);
+        payload.put(payload.position(), (byte) 3);
+        assertThatThrownBy(() -> ChunkCodecs.cursor(payload))
+            .isInstanceOf(UnsupportedChunkFormatException.class)
+            .hasMessageContaining("version: 3");
     }
 
     @Test

@@ -59,8 +59,10 @@ import org.apache.cassandra.db.rows.ColumnData;
 import org.apache.cassandra.db.rows.Row;
 import org.apache.cassandra.db.rows.Unfiltered;
 import org.apache.cassandra.db.rows.UnfilteredRowIterator;
+import org.apache.cassandra.db.timeseries.ChunkV4Codec;
 import org.apache.cassandra.db.timeseries.ColumnarChunkCodec;
 import org.apache.cassandra.db.timeseries.ColumnarCursor;
+import org.apache.cassandra.db.timeseries.StatOrder;
 import org.apache.cassandra.exceptions.ConfigurationException;
 import org.apache.cassandra.io.sstable.format.SSTableReader;
 import org.apache.cassandra.schema.ColumnMetadata;
@@ -394,7 +396,9 @@ public final class ColdWindowChunkFlush
         private final List<ColumnMetadata> valueColumns;
         private final Map<ColumnMetadata, Integer> valueIndex = new HashMap<>();
         private final String[] valueRawNames;
-        private final byte[] valueTypeCodes;
+        private final int[] valueTypeCodes;
+        /** Paired with {@link #valueTypeCodes} -- see the identical pairing in TieredStorageService. */
+        private final StatOrder[] valueStatOrders;
         private final String existingChunkQuery;
         private final String insertChunkQuery;
         private final long cutoff;
@@ -420,12 +424,14 @@ public final class ColdWindowChunkFlush
                 valueColumns.add(column);
             int valueCount = valueColumns.size();
             this.valueRawNames = new String[valueCount];
-            this.valueTypeCodes = new byte[valueCount];
+            this.valueTypeCodes = new int[valueCount];
+            this.valueStatOrders = new StatOrder[valueCount];
             for (int c = 0; c < valueCount; c++)
             {
                 valueIndex.put(valueColumns.get(c), c);
                 valueRawNames[c] = valueColumns.get(c).name.toString();
                 valueTypeCodes[c] = ChunkColumnTypes.typeCodeFor(valueColumns.get(c).type);
+                valueStatOrders[c] = ChunkColumnTypes.statOrderFor(valueColumns.get(c).type);
             }
 
             // The same statements the re-encoder issues, against the same chunk table, at the policy's
@@ -693,9 +699,10 @@ public final class ColdWindowChunkFlush
                     columnValues[c][idx] = values[c];
                 idx++;
             }
-            SortedMap<String, ColumnarChunkCodec.ColumnInput> columns = new TreeMap<>();
+            SortedMap<String, ChunkV4Codec.ColumnInput> columns = new TreeMap<>();
             for (int c = 0; c < valueCount; c++)
-                columns.put(valueRawNames[c], new ColumnarChunkCodec.ColumnInput(valueTypeCodes[c], columnValues[c]));
+                columns.put(valueRawNames[c],
+                            new ChunkV4Codec.ColumnInput(valueTypeCodes[c], valueStatOrders[c], columnValues[c]));
 
             ByteBuffer payload = ColumnarChunkCodec.encode(timestamps, count, columns);
             byte codecByte = payload.get(payload.position());

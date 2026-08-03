@@ -206,10 +206,10 @@ public class TransparentReadTest extends CQLTester
     {
         loadTwoWindowsAndReencode();
 
-        // Version byte 3 (the format this build writes), but a header claiming 0 rows: corrupt
+        // Version byte 4 (the format this build writes), but a header claiming 0 rows: corrupt
         // CONTENT, not a format this build cannot read. Availability wins here -- skip the one bad
         // chunk, serve the rest.
-        overwriteFirstChunkPayload("0x03" + "0".repeat(40));
+        overwriteFirstChunkPayload("0x04" + "0".repeat(78));
 
         assertOnlySecondWindowAndHotRowServed();
     }
@@ -219,24 +219,29 @@ public class TransparentReadTest extends CQLTester
     {
         loadTwoWindowsAndReencode();
 
-        // Version byte 2 = the removed single-column (chimp128) format; byte 1 was gorilla. Unlike
-        // corruption this is systematic (every chunk an older build wrote carries it), so skipping
-        // would make this SELECT -- and every future one -- succeed while silently omitting the
-        // [0,1h) window's history.
-        overwriteFirstChunkPayload("0x02" + "0".repeat(40));
+        // Version byte 2 = the removed single-column (chimp128) format; byte 3 = the columnar v3
+        // format that v4 replaced outright; byte 1 was gorilla. Unlike corruption these are
+        // systematic (every chunk an older build wrote carries them), so skipping would make this
+        // SELECT -- and every future one -- succeed while silently omitting the [0,1h) window's
+        // history.
+        for (String removedVersionPayload : new String[]{ "0x02" + "0".repeat(40), "0x03" + "0".repeat(40) })
+        {
+            overwriteFirstChunkPayload(removedVersionPayload);
 
-        try
-        {
-            execute("SELECT value FROM %s WHERE tag = 't1'");
-            fail("expected the read to fail rather than silently drop the unreadable window");
-        }
-        catch (UnsupportedChunkFormatException e)
-        {
-            // must name the table, the window that proved it, and what the operator has to do
-            assertTrue(e.getMessage(), e.getMessage().contains(currentTable()));
-            assertTrue(e.getMessage(), e.getMessage().contains("older build"));
-            assertTrue(e.getMessage(), e.getMessage().contains(ChunkTables.chunkTableName(currentTable())));
-            assertTrue(e.getMessage(), e.getMessage().contains("not recoverable"));
+            try
+            {
+                execute("SELECT value FROM %s WHERE tag = 't1'");
+                fail("expected the read to fail rather than silently drop the unreadable window (payload " +
+                     removedVersionPayload.substring(0, 4) + ")");
+            }
+            catch (UnsupportedChunkFormatException e)
+            {
+                // must name the table, the window that proved it, and what the operator has to do
+                assertTrue(e.getMessage(), e.getMessage().contains(currentTable()));
+                assertTrue(e.getMessage(), e.getMessage().contains("older build"));
+                assertTrue(e.getMessage(), e.getMessage().contains(ChunkTables.chunkTableName(currentTable())));
+                assertTrue(e.getMessage(), e.getMessage().contains("not recoverable"));
+            }
         }
     }
 

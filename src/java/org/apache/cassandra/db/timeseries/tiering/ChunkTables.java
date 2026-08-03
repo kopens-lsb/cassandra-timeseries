@@ -64,7 +64,7 @@ import org.apache.cassandra.utils.Clock;
  * samples. Its {@value #SAMPLES_COLUMN} is the number of rows encoded (not the number of values),
  * and its {@value #CODEC_COLUMN} is the payload's own leading version byte -- copied out of the blob
  * after encoding rather than named by the writer, so it always describes what was actually stored
- * (3 = {@link org.apache.cassandra.db.timeseries.ColumnarChunkCodec}, the only format written).
+ * (4 = {@link org.apache.cassandra.db.timeseries.ColumnarChunkCodec}, the only format written).
  */
 public final class ChunkTables
 {

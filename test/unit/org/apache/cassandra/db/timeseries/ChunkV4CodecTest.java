@@ -17,8 +17,12 @@
  */
 package org.apache.cassandra.db.timeseries;
 
+import java.io.BufferedReader;
+import java.io.InputStreamReader;
 import java.nio.ByteBuffer;
 import java.nio.charset.StandardCharsets;
+import java.nio.file.Paths;
+import java.security.MessageDigest;
 import java.util.ArrayList;
 import java.util.Arrays;
 import java.util.Collections;
@@ -29,9 +33,11 @@ import java.util.Set;
 import java.util.SortedMap;
 import java.util.TreeMap;
 import java.util.TreeSet;
+import java.util.concurrent.TimeUnit;
 
 import org.junit.Test;
 
+import org.apache.cassandra.config.CassandraRelevantProperties;
 import org.apache.cassandra.db.marshal.ByteBufferAccessor;
 import org.apache.cassandra.db.marshal.DoubleType;
 import org.apache.cassandra.db.marshal.LongType;
@@ -1029,6 +1035,107 @@ public class ChunkV4CodecTest
         assertArrayEquals(timestamps, ChunkV4Codec.toTimestamps(payload));
         assertArrayEquals(payloadBytes(payload),
                           payloadBytes(ChunkV4Codec.encode(timestamps, 100, new TreeMap<>(), 6)));
+    }
+
+    // -----------------------------------------------------------------------------------------
+    // §11: the one test that must exist before v4 is enabled anywhere
+    // -----------------------------------------------------------------------------------------
+
+    /** Marks the forked JVM's hash line among whatever else the child happens to print. */
+    private static final String JIT_HASH_PREFIX = "chunk-v4-corpus-sha256:";
+
+    /**
+     * §11/§12: the format's largest risk is not compression ratio but an encoder whose byte output
+     * depends on the JIT tier -- same input, different bytes per node, every chunk reported changed
+     * and rewritten on every re-encode cycle, looking like a capacity problem rather than a codec
+     * bug -- and it is invisible to every single-JVM test, because one JVM compiles one way. So the
+     * same production-shaped corpus is encoded twice: here, under whatever tiers this test run
+     * reaches, and in a forked child JVM pinned to {@code -XX:TieredStopAtLevel=1} (C1 only, whose
+     * floating-point and intrinsic compilation choices differ from C2's -- exactly where a
+     * non-{@code strictfp} ALP search or a {@code Math.pow} would diverge). The SHA-256 of the
+     * concatenated payloads must match exactly.
+     *
+     * <p>The child is this class's own {@code main}, launched with the parent's java binary
+     * ({@code java.home}) and classpath ({@code java.class.path}), so the two JVMs run identical
+     * bytecode and differ only in compilation tier. Its stdout is drained to EOF before waiting, so
+     * the child can never block on a full pipe, and the wait is bounded.
+     */
+    @Test
+    public void encoderIsDeterministicAcrossJitTiers() throws Exception
+    {
+        String parentHash = encodeCorpusHash();
+
+        String javaBin = Paths.get(CassandraRelevantProperties.JAVA_HOME.getString(), "bin", "java").toString();
+        Process child = new ProcessBuilder(javaBin, "-XX:TieredStopAtLevel=1", "-cp",
+                                           CassandraRelevantProperties.JAVA_CLASS_PATH.getString(),
+                                           ChunkV4CodecTest.class.getName())
+                        .redirectErrorStream(true)
+                        .start();
+
+        List<String> output = new ArrayList<>();
+        String childHash = null;
+        try (BufferedReader reader = new BufferedReader(
+                 new InputStreamReader(child.getInputStream(), StandardCharsets.UTF_8)))
+        {
+            String line;
+            while ((line = reader.readLine()) != null)
+            {
+                output.add(line);
+                if (line.startsWith(JIT_HASH_PREFIX))
+                    childHash = line.substring(JIT_HASH_PREFIX.length());
+            }
+        }
+        if (!child.waitFor(180, TimeUnit.SECONDS))
+        {
+            child.destroyForcibly();
+            fail("tier-1 encoder JVM did not finish in 180s; output so far: " + output);
+        }
+        assertEquals("tier-1 encoder JVM failed; output: " + output, 0, child.exitValue());
+        assertNotNull("tier-1 encoder JVM printed no hash line; output: " + output, childHash);
+        assertEquals("same corpus, same build, different JIT tier, DIFFERENT bytes -- every chunk " +
+                     "would be rewritten on every re-encode cycle (v4 §5, §12)", parentHash, childHash);
+    }
+
+    /** The forked half of {@link #encoderIsDeterministicAcrossJitTiers}. */
+    public static void main(String[] args) throws Exception
+    {
+        System.out.println(JIT_HASH_PREFIX + encodeCorpusHash());
+    }
+
+    /**
+     * SHA-256 over the concatenated payloads of a deterministic, production-shaped corpus:
+     * {@link #productionShapedColumns} (constant, all-null, sparse, OPAQUE-downgraded, dictionary
+     * text, boolean, date and random-walk double columns) over row counts that cross block
+     * boundaries at both the default block size and near §7's minimum, with irregular timestamp
+     * gaps. Bounded by design -- 160 chunks, seconds not minutes -- because it runs in the normal
+     * battery, twice per invocation of the test above.
+     */
+    private static String encodeCorpusHash() throws Exception
+    {
+        MessageDigest digest = MessageDigest.getInstance("SHA-256");
+        Random random = new Random(20260804L);
+        int[] rowCounts = { 4, 13, 64, 100, 257, 1024, 1500, 2050 };
+        for (int round = 0; round < 20; round++)
+        {
+            for (int rows : rowCounts)
+            {
+                long ts = 1_700_000_000_000L + random.nextInt(1_000_000);
+                long[] timestamps = new long[rows];
+                for (int i = 0; i < rows; i++)
+                {
+                    ts += 1 + random.nextInt(5_000);
+                    timestamps[i] = ts;
+                }
+                int blockSizeLog2 = round % 3 == 0 ? 6 : ChunkV4Header.DEFAULT_BLOCK_SIZE_LOG2;
+                ByteBuffer payload = ChunkV4Codec.encode(timestamps, rows,
+                                                         productionShapedColumns(rows, random), blockSizeLog2);
+                digest.update(payload.duplicate());
+            }
+        }
+        StringBuilder hex = new StringBuilder();
+        for (byte b : digest.digest())
+            hex.append(Character.forDigit((b >> 4) & 0xF, 16)).append(Character.forDigit(b & 0xF, 16));
+        return hex.toString();
     }
 
     // -----------------------------------------------------------------------------------------
