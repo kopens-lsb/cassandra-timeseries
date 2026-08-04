@@ -22,12 +22,14 @@ import java.nio.ByteBuffer;
 import java.util.ArrayList;
 import java.util.Arrays;
 import java.util.Collections;
+import java.util.HashMap;
 import java.util.Iterator;
 import java.util.List;
 import java.util.NavigableSet;
 import java.util.concurrent.ConcurrentSkipListMap;
 import java.util.concurrent.atomic.AtomicLong;
 import java.util.concurrent.atomic.LongAdder;
+import java.util.concurrent.locks.ReentrantLock;
 
 import com.google.common.annotations.VisibleForTesting;
 
@@ -53,8 +55,8 @@ import org.apache.cassandra.db.marshal.TimestampType;
 import org.apache.cassandra.db.partitions.ImmutableBTreePartition;
 import org.apache.cassandra.db.partitions.Partition;
 import org.apache.cassandra.db.partitions.PartitionUpdate;
+import org.apache.cassandra.db.rows.ArrayCell;
 import org.apache.cassandra.db.rows.BTreeRow;
-import org.apache.cassandra.db.rows.BufferCell;
 import org.apache.cassandra.db.rows.Cell;
 import org.apache.cassandra.db.rows.ColumnData;
 import org.apache.cassandra.db.rows.EncodingStats;
@@ -65,8 +67,12 @@ import org.apache.cassandra.index.transactions.UpdateTransaction;
 import org.apache.cassandra.schema.ColumnMetadata;
 import org.apache.cassandra.schema.TableMetadata;
 import org.apache.cassandra.schema.TableMetadataRef;
+import org.apache.cassandra.utils.BulkIterator;
+import org.apache.cassandra.utils.ByteArrayUtil;
 import org.apache.cassandra.utils.ByteBufferUtil;
+import org.apache.cassandra.utils.Clock;
 import org.apache.cassandra.utils.btree.BTree;
+import org.apache.cassandra.utils.btree.UpdateFunction;
 import org.apache.cassandra.utils.concurrent.OpOrder;
 import org.apache.cassandra.utils.memory.Cloner;
 import org.apache.cassandra.utils.memory.HeapCloner;
@@ -101,18 +107,21 @@ import org.apache.cassandra.utils.memory.MemtableAllocator;
  * tail is folded in lazily, on read or flush — in-order ingest never sorts. The tail is bounded
  * ({@link #MAX_UNSORTED_TAIL}) only so the duplicate-clustering probe a write performs stays cheap.
  *
- * <p><b>Concurrency: the slots are append-only.</b> Writes synchronise on this object; reads do not.
+ * <p><b>Concurrency: the slots are append-only.</b> Writes hold {@link #writeLock} for their whole
+ * duration; a read takes it only for the instant it captures a walk, and holds nothing while it
+ * iterates.
  * A slot's row data is immutable once written: a re-write of a clustering the arrays already hold
  * appends a <em>new</em> slot with the merged row and marks the old slot {@link #FLAG_SUPERSEDED} —
  * a one-shot 0&rarr;1 flag that is never cleared — and a promotion to the overflow tier inserts into
  * the concurrent overflow map and then supersedes the slot the same way. Consolidation and growth
  * replace the arrays wholesale instead of mutating them, so a reader that captured the array
  * references and the row count under the lock (see {@link #captureWalk()}) walks a frozen prefix
- * that no later write can tear. Reads therefore <b>retain nothing</b>: there is no snapshot and no
- * cache of any kind; the streaming iterator ({@link TimeSeriesStreamingIterator}) assembles one row
- * per pull and leaves nothing behind when it closes, and the full rebuild
- * ({@link #buildSnapshot()}) — the fail-open fallback and the flush view — builds, is consumed, and
- * is discarded.
+ * that no later write can tear. Reads and flushes therefore <b>retain nothing</b>: there is no
+ * snapshot and no cache of any kind; the streaming iterator ({@link TimeSeriesStreamingIterator})
+ * assembles one row per pull and leaves nothing behind when it closes — which is how the hot read
+ * path and the flush view ({@link #flushView()}) both read the arrays — and the full rebuild
+ * ({@link #buildSnapshot()}), kept as the fail-open fallback and for the shapes streaming does not
+ * serve, builds, is consumed, and is discarded.
  *
  * <p><b>The degradation valve.</b> Superseded slots are dead weight until flush. A pathologically
  * re-written partition would grow its arrays without bound, so when more than half of a partition's
@@ -151,16 +160,72 @@ public final class TimeSeriesColumnarPartition implements TimeSeriesMemtable.Sha
     @VisibleForTesting
     public static final LongAdder rowsAssembled = new LongAdder();
 
+    /**
+     * Write-lock acquisitions that found the lock free, acquisitions that had to wait, and the total
+     * nanoseconds the waiting ones spent blocked — across every columnar partition of every table in
+     * the process, like {@link #rowsAssembled} above.
+     *
+     * <p><b>Why they exist.</b> After 6d5f2a3156 took ingest on this memtable from 93.6k to 155.6k
+     * rows/s, nothing outside the process could say whether what remains is CPU in the write path or
+     * threads queueing on one hot partition — the object monitor these replaced cannot be asked. The
+     * ratio {@code contendedWrites / (contendedWrites + uncontendedWrites)} answers the first
+     * question and {@code writeContentionNanos} sizes it; a low ratio means further work belongs in
+     * the per-row cost, a high one means it belongs in the locking granularity.
+     *
+     * <p>Process-wide {@link LongAdder}s rather than a metrics MBean: this is a profiling counter for
+     * a specific optimisation question, the class already publishes {@link #rowsAssembled} exactly
+     * this way, and a per-table {@code MetricsView} would need a lifecycle (creation, release on drop)
+     * that a static counter does not. Tests sample deltas, never absolutes.
+     */
+    @VisibleForTesting
+    public static final LongAdder uncontendedWrites = new LongAdder();
+    @VisibleForTesting
+    public static final LongAdder contendedWrites = new LongAdder();
+    @VisibleForTesting
+    public static final LongAdder writeContentionNanos = new LongAdder();
+
+    /**
+     * The one lock. <b>Every</b> mutation of the arrays and every probe that must not see them
+     * half-written takes it — the write path, {@link #captureWalk()}, {@link #readView()},
+     * {@link #mayContainRowsIn} and the observability accessors — because the append-only slot
+     * protocol is only safe if a reader either holds this lock or reads a capture made under it.
+     * Two locks would be no lock at all: the walk a reader captured could then be torn by a
+     * concurrent {@link #consolidate()} replacing the arrays underneath it.
+     *
+     * <p><b>Why not the object monitor it replaces.</b> A monitor cannot report contention, which is
+     * the question above. {@link ReentrantLock} answers it and gives back everything the monitor
+     * gave: the same happens-before on acquire/release, and reentrancy — which this class relies on
+     * ({@link #put} holds it across {@link #apply} → {@link #replaceSlot} → {@link #materializeRow}).
+     * Nothing in this class ever used {@code wait}/{@code notify}, and nothing outside it ever
+     * synchronised on a partition instance, so the monitor had no other users to strand.
+     *
+     * <p>{@code @Unmetered} as {@code TrieMemtable}'s write lock is, and for a second reason here:
+     * a held lock's AQS keeps an {@code exclusiveOwnerThread} reference, and TimeSeriesMemtableHeapTest
+     * walks this object graph with jamm — a deep measurement that stepped into a live {@code Thread}
+     * would measure the runtime, not the memtable.
+     */
+    @Unmetered
+    @VisibleForTesting
+    final ReentrantLock writeLock = new ReentrantLock();
+
     @Unmetered
     private final TableMetadataRef metadata;
     @Unmetered
     private final MemtableAllocator allocator;
     private final DecoratedKey key;
 
-    /** Whether the clustering is a single (non-reversed) timestamp/bigint column, stored as a bare {@code long}. */
+    /** Whether the clustering is a single timestamp/bigint column, stored as a bare {@code long}. */
     private final boolean longClusterings;
 
-    // ---- row-major parallel arrays; all mutation is guarded by 'this' ----
+    /**
+     * Whether that column is DESC ({@code ReversedType}-wrapped). {@code ReversedType} wraps
+     * comparison only — the serialized form stays the base type's 8 bytes — so the raw value is
+     * stored unchanged and every long comparison is negated instead. Storing a transformed key
+     * would demand an inverse at every materialization site, where a miss corrupts silently.
+     */
+    private final boolean reversedLongKeys;
+
+    // ---- row-major parallel arrays; all mutation is guarded by writeLock ----
     private int capacity;
     private int size;
     /** Rows [0, sortedCount) are in clustering order; rows [sortedCount, size) arrived out of order. */
@@ -174,8 +239,21 @@ public final class TimeSeriesColumnarPartition implements TimeSeriesMemtable.Sha
     /** Per-column stores, kept sorted by column so a materialized row's cells are already in order. */
     private final List<ColumnStore> stores = new ArrayList<>(4);
 
-    /** Slots carrying {@link #FLAG_SUPERSEDED}; feeds the degradation valve. Guarded by 'this'. */
+    /** Slots carrying {@link #FLAG_SUPERSEDED}; feeds the degradation valve. Guarded by {@link #writeLock}. */
     private int supersededCount;
+
+    /** Appends admitted by the certainly-new bounds shortcut, i.e. without a slot search. Guarded by {@link #writeLock}. */
+    private long certainNewAppends;
+
+    /**
+     * Index of the unsorted tail for long-keyed clusterings: clustering key → the newest slot
+     * holding it, so the duplicate probe a write performs is one map lookup instead of a linear
+     * scan of up to {@link #MAX_UNSORTED_TAIL} slots inside the lock. Writer-only state, guarded
+     * by {@link #writeLock} like every array mutation; readers never see it. Cleared whenever
+     * {@link #consolidate()} folds the tail into the sorted prefix (slot indices change there).
+     * Bounded by the tail bound, so at most ~{@value #MAX_UNSORTED_TAIL} entries.
+     */
+    private HashMap<Long, Integer> tailIndex;
 
     /** Greatest clustering held by the arrays, so in-order ingest can append without searching. */
     private long maxClusteringKey;
@@ -216,9 +294,10 @@ public final class TimeSeriesColumnarPartition implements TimeSeriesMemtable.Sha
         this.key = key;
         this.allocator = allocator;
         ClusteringComparator comparator = metadata.get().comparator;
-        this.longClusterings = comparator.size() == 1
-                               && (comparator.subtype(0) == TimestampType.instance
-                                   || comparator.subtype(0) == LongType.instance);
+        AbstractType<?> subtype = comparator.size() == 1 ? comparator.subtype(0) : null;
+        AbstractType<?> base = subtype == null ? null : subtype.unwrap();
+        this.longClusterings = base == TimestampType.instance || base == LongType.instance;
+        this.reversedLongKeys = longClusterings && subtype.isReversed();
     }
 
     /**
@@ -246,7 +325,8 @@ public final class TimeSeriesColumnarPartition implements TimeSeriesMemtable.Sha
         if (demoted == null)
         {
             Put put = new Put(cloner, indexer);
-            synchronized (this)
+            lockForWrite();
+            try
             {
                 demoted = demotedTo;
                 if (demoted == null && size >= INITIAL_CAPACITY && supersededCount * 2 > size)
@@ -280,6 +360,10 @@ public final class TimeSeriesColumnarPartition implements TimeSeriesMemtable.Sha
                     }
                 }
             }
+            finally
+            {
+                writeLock.unlock();
+            }
             if (demoted == null)
             {
                 // Outside the lock: acquiring memtable space may block on a flush, and the flush path
@@ -292,6 +376,33 @@ public final class TimeSeriesColumnarPartition implements TimeSeriesMemtable.Sha
         // Demoted: the object tier owns every write from here on. Also outside the lock, for the
         // same allocation-under-lock reason as above.
         return demoted.put(update, indexer, cloner, opGroup, liveDataSize);
+    }
+
+    /**
+     * Takes {@link #writeLock} and records whether it was free. {@code tryLock()} first and only then
+     * the blocking acquire, with the wait timed — {@code TrieMemtable.MemtableShard.put}'s pattern
+     * verbatim, so the two memtables' contention numbers mean the same thing and can be compared.
+     * The uncontended path is one CAS and one increment; nothing here reads the clock unless a
+     * thread actually blocked, because {@code nanoTime} on the hot path would be part of the cost it
+     * is meant to measure.
+     *
+     * <p>Only the write path is instrumented. A read-side probe holding the lock still shows up here
+     * — as blocked nanos on the writer it delayed — which is the number that matters; counting the
+     * probes themselves would mix a flush's one acquisition per partition into the write ratio.
+     */
+    private void lockForWrite()
+    {
+        // Reentrant, so this also succeeds (and counts as uncontended) if this thread already holds
+        // the lock — the same thing the monitor did for a nested acquisition.
+        if (writeLock.tryLock())
+        {
+            uncontendedWrites.increment();
+            return;
+        }
+        contendedWrites.increment();
+        long lockStartTime = Clock.Global.nanoTime();
+        writeLock.lock();
+        writeContentionNanos.add(Clock.Global.nanoTime() - lockStartTime);
     }
 
     /** Mirrors {@code BTreePartitionUpdater#merge(DeletionInfo, DeletionInfo)}, including the indexer events. */
@@ -361,14 +472,21 @@ public final class TimeSeriesColumnarPartition implements TimeSeriesMemtable.Sha
         }
         boolean arrayable = shape != null && representable;
 
-        // In-order fast path: strictly above everything the arrays hold, and nothing in overflow that
-        // could collide, means the clustering is certainly new — append without any lookup.
+        // In-order fast path: strictly outside everything the arrays hold — above max or below min,
+        // both bounds cover superseded slots too — and nothing in overflow that could collide, means
+        // the clustering is certainly new: append without any lookup. The min side is what ascending
+        // ingest into a DESC table (the production tm_tag_point pattern) takes on every row; without
+        // it each such row pays a findSlot scan of the unsorted tail inside the partition lock.
         boolean overflowEmpty = overflow == null || overflow.isEmpty();
-        if (arrayable && overflowEmpty && (size == 0 || compareToMax(clustering, longKey) > 0))
+        if (arrayable && overflowEmpty
+            && (size == 0 || compareToMax(clustering, longKey) > 0 || compareToMin(clustering, longKey) < 0))
         {
+            certainNewAppends++;
             append(row, shape, longKey, null, put);
             put.indexer.onInserted(row);
-            put.dataDelta += row.dataSize();
+            // shape.dataSize, not row.dataSize(): the same number, already summed by classify()
+            // above out of a walk this path was making anyway.
+            put.dataDelta += shape.dataSize;
             return;
         }
 
@@ -383,7 +501,7 @@ public final class TimeSeriesColumnarPartition implements TimeSeriesMemtable.Sha
         {
             append(row, shape, longKey, null, put);
             put.indexer.onInserted(row);
-            put.dataDelta += row.dataSize();
+            put.dataDelta += shape.dataSize;
         }
         else
         {
@@ -399,6 +517,23 @@ public final class TimeSeriesColumnarPartition implements TimeSeriesMemtable.Sha
      * deletion, a cell tombstone, an expired liveness, a cell whose value does not fit its column's
      * fixed width, a complex column, or cells that do not all share one (timestamp, ttl,
      * localDeletionTime).
+     *
+     * <p>The row's {@code dataSize} rides along in the answer. On the columnar fast path a row was
+     * being walked four times per write — {@code TimeSeriesMemtable.maxTimestamp} to route it, here,
+     * {@link #append} to store it, and then {@code row.dataSize()} purely to account for it — and
+     * this pass is already over exactly the cells that last walk visits, so the sum is free here and
+     * one whole walk is not.
+     *
+     * <p><b>The accounting must not drift:</b> {@code liveDataSize} feeds the flush size estimate.
+     * The sum below reproduces {@code BTreeRow.dataSize()}'s decomposition exactly — clustering plus
+     * primary-key liveness plus <em>deletion, which is {@code time.dataSize() + 1} even when LIVE</em>,
+     * plus every {@code ColumnData} — which is safe because it is computed from the same four parts
+     * of the same row. The {@code instanceof} is the guard for the one thing that could break it: a
+     * {@code Row} implementation whose {@code dataSize()} is not that decomposition. Today there are
+     * only two in the tree ({@code BTreeRow}, and SAI's {@code RowWithSource}, a pure delegating
+     * wrapper built only on the read path), and everything reaching a memtable write is a
+     * {@code BTreeRow} — but a memtable is not the place to bet on that staying true, and the
+     * fallback costs exactly what today costs.
      */
     private RowShape classify(Row row)
     {
@@ -410,8 +545,13 @@ public final class TimeSeriesColumnarPartition implements TimeSeriesMemtable.Sha
         long ldt = 0;
         boolean seen = false;
         boolean hasLiveness = false;
-
         LivenessInfo liveness = row.primaryKeyLivenessInfo();
+
+        boolean fusedSize = row instanceof BTreeRow;
+        long dataSize = fusedSize
+                        ? row.clustering().dataSize() + liveness.dataSize() + row.deletion().dataSize()
+                        : 0;
+
         if (!liveness.isEmpty())
         {
             if (liveness.ttl() == LivenessInfo.EXPIRED_LIVENESS_TTL)
@@ -430,6 +570,8 @@ public final class TimeSeriesColumnarPartition implements TimeSeriesMemtable.Sha
             Cell<?> cell = (Cell<?>) data;
             if (cell.isTombstone())
                 return null;
+
+            dataSize += cell.dataSize();
 
             int width = fixedWidthOf(cell.column().type);
             if (width > 0)
@@ -452,7 +594,9 @@ public final class TimeSeriesColumnarPartition implements TimeSeriesMemtable.Sha
             }
         }
 
-        return seen ? new RowShape(ts, ttl, ldt, hasLiveness) : null;
+        if (!seen)
+            return null;
+        return new RowShape(ts, ttl, ldt, hasLiveness, fusedSize ? dataSize : row.dataSize());
     }
 
     /**
@@ -499,9 +643,23 @@ public final class TimeSeriesColumnarPartition implements TimeSeriesMemtable.Sha
                           && (slot == 0 || compareSlotTo(slot - 1, row.clustering(), longKey) <= 0);
         size++;
         if (inOrder)
+        {
             sortedCount = size;
-        else if (size - sortedCount > MAX_UNSORTED_TAIL)
-            consolidate();
+        }
+        else
+        {
+            // Index the out-of-order slot so findSlot never scans the tail: newest slot wins the
+            // entry (a re-append overwrites it just before the older slot is superseded), and the
+            // whole index dies with the tail in consolidate().
+            if (longClusterings)
+            {
+                if (tailIndex == null)
+                    tailIndex = new HashMap<>();
+                tailIndex.put(longKey, slot);
+            }
+            if (size - sortedCount > MAX_UNSORTED_TAIL)
+                consolidate();
+        }
 
         if (size == 1 || compareToMax(row.clustering(), longKey) > 0)
         {
@@ -527,6 +685,9 @@ public final class TimeSeriesColumnarPartition implements TimeSeriesMemtable.Sha
         Row existing = materializeRow(slot);
         Row merged = Rows.merge(existing, update, put);
         put.indexer.onUpdated(existing, merged);
+        // A delta, not a size: the slot's old row is being replaced, so what leaves must be subtracted
+        // and classify()'s fused size (below, and only when the merged row still fits the arrays)
+        // cannot express it. This is the re-write path, not the ingest path it was fused for.
         put.dataDelta += merged.dataSize() - existing.dataSize();
 
         RowShape shape = classify(merged);
@@ -613,31 +774,38 @@ public final class TimeSeriesColumnarPartition implements TimeSeriesMemtable.Sha
 
     // ------------------------------------------------------------------------------------ ordering
 
+    /** {@code Long.compare} in comparator order: negated when the clustering column is DESC. */
+    private int compareKeys(long a, long b)
+    {
+        int cmp = Long.compare(a, b);
+        return reversedLongKeys ? -cmp : cmp;
+    }
+
     private int compareToMax(Clustering<?> clustering, long longKey)
     {
         return longClusterings
-               ? Long.compare(longKey, maxClusteringKey)
+               ? compareKeys(longKey, maxClusteringKey)
                : metadata.get().comparator.compare(clustering, (Clustering<?>) maxClusteringObject);
     }
 
     private int compareToMin(Clustering<?> clustering, long longKey)
     {
         return longClusterings
-               ? Long.compare(longKey, minClusteringKey)
+               ? compareKeys(longKey, minClusteringKey)
                : metadata.get().comparator.compare(clustering, (Clustering<?>) minClusteringObject);
     }
 
     private int compareSlotTo(int slot, Clustering<?> clustering, long longKey)
     {
         return longClusterings
-               ? Long.compare(clusteringKeys[slot], longKey)
+               ? compareKeys(clusteringKeys[slot], longKey)
                : metadata.get().comparator.compare((Clustering<?>) clusteringObjects[slot], clustering);
     }
 
     private int compareSlots(int a, int b)
     {
         return longClusterings
-               ? Long.compare(clusteringKeys[a], clusteringKeys[b])
+               ? compareKeys(clusteringKeys[a], clusteringKeys[b])
                : metadata.get().comparator.compare((Clustering<?>) clusteringObjects[a], (Clustering<?>) clusteringObjects[b]);
     }
 
@@ -648,6 +816,17 @@ public final class TimeSeriesColumnarPartition implements TimeSeriesMemtable.Sha
      */
     private int findSlot(Clustering<?> clustering, long longKey)
     {
+        // Long-keyed tails are fully indexed: a live hit is the answer (at most one slot per
+        // clustering is ever live), and a superseded or missing entry falls through to the sorted
+        // prefix — the tail cannot hold a live slot the index does not know about, so the linear
+        // tail scan below is skipped entirely for this path.
+        if (longClusterings && tailIndex != null)
+        {
+            Integer tailSlot = tailIndex.get(longKey);
+            if (tailSlot != null && (flags[tailSlot] & FLAG_SUPERSEDED) == 0)
+                return tailSlot;
+        }
+
         int lo = 0;
         int hi = sortedCount - 1;
         int hit = -1;
@@ -678,10 +857,13 @@ public final class TimeSeriesColumnarPartition implements TimeSeriesMemtable.Sha
                     return i;
             }
         }
-        for (int i = sortedCount; i < size; i++)
+        if (!longClusterings)
         {
-            if (compareSlotTo(i, clustering, longKey) == 0 && (flags[i] & FLAG_SUPERSEDED) == 0)
-                return i;
+            for (int i = sortedCount; i < size; i++)
+            {
+                if (compareSlotTo(i, clustering, longKey) == 0 && (flags[i] & FLAG_SUPERSEDED) == 0)
+                    return i;
+            }
         }
         return -1;
     }
@@ -748,6 +930,10 @@ public final class TimeSeriesColumnarPartition implements TimeSeriesMemtable.Sha
             store.applyPermutation(permutation, size, capacity);
 
         sortedCount = size;
+        // Every former tail slot now lives in the sorted prefix under a new index; the map's slot
+        // numbers are stale and the prefix is the binary search's job, so the index empties here.
+        if (tailIndex != null)
+            tailIndex.clear();
     }
 
     // ------------------------------------------------------------------------------------- reads
@@ -792,15 +978,30 @@ public final class TimeSeriesColumnarPartition implements TimeSeriesMemtable.Sha
      * later writes append past the captured count or replace the arrays wholesale — except the flag
      * bytes, whose only possible change is the one-shot supersede the reader double-checks for.
      */
-    synchronized Walk captureWalk()
+    Walk captureWalk()
     {
-        return captureWalkLocked();
+        writeLock.lock();
+        try
+        {
+            return captureWalkLocked();
+        }
+        finally
+        {
+            writeLock.unlock();
+        }
     }
 
     /**
-     * The full rebuild: every live slot plus the overflow, merged in comparator order. The read
-     * path's fail-open fallback and the flush view — built on demand, consumed, discarded; never
-     * retained anywhere. Caller must hold the lock.
+     * The full rebuild: every live slot plus the overflow, merged in comparator order. The fail-open
+     * fallback of both streaming paths (read and flush) and the answer for the shapes streaming does
+     * not serve — built on demand, consumed, discarded; never retained anywhere. Caller must hold
+     * the lock.
+     *
+     * <p>The {@code EncodingStats} collection below is a second walk of every row just built. It is
+     * what a rebuilt {@code Partition} owes its callers, and it is also why the flush path no longer
+     * comes through here: the sstable writer takes its {@code SerializationHeader} from the
+     * memtable-level {@code flushSet.encodingStats()} and {@code SortedTableWriter.append} never
+     * asks the partition or the iterator for stats, so on a flush this pass bought nothing.
      */
     private Snapshot buildSnapshot()
     {
@@ -847,17 +1048,22 @@ public final class TimeSeriesColumnarPartition implements TimeSeriesMemtable.Sha
     }
 
     /**
-     * A freshly built, immediately discarded object view for the read paths the streaming iterator
-     * does not serve (point {@code getRow}, names filters, the no-argument iterator) and for the
-     * streaming path's fail-open fallback. When the partition is demoted, the frozen columnar state
-     * and the object-tier sibling are presented as one merged partition.
+     * A freshly built, immediately discarded object view for the paths the streaming iterator does
+     * not serve (point {@code getRow}, names filters, the read path's no-argument iterator) and for
+     * the fail-open fallback of every streaming path, flush included. When the partition is demoted,
+     * the frozen columnar state and the object-tier sibling are presented as one merged partition.
      */
     private Partition readView()
     {
         Partition base;
-        synchronized (this)
+        writeLock.lock();
+        try
         {
             base = buildSnapshot();
+        }
+        finally
+        {
+            writeLock.unlock();
         }
         TimeSeriesMemtable.ObjectShardPartition demoted = demotedTo;
         return demoted == null
@@ -868,10 +1074,27 @@ public final class TimeSeriesColumnarPartition implements TimeSeriesMemtable.Sha
     @Override
     public Partition flushView()
     {
-        // Deliberately built afresh and never retained: the flush set walks every partition, and
-        // pinning each one's materialized object form until the memtable is discarded would recreate
-        // at flush time the very heap footprint the arrays exist to avoid.
-        return readView();
+        // Flush streams off the arrays; it no longer rebuilds them. It is the one caller that reads
+        // every row of every partition exactly once, in order, and then drops it, so the rebuild was
+        // all cost and no reuse: a BTreeRow and a cell per row — ~4.9 GiB allocated and ~19s of CPU
+        // to flush 2.9M rows — plus buildSnapshot's second whole-tree pass to collect EncodingStats
+        // that nothing on this path reads (the writer's SerializationHeader comes from the
+        // memtable-level flushSet.encodingStats(), and SortedTableWriter.append never calls stats()
+        // on the partition or the iterator).
+        //
+        // Nothing is retained, still — the invariant of f70a0a0610 ("Remove the snapshot retention
+        // that OOMed production"), and satisfied a fortiori: the view below caches nothing at all,
+        // and each iterator captures its walk at open and leaves nothing behind at close.
+        //
+        // The guards mirror streamOrRebuild's, and for the same reasons: a demoted partition keeps
+        // the exact merged rebuild it has always had (its rows are split between the frozen arrays
+        // and the object-tier sibling, which only MergedWindowPartition presents as one), and so
+        // does a clustering-less table. Everything else the streaming open cannot reason about is
+        // caught later, by the fail-open inside streamOrRebuild: a flush must never fail because of
+        // an optimisation.
+        if (demotedTo != null || metadata.get().comparator.size() == 0)
+            return readView();
+        return new StreamingFlushView();
     }
 
     // ------------------------------------------------------------------- Partition implementation
@@ -892,9 +1115,14 @@ public final class TimeSeriesColumnarPartition implements TimeSeriesMemtable.Sha
     public DeletionTime partitionLevelDeletion()
     {
         DeletionTime own;
-        synchronized (this)
+        writeLock.lock();
+        try
         {
             own = deletionInfo.getPartitionDeletion();
+        }
+        finally
+        {
+            writeLock.unlock();
         }
         TimeSeriesMemtable.ObjectShardPartition demoted = demotedTo;
         if (demoted != null)
@@ -910,9 +1138,14 @@ public final class TimeSeriesColumnarPartition implements TimeSeriesMemtable.Sha
     public RegularAndStaticColumns columns()
     {
         RegularAndStaticColumns own;
-        synchronized (this)
+        writeLock.lock();
+        try
         {
             own = columns;
+        }
+        finally
+        {
+            writeLock.unlock();
         }
         TimeSeriesMemtable.ObjectShardPartition demoted = demotedTo;
         return demoted == null ? own : own.mergeTo(demoted.columns());
@@ -929,11 +1162,16 @@ public final class TimeSeriesColumnarPartition implements TimeSeriesMemtable.Sha
     @Override
     public boolean isEmpty()
     {
-        synchronized (this)
+        writeLock.lock();
+        try
         {
             if (!deletionInfo.isLive() || !staticRow.isEmpty() || size > supersededCount
                 || (overflow != null && !overflow.isEmpty()))
                 return false;
+        }
+        finally
+        {
+            writeLock.unlock();
         }
         TimeSeriesMemtable.ObjectShardPartition demoted = demotedTo;
         return demoted == null || demoted.isEmpty();
@@ -942,10 +1180,15 @@ public final class TimeSeriesColumnarPartition implements TimeSeriesMemtable.Sha
     @Override
     public boolean hasRows()
     {
-        synchronized (this)
+        writeLock.lock();
+        try
         {
             if (size > supersededCount || (overflow != null && !overflow.isEmpty()))
                 return true;
+        }
+        finally
+        {
+            writeLock.unlock();
         }
         TimeSeriesMemtable.ObjectShardPartition demoted = demotedTo;
         return demoted != null && demoted.hasRows();
@@ -1011,8 +1254,9 @@ public final class TimeSeriesColumnarPartition implements TimeSeriesMemtable.Sha
      * after the first because only page one carries {@code Slices.ALL}.
      */
     @Override
-    public synchronized boolean mayContainRowsIn(Slices slices)
+    public boolean mayContainRowsIn(Slices slices)
     {
+        writeLock.lock();
         try
         {
             TimeSeriesMemtable.ObjectShardPartition demoted = demotedTo;
@@ -1050,29 +1294,76 @@ public final class TimeSeriesColumnarPartition implements TimeSeriesMemtable.Sha
         {
             return TimeSeriesMemtable.pruneFailedOpen(e);
         }
+        finally
+        {
+            writeLock.unlock();
+        }
     }
 
     // ------------------------------------------------------------------------------ observability
 
+    // Each of these reads writer-owned state and so takes the same lock the writer does — the whole
+    // point of there being exactly one lock. They are not instrumented: they are test and diagnostic
+    // calls, and counting them as "writes" would pollute the contention ratio above.
+
     /** Rows currently live in the primitive arrays (the fast path): slots not yet superseded. */
     @VisibleForTesting
-    public synchronized int fastPathRowCount()
+    public int fastPathRowCount()
     {
-        return size - supersededCount;
+        writeLock.lock();
+        try
+        {
+            return size - supersededCount;
+        }
+        finally
+        {
+            writeLock.unlock();
+        }
+    }
+
+    /** Appends that proved the clustering new by a bounds check alone, skipping {@link #findSlot}. */
+    @VisibleForTesting
+    public long certainNewAppends()
+    {
+        writeLock.lock();
+        try
+        {
+            return certainNewAppends;
+        }
+        finally
+        {
+            writeLock.unlock();
+        }
     }
 
     /** Rows in the object-tier overflow map — promoted rows plus rows the arrays never fit. */
     @VisibleForTesting
-    public synchronized int overflowRowCount()
+    public int overflowRowCount()
     {
-        return overflow == null ? 0 : overflow.size();
+        writeLock.lock();
+        try
+        {
+            return overflow == null ? 0 : overflow.size();
+        }
+        finally
+        {
+            writeLock.unlock();
+        }
     }
 
     /** Slots dead-weighted by an append-only re-write or a promotion; feeds the degradation valve. */
     @VisibleForTesting
-    public synchronized int supersededSlotCount()
+    public int supersededSlotCount()
     {
-        return supersededCount;
+        writeLock.lock();
+        try
+        {
+            return supersededCount;
+        }
+        finally
+        {
+            writeLock.unlock();
+        }
     }
 
     /** Whether the degradation valve moved this partition's future writes to the object tier. */
@@ -1089,6 +1380,20 @@ public final class TimeSeriesColumnarPartition implements TimeSeriesMemtable.Sha
         return longClusterings;
     }
 
+    /**
+     * The key instance this partition actually holds — <b>not</b> {@link #partitionKey()}, which puts
+     * it through {@code allocator.ensureOnHeap()} and therefore returns a copy under a native or
+     * off-heap-objects allocator. The one-instance-per-key invariant
+     * ({@code TimeSeriesMemtable.keys} holds the single cloned key every shard shares) can only be
+     * asserted against the stored reference, so a test that used the accessor would pass vacuously on
+     * heap buffers and be unwritable off heap.
+     */
+    @VisibleForTesting
+    public DecoratedKey storedKey()
+    {
+        return key;
+    }
+
     // ------------------------------------------------------------------------------ inner classes
 
     private static final class RowShape
@@ -1097,13 +1402,21 @@ public final class TimeSeriesColumnarPartition implements TimeSeriesMemtable.Sha
         final int ttl;
         final long localDeletionTime;
         final boolean hasLiveness;
+        /**
+         * What {@code row.dataSize()} would have answered, summed by {@code classify} out of the
+         * walk it was already doing. A {@code long}, though {@code Row.dataSize()} is an {@code int}
+         * checked-cast from a long accumulation: the caller adds it to a {@code long} delta, so
+         * widening here drops an overflow check that no row on a write path can reach.
+         */
+        final long dataSize;
 
-        RowShape(long timestamp, int ttl, long localDeletionTime, boolean hasLiveness)
+        RowShape(long timestamp, int ttl, long localDeletionTime, boolean hasLiveness, long dataSize)
         {
             this.timestamp = timestamp;
             this.ttl = ttl;
             this.localDeletionTime = localDeletionTime;
             this.hasLiveness = hasLiveness;
+            this.dataSize = dataSize;
         }
     }
 
@@ -1248,23 +1561,20 @@ public final class TimeSeriesColumnarPartition implements TimeSeriesMemtable.Sha
 
         Cell<?> cellAt(int slot, long timestamp, int ttl, long localDeletionTime)
         {
+            // ArrayCell over a bare byte[] rather than BufferCell over a ByteBuffer: the value is
+            // rebuilt from the primitive arrays either way, and the ByteBuffer wrapper was ~50
+            // bytes of pure overhead per assembled cell on the read and flush paths.
             switch (width)
             {
                 case 8:
-                {
-                    ByteBuffer value = ByteBuffer.allocate(8);
-                    value.putLong(0, longs[slot]);
-                    return new BufferCell(column, timestamp, ttl, localDeletionTime, value, null);
-                }
+                    return new ArrayCell(column, timestamp, ttl, localDeletionTime,
+                                         ByteArrayUtil.bytes(longs[slot]), null);
                 case 4:
-                {
-                    ByteBuffer value = ByteBuffer.allocate(4);
-                    value.putInt(0, ints[slot]);
-                    return new BufferCell(column, timestamp, ttl, localDeletionTime, value, null);
-                }
+                    return new ArrayCell(column, timestamp, ttl, localDeletionTime,
+                                         ByteArrayUtil.bytes(ints[slot]), null);
                 case 1:
-                    return new BufferCell(column, timestamp, ttl, localDeletionTime,
-                                          ByteBuffer.wrap(new byte[]{ bytes[slot] }), null);
+                    return new ArrayCell(column, timestamp, ttl, localDeletionTime,
+                                         new byte[]{ bytes[slot] }, null);
                 default:
                     return (Cell<?>) cells[slot];
             }
@@ -1364,22 +1674,42 @@ public final class TimeSeriesColumnarPartition implements TimeSeriesMemtable.Sha
             int ttl = ttls[slot];
             long ldt = localDeletionTimes[slot];
 
-            List<ColumnData> cellData = null;
+            Object[] scratch = null;
+            int n = 0;
             for (int s = 0; s < stores.length; s++)
             {
                 ColumnWalk store = stores[s];
                 if (store.present[slot] == 0)
                     continue;
-                if (cellData == null)
-                    cellData = new ArrayList<>(stores.length);
-                cellData.add(store.cellAt(slot, ts, ttl, ldt));
+                if (scratch == null)
+                    scratch = new Object[stores.length];
+                scratch[n++] = store.cellAt(slot, ts, ttl, ldt);
             }
 
             LivenessInfo liveness = (flags[slot] & FLAG_HAS_LIVENESS) != 0
                                     ? LivenessInfo.withExpirationTime(ts, ttl, ldt)
                                     : LivenessInfo.EMPTY;
-            Object[] tree = cellData == null ? BTree.empty() : BTree.build(cellData);
-            return BTreeRow.create(clusteringAt(slot), liveness, Row.Deletion.LIVE, tree);
+
+            // Stores are kept in column order, so the scratch prefix is already BTree input order.
+            // The BulkIterator is pooled and must be closed, or its thread-local slot leaks.
+            Object[] tree;
+            if (n == 0)
+                tree = BTree.empty();
+            else if (n == 1)
+                tree = BTree.singleton(scratch[0]);
+            else
+                try (BulkIterator<Object> bulk = BulkIterator.of(scratch, 0))
+                {
+                    tree = BTree.build(bulk, n, UpdateFunction.noOp());
+                }
+
+            // O(1) by construction: classify() admits a slot only with Deletion.LIVE, no cell
+            // tombstone, and one shared (ts, ttl, ldt) across the liveness and every cell — so the
+            // 4-arg create's per-cell accumulate over the tree would always fold to exactly this.
+            long minDeletionTime = ttl == LivenessInfo.NO_TTL
+                                   ? Cell.MAX_DELETION_TIME
+                                   : Math.min(Cell.MAX_DELETION_TIME, ldt);
+            return BTreeRow.create(clusteringAt(slot), liveness, Row.Deletion.LIVE, tree, minDeletionTime);
         }
     }
 
@@ -1427,6 +1757,107 @@ public final class TimeSeriesColumnarPartition implements TimeSeriesMemtable.Sha
         @Override
         public void onAllocatedOnHeap(long delta)
         {
+        }
+    }
+
+    /**
+     * The streamed view, handed to the flush path by {@link TimeSeriesColumnarPartition#flushView()}.
+     * Every row-bearing call goes through {@link TimeSeriesColumnarPartition#streamOrRebuild}, so the
+     * arrays are walked and one row assembled per row actually written out, instead of the whole
+     * partition being rebuilt into objects first and walked afterwards. It holds no row state of its
+     * own — the walk is captured per iterator, at open, and dropped at close — so the flush path's
+     * "never retain a materialization" rule is kept by construction rather than by discipline.
+     *
+     * <p><b>Why this and not the outer partition itself.</b> The outer {@code Partition} overrides
+     * are the read path's: they put iterators, rows and the partition key through
+     * {@code allocator.ensureOnHeap()}. Flush never did — it consumed {@link Snapshot} directly,
+     * whose key and rows are the memtable's own buffers — so copying here would change what the
+     * sstable writer is handed and add back a slice of the very allocation this class exists to
+     * remove. Each method below therefore reproduces what {@code Snapshot} answered, not what the
+     * read path answers.
+     *
+     * <p>The shapes streaming does not serve ({@code getRow}, a names filter) fall through to the
+     * rebuild, unwrapped, for the same reason.
+     */
+    private final class StreamingFlushView implements Partition
+    {
+        @Override
+        public TableMetadata metadata()
+        {
+            return TimeSeriesColumnarPartition.this.metadata();
+        }
+
+        @Override
+        public DecoratedKey partitionKey()
+        {
+            // The memtable's own key object, exactly as Snapshot handed it to the writer: see the
+            // note above on ensureOnHeap.
+            return key;
+        }
+
+        @Override
+        public DeletionTime partitionLevelDeletion()
+        {
+            return TimeSeriesColumnarPartition.this.partitionLevelDeletion();
+        }
+
+        @Override
+        public RegularAndStaticColumns columns()
+        {
+            return TimeSeriesColumnarPartition.this.columns();
+        }
+
+        @Override
+        public EncodingStats stats()
+        {
+            // The maintained cumulative stats, not the exact per-row collection the rebuild made:
+            // collecting exactly costs a walk of every row, and no one on the flush path reads this
+            // (see buildSnapshot). It is the same value the streaming read path already publishes on
+            // every iterator it opens.
+            return TimeSeriesColumnarPartition.this.stats();
+        }
+
+        @Override
+        public boolean isEmpty()
+        {
+            return TimeSeriesColumnarPartition.this.isEmpty();
+        }
+
+        @Override
+        public boolean hasRows()
+        {
+            return TimeSeriesColumnarPartition.this.hasRows();
+        }
+
+        @Override
+        public Row getRow(Clustering<?> clustering)
+        {
+            return readView().getRow(clustering);
+        }
+
+        @Override
+        public UnfilteredRowIterator unfilteredIterator()
+        {
+            // ColumnFilter.all(columns()) — the RegularAndStaticColumns overload, Slices.ALL,
+            // forward: the exact arguments AbstractBTreePartition.unfilteredIterator() passes, so
+            // the iterator's columns() and the unfiltereds it yields are what the rebuild yielded.
+            // This is the call the flush path makes (Flushing.writeSortedContents, and the tiering
+            // hook's ColdWindowChunkFlush.encodePartition).
+            return streamOrRebuild(ColumnFilter.all(columns()), Slices.ALL, false);
+        }
+
+        @Override
+        public UnfilteredRowIterator unfilteredIterator(ColumnFilter selection, Slices slices, boolean reversed)
+        {
+            return streamOrRebuild(selection, slices, reversed);
+        }
+
+        @Override
+        public UnfilteredRowIterator unfilteredIterator(ColumnFilter selection,
+                                                        NavigableSet<Clustering<?>> clusteringsInQueryOrder,
+                                                        boolean reversed)
+        {
+            return readView().unfilteredIterator(selection, clusteringsInQueryOrder, reversed);
         }
     }
 

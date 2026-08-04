@@ -60,6 +60,36 @@ public class TimeSeriesCompactionStrategyOptionsTest
         assertEquals(-1L, opts.retentionMillis);                  // 기본: 없음
     }
 
+    /**
+     * {@code windowStartFor} is the memtable's write-path copy of the boundary arithmetic and
+     * {@code TimeWindowCompactionStrategy.getWindowBoundsInMillis(...).left} is the strategy's.
+     * They must agree bit-for-bit — including the truncate-toward-zero behaviour around t=0 and
+     * the saturating conversions at the extremes — or write-time routing and the freeze
+     * classifier drift apart. This is the pin that lets the write path skip the Pair.
+     */
+    @Test
+    public void windowStartMatchesStrategyBoundsForEveryUnitAndExtreme()
+    {
+        long[] probes = { Long.MIN_VALUE, Long.MIN_VALUE + 1, -1_700_003_723_456L, -1L, 0L, 1L,
+                          999L, 1000L, 1_700_003_723_456L, Long.MAX_VALUE - 1, Long.MAX_VALUE };
+        String[][] windows = { { "window_size", "7m" }, { "window_size", "3h" }, { "window_size", "2d" } };
+        for (String[] window : windows)
+        {
+            TimeSeriesCompactionStrategyOptions opts =
+                new TimeSeriesCompactionStrategyOptions(options(window));
+            for (long t : probes)
+            {
+                assertEquals("unit " + window[1] + " at " + t,
+                             (long) TimeWindowCompactionStrategy.getWindowBoundsInMillis(
+                                 opts.windowUnit, opts.windowSizeInUnits, t).left,
+                             opts.windowStartFor(t));
+                // The unboxed single-window sentinel in TimeSeriesMemtable relies on this never
+                // being produced by real arithmetic.
+                assertFalse(opts.windowStartFor(t) == Long.MIN_VALUE + 1);
+            }
+        }
+    }
+
     @Test
     public void windowStartIsFloorAligned()
     {

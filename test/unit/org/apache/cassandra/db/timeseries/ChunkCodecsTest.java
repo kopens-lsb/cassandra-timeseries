@@ -18,39 +18,54 @@
 package org.apache.cassandra.db.timeseries;
 
 import java.nio.ByteBuffer;
-import java.util.SortedMap;
-import java.util.TreeMap;
 
 import org.junit.Test;
 
 import static org.assertj.core.api.Assertions.assertThatThrownBy;
-import static org.junit.Assert.assertEquals;
-import static org.junit.Assert.assertTrue;
 
 /**
- * Tests the {@link ChunkCodecs} entry point -- the only one the chunk store is meant to consume for
- * the single-column format. Chimp128 (v2) is the sole single-column codec; the removed gorilla
- * codec's version byte (1) is now just an unknown version, and columnar (v3) payloads are rejected
- * with a pointer at {@link ColumnarChunkCodec}.
+ * Tests {@link ChunkCodecs#unsupportedVersion}, the single place that classifies chunk version
+ * bytes: one naming a real-but-removed format (gorilla v1, chimp128 v2, columnar v3) is an
+ * {@link UnsupportedChunkFormatException} the read path must never swallow, while one naming
+ * nothing is indistinguishable from a scrambled first byte and stays a plain
+ * {@link IllegalArgumentException} the read path skips one chunk at a time.
+ * <p>
+ * Exercised through {@link ColumnarChunkCodec}'s entry points -- the ones the production read path
+ * uses -- rather than by calling the classifier directly, so a regression in the routing (an entry
+ * point that stops consulting the classifier) fails here too. The payloads are a bare version byte
+ * plus padding: since v1/v2/v3 have no decoders any more, classification must happen on that byte
+ * alone, before any other byte is interpreted.
  */
 public class ChunkCodecsTest
 {
     @Test
-    public void encodesAndCursorsChimpPayloads()
+    public void removedGorillaVersionIsReportedAsAnUnsupportedFormat()
     {
-        long[] ts = { 1L, 2L, 3L };
-        double[] vs = { 1.0, 2.0, 3.0 };
-        ByteBuffer payload = ChunkCodecs.encode(ts, vs, 3);
+        assertThatThrownBy(() -> ColumnarChunkCodec.cursor(payloadWithVersion((byte) 1), null))
+            .isInstanceOf(UnsupportedChunkFormatException.class)
+            .hasMessageContaining("gorilla");
+        assertThatThrownBy(() -> ColumnarChunkCodec.rowCount(payloadWithVersion((byte) 1)))
+            .isInstanceOf(UnsupportedChunkFormatException.class);
+    }
 
-        assertEquals(Chimp128Codec.VERSION, payload.get(payload.position()));
-        SampleCursor cursor = ChunkCodecs.cursor(payload);
-        for (int i = 0; i < 3; i++)
-        {
-            assertTrue(cursor.advance());
-            assertEquals(ts[i], cursor.timestamp());
-            assertEquals(vs[i], cursor.value(), 0.0);
-        }
-        assertEquals(3, ChunkCodecs.sampleCount(payload));
+    @Test
+    public void removedChimpVersionIsReportedAsAnUnsupportedFormat()
+    {
+        assertThatThrownBy(() -> ColumnarChunkCodec.cursor(payloadWithVersion((byte) 2), null))
+            .isInstanceOf(UnsupportedChunkFormatException.class)
+            .hasMessageContaining("known chunk format");
+        assertThatThrownBy(() -> ColumnarChunkCodec.rowCount(payloadWithVersion((byte) 2)))
+            .isInstanceOf(UnsupportedChunkFormatException.class);
+    }
+
+    @Test
+    public void removedColumnarV3VersionIsReportedAsAnUnsupportedFormat()
+    {
+        assertThatThrownBy(() -> ColumnarChunkCodec.cursor(payloadWithVersion((byte) 3), null))
+            .isInstanceOf(UnsupportedChunkFormatException.class)
+            .hasMessageContaining("version: 3");
+        assertThatThrownBy(() -> ColumnarChunkCodec.rowCount(payloadWithVersion((byte) 3)))
+            .isInstanceOf(UnsupportedChunkFormatException.class);
     }
 
     @Test
@@ -59,61 +74,23 @@ public class ChunkCodecsTest
         // A version byte naming no known format is indistinguishable from a header whose first byte
         // got scrambled, so it must stay a plain IllegalArgumentException -- the read path skips
         // those one at a time rather than failing the query.
-        ByteBuffer payload = ChunkCodecs.encode(new long[]{ 1L }, new double[]{ 1.0 }, 1);
-        payload.put(payload.position(), (byte) 9);
-        assertThatThrownBy(() -> ChunkCodecs.cursor(payload))
-            .isInstanceOf(IllegalArgumentException.class)
-            .isNotInstanceOf(UnsupportedChunkFormatException.class);
+        for (byte version : new byte[]{ 0, 5, 9, (byte) 0xFF })
+        {
+            assertThatThrownBy(() -> ColumnarChunkCodec.cursor(payloadWithVersion(version), null))
+                .as("version " + version)
+                .isInstanceOf(IllegalArgumentException.class)
+                .isNotInstanceOf(UnsupportedChunkFormatException.class);
+            assertThatThrownBy(() -> ColumnarChunkCodec.rowCount(payloadWithVersion(version)))
+                .as("version " + version)
+                .isInstanceOf(IllegalArgumentException.class)
+                .isNotInstanceOf(UnsupportedChunkFormatException.class);
+        }
     }
 
-    @Test
-    public void removedGorillaVersionIsReportedAsAnUnsupportedFormat()
+    private static ByteBuffer payloadWithVersion(byte version)
     {
-        // Version byte 1 was the gorilla single-column format. It names a real format, so it is a
-        // systematic "this build cannot read these chunks" condition, NOT one bad chunk -- and it
-        // must never be half-decoded as chimp (the two headers are byte-identical in layout).
-        ByteBuffer payload = ChunkCodecs.encode(new long[]{ 1L }, new double[]{ 1.0 }, 1);
-        payload.put(payload.position(), (byte) 1);
-        assertThatThrownBy(() -> ChunkCodecs.cursor(payload))
-            .isInstanceOf(UnsupportedChunkFormatException.class)
-            .hasMessageContaining("gorilla");
-        assertThatThrownBy(() -> ChunkCodecs.sampleCount(payload))
-            .isInstanceOf(UnsupportedChunkFormatException.class);
-    }
-
-    @Test
-    public void firstAndLastTimestampPeeks()
-    {
-        ByteBuffer payload = ChunkCodecs.encode(new long[]{ 10L, 20L, 30L }, new double[]{ 1.0, 2.0, 3.0 }, 3);
-        assertEquals(10L, ChunkCodecs.firstTimestamp(payload));
-        assertEquals(30L, ChunkCodecs.lastTimestamp(payload));
-    }
-
-    @Test
-    public void cursorRejectsColumnarPayloadsWithAPointer()
-    {
-        SortedMap<String, ColumnarChunkCodec.ColumnInput> columns = new TreeMap<>();
-        columns.put("v", new ColumnarChunkCodec.ColumnInput(ColumnarChunkCodec.TYPE_INT32,
-                                                            new ByteBuffer[]{ intBytes(1), intBytes(2), intBytes(3) }));
-        ByteBuffer payload = ColumnarChunkCodec.encode(new long[]{ 1L, 2L, 3L }, 3, columns);
-
-        assertThatThrownBy(() -> ChunkCodecs.cursor(payload))
-            .isInstanceOf(UnsupportedChunkFormatException.class)
-            .hasMessageContaining("ColumnarChunkCodec.cursor()");
-    }
-
-    @Test
-    public void headerConstantsAgree()
-    {
-        assertEquals(Chimp128Codec.HEADER_SIZE, ChunkCodecs.HEADER_SIZE);
-        assertEquals(Chimp128Codec.MAX_SAMPLES, ChunkCodecs.MAX_SAMPLES);
-    }
-
-    private static ByteBuffer intBytes(int v)
-    {
-        ByteBuffer b = ByteBuffer.allocate(4);
-        b.putInt(v);
-        b.flip();
-        return b;
+        byte[] bytes = new byte[64];
+        bytes[0] = version;
+        return ByteBuffer.wrap(bytes);
     }
 }

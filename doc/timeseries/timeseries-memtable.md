@@ -85,25 +85,28 @@ ALTER TABLE ks.tbl WITH memtable = 'timeseries';
 "조용히 저하됨"이라, 노드별로 1단계를 빠뜨리면 알아채기 어렵습니다 — §5의 확인 절차로 노드마다
 직접 확인하십시오.
 
-## 3. 지원되는 스키마, 지원되지 않는 스키마
+## 3. 지원 범위 — 폴백 조건은 하나뿐입니다
 
-판정 로직은 `TimeSeriesMemtable.unsupportedReason(TableMetadata)`에 있으며, 다음을 모두
-만족해야 지원됩니다:
+판정 로직은 `TimeSeriesMemtable.unsupportedReason(TableMetadata)`에 있으며, 거부되는 것은
+**컴팩션이 `TimeSeriesCompactionStrategy`가 아닌 테이블** 하나뿐입니다 — 창 크기
+(`window_size`)를 읽을 곳이 없기 때문입니다.
 
-| 조건 | 이유 |
-| --- | --- |
-| 컴팩션이 `TimeSeriesCompactionStrategy` | 창 크기(`window_size`)를 여기서 읽습니다. 다른 전략에는 배정할 창이 없습니다 |
-| 클러스터링 컬럼이 정확히 1개 | 창 배정 기준이 그 컬럼 하나입니다 |
-| 그 클러스터링 컬럼이 `timestamp` 타입 | 창은 시간 폭이므로 시간 값이어야 배정할 수 있습니다 |
-| `counter` 컬럼 없음 | counter는 삭제 후 재삽입이 불가능해서, 행을 창 사이로 옮길 수 있는 이 memtable의 flush 경로가 counter 셀에는 안전하지 않습니다 |
-| 비frozen(멀티셀) 컬럼 없음 | 멀티셀 컬럼은 행 전체를 대표하는 단일 쓰기 타임스탬프가 없어, 창을 어느 기준으로 정할지가 성립하지 않습니다 |
+기본 키의 형태는 제약이 아닙니다. 창 배정 기준이 클러스터링 값이 아니라 **쓰기 타임스탬프**
+(모든 스키마의 모든 셀이 가진 값)이기 때문입니다 — 복합 파티션 키, 복수 클러스터링,
+`timestamp`가 아닌 클러스터링 모두 동작합니다. `counter`·비frozen 컬렉션 컬럼도 동작합니다:
+한 논리 행의 셀이 여러 SSTable로 갈라져도 읽기에서 병합하는 것은 카산드라가 원래 하는 일이고,
+flush 경로의 `WindowRoutingIterator`가 같은 테이블들에 이미 하고 있는 일입니다.
 
-**`frozen` 컬렉션은 지원됩니다** — 단일 셀이라 위 제약에 걸리지 않습니다. 운영 `tm_tag_point`의
-`attribute frozen<map<text,text>>`가 이 모양입니다.
+**샤드 내부 저장은 2단계입니다** (`columnarCapable`). 일반 컬럼이 전부 단순 컬럼(counter 아님,
+비frozen 컬렉션/UDT 없음)인 테이블은 파티션을 컬럼 지향 원시 배열로 저장합니다 — §4.3의 힙
+절감이 여기서 나옵니다. `frozen` 컬렉션은 단일 셀이라 이쪽입니다(운영 `tm_tag_point`의
+`attribute frozen<map<text,text>>`가 이 모양). 그 외 테이블은 파티션당 기존 객체 표현
+(`AtomicBTreePartition`)을 유지합니다. 이 선택은 테이블 단위이고 읽기·flush에는 보이지 않으며,
+**저장 방식의 선택일 뿐 폴백이 아닙니다** — 창 샤딩의 이득은 양쪽 다 얻습니다.
 
-지원되지 않는 테이블에 `memtable = 'timeseries'`를 걸면 §2.3과 같은 방식으로 처리됩니다: 팩토리가
-스키마를 보고 거부 사유를 판정한 뒤, **기본 memtable로 폴백하고 테이블당 한 번(시간당) 경고를
-남깁니다.** `ALTER TABLE` 자체는 거부되지 않고, 쓰기도 정상적으로 계속됩니다.
+TSCS가 아닌 테이블에 `memtable = 'timeseries'`를 걸면 §2.3과 같은 방식으로 처리됩니다: 팩토리가
+거부 사유를 판정한 뒤, **기본 memtable로 폴백하고 테이블당 한 번(시간당) 경고를 남깁니다.**
+`ALTER TABLE` 자체는 거부되지 않고, 쓰기도 정상적으로 계속됩니다.
 
 **왜 던지지 않고 폴백하는가.** memtable은 쓰기 경로 위에 있습니다. 지원하지 않는 스키마를 만났을
 때 예외를 던지면 그 테이블에 대한 **모든 쓰기**가 실패합니다 — 최적화 하나를 놓치는 대가로 그
@@ -169,7 +172,8 @@ allocator:   skiplist 703 B/행  →  timeseries  71 B/행   = 9.87×
 ### 4.4 콜드 창 청크 직접 flush — 재인코더 왕복 제거
 
 계층화(`timeseries_tiering`)가 켜진 테이블에서, flush 대상 창이 이미 `hot_window`보다
-오래됐으면 행을 쓰는 대신 **flush 시점에 바로 컬럼 지향 청크를 만들어** `<base>__chunks`에
+오래됐으면 행을 쓰는 대신 **flush 시점에 바로 컬럼 지향 청크(포맷 v4,
+[chunk-format-v4.md](chunk-format-v4.md))를 만들어** `<base>__chunks`에
 씁니다. 재인코더가 나중에 그 행들을 다시 읽어 인코딩하고 range-delete하는 왕복이 사라집니다 —
 대량 백필·아카이브 적재에서 가장 큰 이득입니다.
 

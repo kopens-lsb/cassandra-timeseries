@@ -180,8 +180,8 @@ Plain `time_bucket` only emits buckets that have data. `time_bucket_gapfill` add
 > ascending order, and nothing enforces it. On a `DESC`-clustered table the rows arrive newest-first and
 > the fill is applied backwards — with **no error**. Adding `ORDER BY timestamp ASC` makes the read itself
 > ascending (a `DESC` declaration plus an `ASC` request cancel out into a reversed slice filter), which is
-> what gap-fill needs. This combination is not yet covered by a test; see
-> [gapfill-design.md §4](gapfill-design.md).
+> what gap-fill needs. This combination is pinned by a test (`TimeSeriesFctsTest`, gap-fill on a
+> `DESC`-clustered table); see [gapfill-design.md §4](gapfill-design.md).
 
 ```sql
 SELECT time_bucket_gapfill(1h, timestamp, '2024-01-01 00:00:00+0000', '2024-01-02 00:00:00+0000'),

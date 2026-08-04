@@ -18,8 +18,8 @@
 
 # 운영 TSCS 설정과 파킹 진단
 
-단일 노드 448 GiB, `pp` 키스페이스 75개 테이블에 TSCS를 적용한 상태에서 측정한 값과,
-파킹된 창을 만났을 때의 진단 절차입니다.
+운영 노드 41(단일 노드 448 GiB), `pp` 키스페이스 75개 테이블에 TSCS를 적용한 상태에서 측정한
+값과, 파킹된 창을 만났을 때의 진단 절차입니다.
 
 ## 1. 현재 설정 — 전부 적정합니다
 
@@ -35,6 +35,10 @@
 
 전부 **`retention = TTL + window_size`** 를 만족합니다. TTL이 0인 64개에 `retention`이 없는 것도
 정상입니다 — 만료시킬 대상이 없습니다.
+
+> `tm_asset_oee` 계열 5개는 `memtable = 'timeseries'`가 걸려 있으나 컴팩션이 UCS라 기본
+> memtable로 폴백 중입니다(2026-08-02 확인) — TSCS로 전환하면 자동 적용됩니다.
+> [timeseries-memtable.md §2.3](timeseries-memtable.md) 참고.
 
 ### `window_size`를 더 키울 이유가 없습니다
 
@@ -184,7 +188,7 @@ grep "window-routing buffer" system.log | grep -o "of [a-z_]*\.[a-z_]*" | sort |
 # 둘 다 비어 있는 것이 정상입니다.
 ```
 
-## 4. 운영 실측 (단일 노드, 24k rows/s 유입)
+## 4. 운영 실측 (노드 41, 2026-08-02, 24k rows/s 유입)
 
 | 항목 | 값 |
 | --- | --- |

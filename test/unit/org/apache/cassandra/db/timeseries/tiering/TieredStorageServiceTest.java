@@ -30,8 +30,11 @@ import org.slf4j.LoggerFactory;
 import org.apache.cassandra.cql3.CQLTester;
 import org.apache.cassandra.cql3.UntypedResultSet;
 import org.apache.cassandra.db.marshal.DoubleType;
+import org.apache.cassandra.db.timeseries.ChunkV4Codec;
+import org.apache.cassandra.db.timeseries.ChunkV4Directory;
 import org.apache.cassandra.db.timeseries.ColumnarChunkCodec;
 import org.apache.cassandra.db.timeseries.ColumnarCursor;
+import org.apache.cassandra.db.timeseries.StatOrder;
 import org.apache.cassandra.db.timeseries.tiering.TieredStorageService.TierRunStats;
 import org.apache.cassandra.schema.Schema;
 import org.apache.cassandra.schema.TableMetadata;
@@ -418,7 +421,7 @@ public class TieredStorageServiceTest extends CQLTester
     public void everyChunkIsWrittenWithTheColumnarCodecVersion() throws Throwable
     {
         // The columnar format is the only chunk format written, so the chunk row's `codec` column is
-        // a fixed 3 for every pattern -- constant series and quantized walks alike. (This replaces
+        // a fixed 4 for every pattern -- constant series and quantized walks alike. (This replaces
         // the per-window gorilla/chimp bake-off that used to make this column vary.)
         createTable("CREATE TABLE %s (tag text, ts timestamp, value double, PRIMARY KEY (tag, ts))");
         setPolicy("{\"hot_window\":\"2h\",\"chunk_window\":\"1h\"}");
@@ -585,9 +588,9 @@ public class TieredStorageServiceTest extends CQLTester
     @Test
     public void oversizedWindowAbortsThatTagOnlyWithError() throws Throwable
     {
-        // Regression for a final-review finding: a window holding more samples than the codec can
-        // encode (ChunkCodecs.MAX_SAMPLES in production; shrunk to 3 here via the maxSamplesPerWindow
-        // seam) must be detected while paging -- never fully materialized -- and abort that tag's walk
+        // Regression for a final-review finding: a window holding more samples than the service will
+        // encode (TieredStorageService.maxSamplesPerWindow in production; shrunk to 3 here via that
+        // same seam) must be detected while paging -- never fully materialized -- and abort that tag's walk
         // with an actionable ERROR, instead of blowing up in encode and re-reading the giant window
         // every cycle forever. Other tags in the same run must still encode.
         createTable("CREATE TABLE %s (tag text, ts timestamp, value double, PRIMARY KEY (tag, ts))");
@@ -791,14 +794,15 @@ public class TieredStorageServiceTest extends CQLTester
         return DoubleType.instance.compose(cursor.getBytes(name));
     }
 
-    /** A v3 payload holding one {@code double} column called {@code value} -- what the re-encoder writes. */
+    /** A v4 payload holding one {@code double} column called {@code value} -- what the re-encoder writes. */
     private static ByteBuffer encodeDoubleChunk(long[] timestamps, double[] values, int count)
     {
         ByteBuffer[] cells = new ByteBuffer[count];
         for (int i = 0; i < count; i++)
             cells[i] = DoubleType.instance.decompose(values[i]);
-        SortedMap<String, ColumnarChunkCodec.ColumnInput> columns = new TreeMap<>();
-        columns.put("value", new ColumnarChunkCodec.ColumnInput(ColumnarChunkCodec.TYPE_DOUBLE_CHIMP, cells));
+        SortedMap<String, ChunkV4Codec.ColumnInput> columns = new TreeMap<>();
+        columns.put("value", new ChunkV4Codec.ColumnInput(ChunkV4Directory.TYPE_DOUBLE,
+                                                          StatOrder.IEEE754_TOTAL, cells));
         return ColumnarChunkCodec.encode(timestamps, count, columns);
     }
 
@@ -840,7 +844,7 @@ public class TieredStorageServiceTest extends CQLTester
     private String chunkInsertQuery()
     {
         return "INSERT INTO " + chunkTableRef() +
-               " (tag, window_start, codec, samples, max_row_writetime, payload) VALUES (?, ?, 3, ?, ?, ?) " +
+               " (tag, window_start, codec, samples, max_row_writetime, payload) VALUES (?, ?, 4, ?, ?, ?) " +
                "USING TIMESTAMP ?";
     }
 }

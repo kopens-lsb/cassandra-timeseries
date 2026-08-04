@@ -18,8 +18,6 @@
 package org.apache.cassandra.db.timeseries.tiering;
 
 import java.nio.ByteBuffer;
-import java.nio.ByteOrder;
-import java.nio.charset.StandardCharsets;
 import java.util.ArrayList;
 import java.util.Date;
 import java.util.LinkedHashMap;
@@ -41,6 +39,9 @@ import org.apache.cassandra.db.marshal.DoubleType;
 import org.apache.cassandra.db.marshal.Int32Type;
 import org.apache.cassandra.db.marshal.MapType;
 import org.apache.cassandra.db.marshal.UTF8Type;
+import org.apache.cassandra.db.timeseries.ChunkV4Codec;
+import org.apache.cassandra.db.timeseries.ChunkV4Directory;
+import org.apache.cassandra.db.timeseries.ChunkV4Header;
 import org.apache.cassandra.db.timeseries.ColumnarChunkCodec;
 import org.apache.cassandra.db.timeseries.ColumnarCursor;
 import org.apache.cassandra.db.timeseries.tiering.TieredStorageService.TierRunStats;
@@ -1238,7 +1239,7 @@ public class TieredStorageColumnsTest extends CQLTester
         UntypedResultSet.Row chunkRow = execute(chunkSelectQuery(), "t1", new Date(0L)).one();
         assertEquals(REAL_SHAPE_ROWS, chunkRow.getInt("samples"));
         ByteBuffer payload = chunkRow.getBytes("payload");
-        Map<String, DirectoryEntry> directory = readDirectory(payload);
+        Map<String, ChunkV4Directory.Entry> directory = readDirectory(payload);
 
         // Round-tripping alone cannot tell a CONSTANT column from one that silently fell back to a
         // full-width section holding 3600 copies of 192, so assert the directory itself: the flag is
@@ -1246,22 +1247,22 @@ public class TieredStorageColumnsTest extends CQLTester
         // section would mean the bytes were written anyway.
         for (String constant : new String[]{ "quality", "error_code", "attribute" })
         {
-            DirectoryEntry entry = directory.get(constant);
+            ChunkV4Directory.Entry entry = directory.get(constant);
             assertNotNull("no directory entry for " + constant + " in " + directory.keySet(), entry);
-            assertTrue(constant + " must be encoded via the CONSTANT flag, flags=" + entry.flags, entry.constant());
+            assertTrue(constant + " must be encoded via the CONSTANT flag, flags=" + entry.colFlags, entry.constant());
             assertEquals(constant + " must occupy no data section at all", 0, entry.sectionLen);
         }
 
-        DirectoryEntry numeric = directory.get("value_numeric");
+        ChunkV4Directory.Entry numeric = directory.get("value_numeric");
         assertNotNull("no directory entry for value_numeric", numeric);
-        assertTrue("value_numeric was never written and must take the all-null flag, flags=" + numeric.flags,
+        assertTrue("value_numeric was never written and must take the all-null flag, flags=" + numeric.colFlags,
                    numeric.allNull());
         assertFalse("an all-null column must not also claim to be constant", numeric.constant());
         assertEquals("value_numeric must occupy no data section at all", 0, numeric.sectionLen);
 
         // The control: the high-entropy column must NOT have been folded away, or the assertions
         // above would be satisfied by an encoder that constant-folds everything.
-        DirectoryEntry latency = directory.get("latency");
+        ChunkV4Directory.Entry latency = directory.get("latency");
         assertFalse("latency varies per row and must not be CONSTANT", latency.constant());
         assertTrue("latency must occupy a real data section, got " + latency.sectionLen, latency.sectionLen > 1000);
 
@@ -1301,12 +1302,25 @@ public class TieredStorageColumnsTest extends CQLTester
         ByteBuffer payload = execute(chunkSelectQuery(), "t1", new Date(0L)).one().getBytes("payload");
 
         // The column has to be carrying real data or this measures the same optimistic thing twice:
-        // not ALL_NULL, not folded to CONSTANT, and a section of exactly one packed bit per row.
-        DirectoryEntry flag = readDirectory(payload).get("value_boolean");
+        // not ALL_NULL, not folded to CONSTANT, and a section of exactly one packed bit per row plus
+        // v4's per-block metadata: an 8-byte block-table entry per block (statWidth 0), and each
+        // block's BITPACK1 body of ceil(rows/64) 64-bit lanes -- no presence bytes, the column is
+        // ALL_PRESENT. The closed form is v4 §4/§5's, evaluated here rather than hard-coded so the
+        // derivation is visible.
+        ChunkV4Directory.Entry flag = readDirectory(payload).get("value_boolean");
         assertNotNull("no directory entry for value_boolean", flag);
         assertFalse("value_boolean is written on every row here and must not be ALL_NULL", flag.allNull());
         assertFalse("value_boolean flips and must not fold to CONSTANT", flag.constant());
-        assertEquals("a boolean section is one packed bit per row", (REAL_SHAPE_ROWS + 7) / 8, flag.sectionLen);
+        int blockSize = 1 << ChunkV4Header.DEFAULT_BLOCK_SIZE_LOG2;
+        int blocks = (REAL_SHAPE_ROWS + blockSize - 1) / blockSize;
+        int expectedSection = blocks * 8;                          // block-table entries, statWidth 0
+        for (int b = 0; b < blocks; b++)
+        {
+            int rowsInBlock = Math.min(blockSize, REAL_SHAPE_ROWS - b * blockSize);
+            expectedSection += ((rowsInBlock + 63) / 64) * 8;      // BITPACK1: one bit per row, 64-bit lanes
+        }
+        assertEquals("a boolean section is one packed bit per row plus the block table",
+                     expectedSection, flag.sectionLen);
 
         double absent = absentBytes / (double) REAL_SHAPE_ROWS;
         double populated = payload.remaining() / (double) REAL_SHAPE_ROWS;
@@ -1361,78 +1375,21 @@ public class TieredStorageColumnsTest extends CQLTester
     // ---- helpers ----
 
     /**
-     * One column's v3 directory entry, re-read test-side. Asserting on the round trip alone cannot
-     * distinguish "encoded as CONSTANT" from "encoded at full width and decoded correctly", so this
-     * deliberately re-implements the documented directory layout: header ({@code HEADER_SIZE} bytes),
-     * then one entry per column of {@code typeCode(1) flags(1) nameLen(1) name sectionLen(varint)
-     * [constLen(varint) constBytes]}.
+     * The chunk's v4 directory entries, re-read from the payload's own metadata. Asserting on the
+     * round trip alone cannot distinguish "encoded as CONSTANT" from "encoded at full width and
+     * decoded correctly", so these tests assert on the directory itself -- flags and section
+     * lengths as stored in the bytes. {@link ChunkV4Codec#open} parses exactly the header and
+     * directory (no section, no block table, no body) and the entry layout it reads is
+     * golden-pinned by {@code ChunkV4DirectoryTest}, so this is the payload's own claim, not the
+     * decoder's reconstruction.
      */
-    private static final class DirectoryEntry
+    private static Map<String, ChunkV4Directory.Entry> readDirectory(ByteBuffer payload)
     {
-        // Mirrors ColumnarChunkCodec's private FLAG_* constants; a change to either must break this.
-        private static final byte FLAG_ALL_NULL = 0x02;
-        private static final byte FLAG_CONSTANT = 0x04;
-
-        final byte typeCode;
-        final byte flags;
-        final int sectionLen;
-
-        DirectoryEntry(byte typeCode, byte flags, int sectionLen)
-        {
-            this.typeCode = typeCode;
-            this.flags = flags;
-            this.sectionLen = sectionLen;
-        }
-
-        boolean constant()
-        {
-            return (flags & FLAG_CONSTANT) != 0;
-        }
-
-        boolean allNull()
-        {
-            return (flags & FLAG_ALL_NULL) != 0;
-        }
-    }
-
-    private static Map<String, DirectoryEntry> readDirectory(ByteBuffer payload)
-    {
-        ByteBuffer buffer = payload.duplicate().order(ByteOrder.BIG_ENDIAN);
-        assertEquals("not a v3 columnar payload", ColumnarChunkCodec.VERSION, buffer.get());
-        buffer.position(buffer.position() + Integer.BYTES + Long.BYTES + Long.BYTES);   // count, first ts, last ts
-        int columnCount = buffer.getShort() & 0xFFFF;
-        buffer.getShort();                                                              // directory size
-        Map<String, DirectoryEntry> directory = new LinkedHashMap<>();
-        for (int c = 0; c < columnCount; c++)
-        {
-            byte typeCode = buffer.get();
-            byte flags = buffer.get();
-            byte[] name = new byte[buffer.get() & 0xFF];
-            buffer.get(name);
-            int sectionLen = (int) readVarLong(buffer);
-            if ((flags & DirectoryEntry.FLAG_CONSTANT) != 0)
-            {
-                // Two statements, not buffer.position(buffer.position() + readVarLong(buffer)): Java
-                // evaluates the outer position() BEFORE readVarLong advances it, which would rewind
-                // over the length varint itself and desynchronise every later entry.
-                int constLen = (int) readVarLong(buffer);
-                buffer.position(buffer.position() + constLen);
-            }
-            directory.put(new String(name, StandardCharsets.UTF_8), new DirectoryEntry(typeCode, flags, sectionLen));
-        }
+        assertEquals("not a v4 columnar payload", ColumnarChunkCodec.VERSION, payload.get(payload.position()));
+        Map<String, ChunkV4Directory.Entry> directory = new LinkedHashMap<>();
+        for (ChunkV4Directory.Entry entry : ChunkV4Codec.open(payload).directory().entries())
+            directory.put(entry.name, entry);
         return directory;
-    }
-
-    private static long readVarLong(ByteBuffer buffer)
-    {
-        long value = 0;
-        for (int shift = 0; ; shift += 7)
-        {
-            byte b = buffer.get();
-            value |= (long) (b & 0x7F) << shift;
-            if ((b & 0x80) == 0)
-                return value;
-        }
     }
 
     private static ByteBuffer attribute(String unit)

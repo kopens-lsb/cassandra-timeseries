@@ -4,6 +4,9 @@
 
 작성일: 2026-07-30 · 대상: [cassandra-timeseries](https://dev.kopens.io/common/cassandra-timeseries) (Apache Cassandra 6.0.0 + 네이티브 시계열 CQL 함수)
 
+> 측정 환경: 구형 24코어 컨테이너(X5670급), v3 청크 시절. GC 간 **상대 비교**와 결론
+> (Generational ZGC 채택 — 현행 설정)은 유효하나, 절대 수치는 현재 기준이 아니다.
+
 ---
 
 ## 요약

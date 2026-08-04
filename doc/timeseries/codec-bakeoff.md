@@ -1,114 +1,75 @@
-# Chunk codec bake-off: Gorilla (v1) vs Chimp128 (v2)
+# Double 코덱 선정 기록 — ALP / ALP-RD 확정
 
-> ## 결론 (2026-08-01, SP4 Task 1.5) — **Chimp128이 유일한 코덱**
+> **상태 (확정): ALP / ALP-RD가 이 저장소의 유일한 double 코덱입니다.** chunk v4의 블록 인코딩
+> `0x20 ALP` / `0x21 ALP_RD`로 구현되어 있습니다 —
+> [`AlpBlockCodec`](../../src/java/org/apache/cassandra/db/timeseries/AlpBlockCodec.java)(블록
+> 레이아웃·규범)과 [`AlpCodec`](../../src/java/org/apache/cassandra/db/timeseries/AlpCodec.java)
+> (계획 함수·값 산술). **Gorilla와 Chimp128은 트리에서 삭제됐습니다** — 그 코덱이 쓰던 청크
+> 버전 바이트(v1, v2)는 v3와 함께 제거된 포맷으로 `UnsupportedChunkFormatException`을 받습니다
+> ([chunk-format-v4.md §10](chunk-format-v4.md)).
 >
-> 이 bake-off 이후 **Gorilla는 삭제됐고 Chimp128이 유일한 double 코덱**이 됐습니다. 정책의
-> `codec` 옵션(`auto`/`gorilla`/`chimp128`)도 함께 제거됐습니다.
+> **현재 재현 가능한 실측**은 ALP vs `RAW`(코덱 없는 double 블록이 받는 인코딩) 비교입니다:
+> `DoubleBlockCodecTest.sizeAgainstRawOnTheProductionDistributions`가 실행마다 분포별 비율을
+> 출력하고 상한을 게이트합니다 — 운영형 소수 2자리 워크 **0.0712 실측**(게이트 0.15),
+> integral 워크 게이트 0.15, near-constant 게이트 0.05, full-precision 가우시안 게이트 0.85,
+> all-NaN 0.80, random 64비트 0.95.
 >
-> **이유**: 아래 측정에서 Gorilla가 이긴 유일한 구간은 **상수(near-constant) 계열**(5배 우세)
-> 뿐입니다. 그런데 컬럼 지향 청크 포맷(v3, SP4 Task 1)이 **CONSTANT 플래그**로 상수 컬럼을
-> 어떤 코덱보다 먼저, 행 수와 무관하게 **O(1) 바이트**로 처리합니다 — 값을 디렉토리에 한 번만
-> 저장하고 데이터 섹션은 0바이트입니다. 즉 Gorilla의 유일한 강점이 코덱 레이어에 도달하기도
-> 전에 사라졌습니다. 남는 위험은 "거의 변하지 않지만 완전한 상수는 아닌" double 계열인데,
-> 그 경우에도 Gorilla를 되살리는 대신 **double용 RLE 경로**를 추가하는 편이 낫습니다(RLE는
-> 그 패턴에서 Gorilla보다도 작습니다).
->
-> 아래의 측정치·표·판정문은 당시 기록 그대로 보존합니다(`ChunkCodecsTest#bakeoff`는 Gorilla와
-> 함께 삭제되어 더 이상 재현되지 않습니다). Chimp128 단독의 크기 회귀 기준은
-> `Chimp128CodecTest#sizeRegressionBaselines`가 이어받았습니다.
+> ```bash
+> .build/sh/ai-ci-test org.apache.cassandra.db.timeseries.DoubleBlockCodecTest
+> ```
 
-## 당시 기록 (2026-07-31)
+이 문서의 나머지는 그 확정에 이른 **측정 기록**입니다. 비교 상대(Chimp128·Gorilla)와 측정
+하네스는 삭제되어 아래 표는 더 이상 재현되지 않지만, 분포별 수치와 구조적 설명은 코덱을 다시
+논의하려는 시도가 참조해야 하는 판정 근거로 남습니다.
 
-Source: `org.apache.cassandra.db.timeseries.ChunkCodecsTest#bakeoff` · 100,000 samples/pattern,
-seed 17, single JVM run (JIT warm-up not isolated -- see the timing caveat below). Promotion
-criteria: [chimp128-codec design spec](../../docs/superpowers/specs/2026-07-31-chimp128-codec-design.md),
-§1 ("목표·판정 기준"). Numbers below are the actual measured `BAKEOFF` output, unedited.
+## ALP vs Chimp128 — 확정 근거 실측 (3,600 값/컬럼 = 1시간 × 1초 간격)
 
-## Raw output
+| 분포 | 변형 | ALP B/값 | Chimp128 B/값 | ALP/Chimp |
+| --- | --- | ---: | ---: | ---: |
+| 운영 `value_numeric` 소수 2자리 워크 | ALP | **0.752** | 1.351 | **0.56×** |
+| 운영 `value_numeric` 정수 워크 | ALP | **0.752** | 1.905 | **0.40×** |
+| near-constant (997행마다 1회 변화) | ALP | **0.013** | 1.130 | **0.011×** |
+| quantized-walk-0.1 | ALP | 0.752 | 1.269 | 0.59× |
+| quantized-sine | ALP | 1.377 | 3.179 | 0.43× |
+| 소수 3자리 압력 워크 | ALP | 0.753 | 1.330 | 0.57× |
+| 단조 증가 정수 카운터 | ALP | 1.627 | 2.320 | 0.70× |
+| uniform [0,1) double | ALP-RD | 6.893 | 7.220 | 0.96× |
+| random 64비트 패턴 | ALP-RD | 8.002 | 8.251 | 0.97× |
+| **full-precision 가우시안 워크** | ALP-RD | 6.627 | **6.532** | **1.015×** |
+| **full-precision 사인** | ALP-RD | 7.038 | **6.773** | **1.039×** |
 
-```
-BAKEOFF constant               gorilla=0.250 B/s chimp=1.250 B/s ratio=0.20 enc(g/c)=18/39 ms dec(g/c)=9/7 ms
-BAKEOFF quantized-walk-0.1     gorilla=4.669 B/s chimp=1.451 B/s ratio=3.22 enc(g/c)=59/16 ms dec(g/c)=6/8 ms
-BAKEOFF quantized-sine         gorilla=6.469 B/s chimp=2.503 B/s ratio=2.58 enc(g/c)=4/28 ms dec(g/c)=9/6 ms
-BAKEOFF full-precision-walk    gorilla=8.359 B/s chimp=6.637 B/s ratio=1.26 enc(g/c)=5/87 ms dec(g/c)=9/10 ms
-BAKEOFF random-bits            gorilla=8.375 B/s chimp=8.375 B/s ratio=1.00 enc(g/c)=5/14 ms dec(g/c)=5/8 ms
-```
+**알려진 손해 — 수용된 트레이드오프**: 굵게 표시한 두 줄 — 소수점이 잘리지 **않은**, 매끄럽게
+변하는 double — 에서는 Chimp128이 1.5~3.9% 더 작습니다. 튜닝 실패가 아니라 구조적입니다. Chimp는
+각 값을 비슷한 최근 값과 XOR해 **순차 상관**을 먹지만, ALP-RD는 비트 패턴의 정적 분포만 모델링하고
+모든 값을 같은 자리에서 자릅니다. ALP-RD 사전을 8개 이상으로 키워도 개선되지 않습니다 — 그런
+계열의 하위 ~53 맨티사 비트는 순차 모델 없이는 사실상 비압축이고, 그것이 ALP-RD의 하한
+(53 bits/값)을 정합니다.
 
-(`B/s` in the printf label is a leftover from the spec's fragment -- the values are
-**bytes/sample**, not bytes/second; `ratio` = gorilla/chimp, i.e. >1 means chimp is smaller.)
+이 두 형태는 **측정된 운영 분포에는 없습니다** (`docker/scale-workload.py` — 운영 판독값은 전부
+십진 양자화되어 있습니다). 순차 상관이 없는 full-precision 데이터에서는 오히려 ALP-RD가 더
+작습니다. 이것이 손해를 수용하고 폴백 없이 ALP 단독을 채택한 근거입니다.
 
-## Table
+측정 외 판정 요소: ALP는 블록 기반이라 v4의 독립 디코드·랜덤 접근 모델과 정합합니다. Chimp의
+XOR 체인은 직렬 의존이라 청크 전체 순차 디코드를 강제했고, 그것이 v4가 폐기한 성질입니다
+([chunk-format-v4.md §0](chunk-format-v4.md)).
 
-| pattern | gorilla (B/sample) | chimp (B/sample) | size ratio (g/c) | chimp vs gorilla | enc ms (g/c) | dec ms (g/c) |
-|---|---:|---:|---:|---:|---:|---:|
-| constant | 0.250 | 1.250 | 0.20 | **+400% (5.0x larger)** | 18 / 39 | 9 / 7 |
-| quantized-walk-0.1 | 4.669 | 1.451 | 3.22 | **-68.9% (smaller)** | 59 / 16 | 6 / 8 |
-| quantized-sine | 6.469 | 2.503 | 2.58 | **-61.3% (smaller)** | 4 / 28 | 9 / 6 |
-| full-precision-walk | 8.359 | 6.637 | 1.26 | -20.6% (smaller) | 5 / 87 | 9 / 10 |
-| random-bits | 8.375 | 8.375 | 1.00 | 0.0% (identical) | 5 / 14 | 5 / 8 |
+## 앞선 라운드 — Gorilla (v1) vs Chimp128 (v2), 100,000 샘플/패턴, seed 17
 
-## Promotion verdict (spec §1 criteria)
+| pattern | gorilla (B/sample) | chimp (B/sample) | chimp vs gorilla |
+|---|---:|---:|---:|
+| constant | 0.250 | 1.250 | **+400% (5.0× 큼)** |
+| quantized-walk-0.1 | 4.669 | 1.451 | **−68.9%** |
+| quantized-sine | 6.469 | 2.503 | **−61.3%** |
+| full-precision-walk | 8.359 | 6.637 | −20.6% |
+| random-bits | 8.375 | 8.375 | 0.0% (동일) |
 
-Spec §1 requires **both** of the following to promote chimp128 to the default codec:
+이 라운드가 남긴, 지금도 유효한 두 가지 사실:
 
-1. **>=30% bytes/sample reduction vs gorilla on quantized patterns** (quantized-walk-0.1,
-   quantized-sine).
-2. **No more than +-10% regression (+ small fixed slack) on the constant pattern**, relative to
-   the spec's cited 0.253 B/sample (measured 0.250 in this run).
-
-Measured: criterion 1 **passes decisively** -- quantized-walk-0.1 is 68.9% smaller and
-quantized-sine is 61.3% smaller, both more than double the 30% bar. Criterion 2 **fails badly** --
-the constant pattern is not within +-10%, it is **5.0x larger (a ~400% regression)**.
-
-**Verdict: chimp128 (v2) is NOT promoted to the default chunk codec.** It stays available as an
-explicit opt-in via `ChunkCodecs.Codec.CHIMP128` (or direct `Chimp128Codec` use); `GorillaCodec`
-(v1) remains the recommended default for workloads that mix constant/setpoint stretches with
-quantized movement, which is the common industrial-sensor case this repo targets (see the README's
-Gorilla row: constant series compress to 0.25 B/sample, a 64x reduction, precisely the case chimp
-regresses). Because `ChunkCodecs.encode` takes an explicit `Codec` enum, callers that know their
-series is reliably quantized and rarely constant (e.g. periodic vibration/temperature readings
-that never truly flatline) can deliberately choose `CHIMP128` for a real 60-69% size win.
-
-### Why chimp loses on the constant pattern (not a bug)
-
-This is a real, honest loss, not an implementation defect -- it falls directly out of the
-normative algorithm in the design spec (§2, left branch, `xorC == 0` case). Chimp128 always
-references its best-matching prior sample through a 7-bit ring index (`i % 128`), even when that
-best match happens to be the immediately preceding value. So an exact repeat costs
-`1 (branch flag) + 7 (ring index) + 1 (exact-match flag)` = **9 bits**, versus Gorilla's dedicated
-1-bit "value unchanged" fast path when the raw XOR against the previous value is zero. For a
-long run of identical values, timestamp DoD is 1 bit in both codecs, so per-sample cost is 2 bits
-(gorilla) vs 10 bits (chimp) -- a 5x blow-up that matches the measured ratio almost exactly
-(1.25 / 0.25 = 5.0). Chimp128's 128-deep ring is optimized for *periodic* recurrence (a value seen
-somewhere in the last 128 samples, not necessarily the previous one), which is exactly why it wins
-big on quantized-sine; it simply does not special-case "same as literally the last sample" the way
-Gorilla's single-window XOR scheme does.
-
-### full-precision-walk and random-bits (informational, not gating)
-
-Neither pattern is part of the spec §1 promotion gate (that only covers quantized + constant), but
-both are worth recording. full-precision-walk (unquantized Gaussian random walk) still favors
-chimp by 20.6% -- its ring-candidate search occasionally finds a better XOR partner than "always
-compare to the immediately preceding sample" even without quantization. random-bits (uniform random
-`double` bits, the encoding worst case for both codecs) comes out identical at 8.375 bytes/sample
-for both -- neither scheme can compress incompressible data, and both converge to essentially the
-8-byte raw value plus a small fixed per-sample control-bit tax.
-
-### Timing caveat
-
-The enc/dec millisecond columns are single-run, same-JVM, no-warm-up wall-clock timings taken
-inside one JUnit test method (see `ChunkCodecsTest#bakeoff`) -- they include JIT warm-up noise and
-should be read as rough orders of magnitude, not a rigorous throughput benchmark. They are recorded
-here only because the source printf emits them; no conclusion in this document rests on their
-precise values.
-
-## Reproducing
-
-```bash
-.build/sh/ai-ci-test --reuse org.apache.cassandra.db.timeseries.ChunkCodecsTest
-```
-
-The `BAKEOFF` lines are on the test's standard output, visible directly in the ant/junit console
-log (`showoutput=true` for `testclasslist`/`testsome`) or duplicated into
-`build/test/output/TEST-org.apache.cassandra.db.timeseries.ChunkCodecsTest.xml`'s
-`Standard Output` section when running via `ant testsome`.
+- **Chimp가 상수 패턴에서 5× 지는 것은 버그가 아니라 구조입니다.** Chimp128은 최적 참조 샘플을
+  항상 7비트 링 인덱스로 지목하므로 정확한 반복 하나가 9비트(분기 1 + 링 7 + 일치 1)인 반면,
+  Gorilla는 "직전 값과 동일" 1비트 전용 경로가 있습니다. 링 구조는 *주기적* 재출현(quantized-sine)
+  에 최적화된 것이고, 그래서 거기서 크게 이깁니다.
+- **상수 계열은 코덱 층에 도달하기 전에 끝나는 문제입니다.** 청크 포맷이 `CONSTANT`(청크 수준
+  디렉토리 + v4의 블록 수준 `0x02 CONSTANT`)로 상수를 행 수와 무관하게 O(1) 바이트로 처리하므로,
+  Gorilla의 유일한 강점이었던 축은 코덱 선정과 무관해졌습니다. "거의 상수지만 완전한 상수는 아닌"
+  계열도 ALP가 흡수합니다 — 위 표의 near-constant 0.013 B/값이 그 측정입니다.

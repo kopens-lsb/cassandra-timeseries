@@ -24,6 +24,8 @@ import org.junit.Test;
 
 import org.apache.cassandra.cql3.CQLTester;
 
+import static org.junit.Assert.assertTrue;
+
 /**
  * Tests for the time-series native functions defined in {@link TimeSeriesFcts}
  * ({@code time_bucket}, {@code first}, {@code last}), exercised through real CQL.
@@ -339,6 +341,63 @@ public class TimeSeriesFctsTest extends CQLTester
 
         assertRows(execute("SELECT integral(v, ts), time_weighted_average(v, ts) FROM %s WHERE k = 1"),
                    row(300.0, 10.0));
+    }
+
+    /**
+     * The ordering the buffered (value, timestamp) aggregates do at finalization has to be correct AND cheap on a
+     * DESC-clustered table, which is the ordinary time-series shape: rows then arrive newest-first, i.e. exactly
+     * reversed. An insertion sort is O(n²) there — measured at 14.4 s for one 100,000-row partition against ~0.5 s
+     * for every other aggregate over the same scan.
+     *
+     * <p>Correctness and cost are asserted together on purpose. The answer alone cannot fail on a quadratic sort,
+     * and a wall-clock bound alone is a flaky test; the bound here is deliberately loose (10 s for 20,000 rows,
+     * where the quadratic version needs minutes and the merge sort needs milliseconds) so it fails only on a
+     * genuine complexity regression, not on a slow machine.
+     */
+    @Test
+    public void testBufferedAggregatesOnDescendingClusteringAreNotQuadratic() throws Throwable
+    {
+        createTable("CREATE TABLE %s (k int, ts timestamp, v double, PRIMARY KEY (k, ts)) " +
+                    "WITH CLUSTERING ORDER BY (ts DESC)");
+        // Constant 10 over 19,999 uniform 1s steps: integral = 10 * 19,999, TWA = 10 -- values chosen so the
+        // expected result is exact in double arithmetic whatever order the samples are folded in.
+        int rows = 20_000;
+        long base = 1_704_099_600_000L;                 // 2024-01-01 09:00:00Z
+        for (int i = 0; i < rows; i++)
+            execute("INSERT INTO %s (k, ts, v) VALUES (1, ?, 10)", new Date(base + i * 1000L));
+
+        long startedAt = System.nanoTime();
+        assertRows(execute("SELECT integral(v, ts), time_weighted_average(v, ts) FROM %s WHERE k = 1"),
+                   row(10.0 * (rows - 1), 10.0));
+        long elapsedMs = (System.nanoTime() - startedAt) / 1_000_000L;
+        assertTrue("integral/TWA over " + rows + " descending rows took " + elapsedMs + " ms -- the finalization "
+                   + "sort has gone quadratic again", elapsedMs < 10_000);
+
+        // counter_delta/counter_rate buffer and order through the same helper, so they regress together.
+        startedAt = System.nanoTime();
+        execute("SELECT counter_delta(v, ts) FROM %s WHERE k = 1");
+        elapsedMs = (System.nanoTime() - startedAt) / 1_000_000L;
+        assertTrue("counter_delta over " + rows + " descending rows took " + elapsedMs + " ms", elapsedMs < 10_000);
+    }
+
+    /**
+     * The reversal fast path is only stable when no two timestamps tie, and ties are reachable: a re-written sample
+     * keeps its clustering, so the buffer can hold the same timestamp twice. Ordering must still put the later
+     * arrival last, which is what makes the newest value win at the seam.
+     */
+    @Test
+    public void testBufferedAggregateOrderingIsStableAcrossTiedTimestamps() throws Throwable
+    {
+        createTable("CREATE TABLE %s (k int, ts timestamp, v double, PRIMARY KEY (k, ts)) " +
+                    "WITH CLUSTERING ORDER BY (ts DESC)");
+        // Descending arrival with a duplicated clustering: the second write to 09:00:10 replaces the first, so the
+        // series is 0 @00s, 20 @10s, 20 @20s -- integral = trapezoid(0,20,10s) + trapezoid(20,20,10s) = 100 + 200.
+        execute("INSERT INTO %s (k, ts, v) VALUES (1, '2024-01-01 09:00:20+0000', 20)");
+        execute("INSERT INTO %s (k, ts, v) VALUES (1, '2024-01-01 09:00:10+0000', 10)");
+        execute("INSERT INTO %s (k, ts, v) VALUES (1, '2024-01-01 09:00:10+0000', 20)");
+        execute("INSERT INTO %s (k, ts, v) VALUES (1, '2024-01-01 09:00:00+0000', 0)");
+
+        assertRows(execute("SELECT integral(v, ts) FROM %s WHERE k = 1"), row(300.0));
     }
 
     @Test

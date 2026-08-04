@@ -34,8 +34,11 @@ import com.google.common.annotations.VisibleForTesting;
 import org.slf4j.Logger;
 import org.slf4j.LoggerFactory;
 
+import org.apache.cassandra.cql3.CQLStatement;
 import org.apache.cassandra.cql3.ColumnIdentifier;
+import org.apache.cassandra.cql3.QueryOptions;
 import org.apache.cassandra.cql3.QueryProcessor;
+import org.apache.cassandra.cql3.ResultSet;
 import org.apache.cassandra.cql3.UntypedResultSet;
 import org.apache.cassandra.db.Clustering;
 import org.apache.cassandra.db.ConsistencyLevel;
@@ -48,6 +51,11 @@ import org.apache.cassandra.db.timeseries.UnsupportedChunkFormatException;
 import org.apache.cassandra.schema.ColumnMetadata;
 import org.apache.cassandra.schema.TableMetadata;
 import org.apache.cassandra.service.ClientWarn;
+import org.apache.cassandra.service.QueryState;
+import org.apache.cassandra.service.pager.PagingState;
+import org.apache.cassandra.transport.Dispatcher;
+import org.apache.cassandra.transport.ProtocolVersion;
+import org.apache.cassandra.transport.messages.ResultMessage;
 import org.apache.cassandra.utils.AbstractIterator;
 import org.apache.cassandra.utils.CloseableIterator;
 import org.apache.cassandra.utils.NoSpamLogger;
@@ -82,6 +90,36 @@ import static java.lang.String.format;
  * equivalent) so that a partition with years of hourly windows is paged rather than assembled in one
  * page.
  *
+ * <h2>The statements are prepared once, never per call</h2>
+ * Both statements are fixed text for a given table -- the table reference, the partition-key
+ * predicate and the ordering are all decided in the constructor, and every window and every
+ * partition key differs only in its <em>bind values</em>. They are nevertheless CQL strings, and the
+ * string-taking execution entry points re-run ANTLR and re-prepare on <em>every</em> call:
+ * {@link QueryProcessor#process(String, ConsistencyLevel, List)} parses on its way in, and so does
+ * {@link TieredStorageService#pagedSelectLazy} once per page. That put a parse and a prepare in front
+ * of every payload fetch -- {@code O(windows decoded)} per query, on the consistency-level path that
+ * every user SELECT takes.
+ * <p>
+ * So the text is turned into a {@link CQLStatement} once (see {@link #prepare}) and that statement is
+ * executed directly. Two levels of reuse, and the second is the one that matters:
+ * <ul>
+ *   <li>per source, in {@link #windowStatement} / {@link #payloadStatement}, so one query resolves
+ *       each statement once no matter how many windows it decodes;</li>
+ *   <li>per process, because {@link QueryProcessor#prepareInternal} is backed by the same
+ *       internal-statement cache {@code executeInternal} uses -- so the ANTLR parse happens once per
+ *       table per process, not once per query, and, crucially, that is the cache Cassandra's own
+ *       {@code StatementInvalidatingListener} clears on {@code DROP}/{@code ALTER}. A chunk table
+ *       that is dropped and recreated cannot be served by a statement prepared against the old one,
+ *       and the invalidation is upstream's, not a copy of it.</li>
+ * </ul>
+ * <b>The consistency level is untouched by this.</b> Execution still goes through
+ * {@code QueryProcessor.instance.process(...)} with {@link QueryOptions#forInternalCalls(ConsistencyLevel, List)}
+ * at the policy's CL -- byte for byte what the string overload does after parsing. Only the parse is
+ * skipped; the read is as coordinated and as replicated as it ever was, and is emphatically not an
+ * {@code executeInternal}-style local-only execution. (The {@code cl == null} branches keep calling
+ * {@code executeInternal}/{@code executeInternalWithPaging}, which were never the problem: they
+ * resolve through that same internal-statement cache already.)
+ *
  * <h2>Order is inherited, never re-derived</h2>
  * {@code descending} is the caller's {@code emitDescending} -- the order rows must come out in
  * expressed as timestamps, which is <em>not</em> the read's {@code reversed} flag (see
@@ -110,6 +148,26 @@ final class ChunkRowSource
     @VisibleForTesting
     static final AtomicLong payloadReads = new AtomicLong();
 
+    /**
+     * Window rows pulled from the chunk table's window listing. The companion of
+     * {@link #payloadReads} for the step before it: a read can decode one payload and still have
+     * enumerated every window in the partition to find it, which is invisible in the results and
+     * was the real cost of an unbounded newest-first {@code LIMIT}.
+     */
+    @VisibleForTesting
+    static final AtomicLong windowRowsListed = new AtomicLong();
+
+    /**
+     * Times a chunk-table CQL string has been handed to {@link #prepare} to be turned into an
+     * executable statement. An <em>upper bound</em> on ANTLR parses, not a count of them: repeats hit
+     * {@link QueryProcessor#prepareInternal}'s process-wide cache and parse nothing. It is the bound
+     * that is worth holding -- it used to be one per payload fetch and one per window-listing page,
+     * i.e. {@code O(windows)} per query, and it must stay {@code O(statements)}. Invisible in a
+     * query's results, so only a counter can hold it. See {@code TransparentReadTest}.
+     */
+    @VisibleForTesting
+    static final AtomicLong statementPreparations = new AtomicLong();
+
     private final TableMetadata metadata;
     /** {@code SELECT window_start, max_row_writetime ...} -- deliberately no payload column. */
     private final String windowSelect;
@@ -123,6 +181,16 @@ final class ChunkRowSource
     private final boolean descending;
     private final Set<String> projection;
     private final ConsistencyLevel cl;
+
+    /**
+     * {@link #windowSelect} and {@link #payloadSelect} prepared, resolved on first use and reused for
+     * every window and every partition key this source is asked about. Volatile and racily published
+     * on purpose, exactly as {@link QueryProcessor#prepareInternal} does it: two threads resolving the
+     * same text get the same cached statement back, so a lost write costs one map lookup and changes
+     * nothing else.
+     */
+    private volatile CQLStatement windowStatement;
+    private volatile CQLStatement payloadStatement;
 
     /**
      * @param lookbackMs how far before {@code startMs} a chunk's {@code window_start} may sit and
@@ -158,8 +226,14 @@ final class ChunkRowSource
             tagPredicate.append(column.name.toCQLString()).append(" = ?");
         }
         String ref = chunkRef(metadata);
-        this.windowSelect = format("SELECT window_start, max_row_writetime FROM %s " +
-                                   "WHERE %s AND window_start >= ? AND window_start < ?", ref, tagPredicate);
+        // Newest-first queries push the ordering into the chunk table instead of listing every
+        // window and reversing in memory: window_start is the clustering column and the whole
+        // partition key is restricted, so ORDER BY ... DESC is a plain reversed single-partition
+        // read. Combined with the lazy window iterator below, an unbounded `LIMIT n` now touches
+        // one page of window rows rather than every window the tag has ever had.
+        String select = format("SELECT window_start, max_row_writetime FROM %s " +
+                               "WHERE %s AND window_start >= ? AND window_start < ?", ref, tagPredicate);
+        this.windowSelect = descending ? select + " ORDER BY window_start DESC" : select;
         this.payloadSelect = format("SELECT payload FROM %s WHERE %s AND window_start = ?", ref, tagPredicate);
         this.lookbackMs = lookbackMs;
         this.startMs = startMs;
@@ -172,6 +246,122 @@ final class ChunkRowSource
     }
 
     /**
+     * @return {@code cql} as an executable statement. Deliberately {@link QueryProcessor#prepareInternal}
+     *         and not a cache of our own: it is keyed by the exact query text, it is the cache
+     *         {@code executeInternal} already serves the {@code cl == null} branches from (so both
+     *         paths share one entry per statement per table), and above all it is the one
+     *         {@code QueryProcessor.StatementInvalidatingListener} empties on {@code DROP TABLE},
+     *         {@code DROP KEYSPACE} and schema-affecting {@code ALTER}s. Rolling our own would mean
+     *         re-implementing that invalidation and getting the dropped-and-recreated chunk table
+     *         wrong; this way the entry is gone before the next read can ask for it.
+     *         <p>
+     *         "Internal" here names the cache, not the execution: what comes back is an ordinary
+     *         prepared {@link CQLStatement}, and the caller decides at what consistency level to run
+     *         it. Nothing about {@code prepareInternal} makes a read local.
+     */
+    private static CQLStatement prepare(String cql)
+    {
+        statementPreparations.incrementAndGet();
+        return QueryProcessor.prepareInternal(cql).statement;
+    }
+
+    /**
+     * The two statements, resolved lazily so that a source built for a query that never touches the
+     * chunk table costs nothing, and so that a missing or malformed chunk table still surfaces from
+     * inside the {@code try} blocks that turn it into a {@link #chunkReadFailed} rather than from the
+     * constructor.
+     * <p>
+     * Memoised for the life of this source, which is the life of one SELECT: a query that decodes
+     * forty windows resolves the payload statement once, and -- less obviously but more usefully --
+     * a schema change part-way through a read cannot make the second half of one result set come
+     * from a differently-shaped chunk table than the first half.
+     */
+    private CQLStatement windowStatement()
+    {
+        CQLStatement statement = windowStatement;
+        if (statement == null)
+            windowStatement = statement = prepare(windowSelect);
+        return statement;
+    }
+
+    private CQLStatement payloadStatement()
+    {
+        CQLStatement statement = payloadStatement;
+        if (statement == null)
+            payloadStatement = statement = prepare(payloadSelect);
+        return statement;
+    }
+
+    /**
+     * Runs an already-prepared {@code statement} once, at this query's consistency level.
+     *
+     * <p>This is {@link QueryProcessor#process(String, ConsistencyLevel, List)} with its first line
+     * removed. That overload's body is: build an internal {@code QueryState}, build
+     * {@code QueryOptions.forInternalCalls(cl, values)}, <b>parse the string</b>, call
+     * {@code instance.process(...)}, unwrap the rows. Everything here is identical except that the
+     * statement arrives already parsed -- same query state, same options, same CL, same
+     * {@code process} entry point, so the same coordinated, replicated read.
+     */
+    private UntypedResultSet execute(CQLStatement statement, List<ByteBuffer> values)
+    {
+        ResultMessage result = QueryProcessor.instance.process(statement,
+                                                               QueryState.forInternalCalls(),
+                                                               QueryOptions.forInternalCalls(cl, values),
+                                                               Dispatcher.RequestTime.forImmediateExecution());
+        return result instanceof ResultMessage.Rows
+               ? UntypedResultSet.create(((ResultMessage.Rows) result).result)
+               : null;
+    }
+
+    /**
+     * Pages an already-prepared {@code statement} at this query's consistency level, fetching the next
+     * page only when the current one is exhausted.
+     *
+     * <p>This is {@link TieredStorageService#pagedSelectLazy} with one difference, which is the whole
+     * reason for the copy: that helper takes the query as a <em>string</em> and calls
+     * {@code QueryProcessor.instance.parse} inside its paging loop, so it re-parses and re-prepares
+     * once per page. Paging semantics, failure behaviour and CL are otherwise identical, down to the
+     * {@link QueryOptions} construction. The two should be folded back together by giving
+     * {@code pagedSelectLazy} a {@link CQLStatement} overload; that file is owned elsewhere right now.
+     *
+     * <p>Exceptions surface from {@code hasNext()}/{@code next()} at the page boundary that failed,
+     * not from this call; the caller wraps them.
+     */
+    private Iterator<UntypedResultSet.Row> pagedRows(CQLStatement statement, List<ByteBuffer> values)
+    {
+        QueryState queryState = QueryState.forInternalCalls();
+        return new AbstractIterator<UntypedResultSet.Row>()
+        {
+            private PagingState pagingState = null;
+            private boolean exhausted = false;
+            private Iterator<UntypedResultSet.Row> page = Collections.emptyIterator();
+
+            @Override
+            protected UntypedResultSet.Row computeNext()
+            {
+                while (!page.hasNext())
+                {
+                    if (exhausted)
+                        return endOfData();
+
+                    QueryOptions options = QueryOptions.create(cl, values, false, TieredStorageService.PAGE_SIZE,
+                                                               pagingState, null, ProtocolVersion.CURRENT, null);
+                    ResultMessage result = QueryProcessor.instance.process(statement, queryState, options,
+                                                                           Dispatcher.RequestTime.forImmediateExecution());
+                    if (!(result instanceof ResultMessage.Rows))
+                        return endOfData();
+
+                    ResultSet resultSet = ((ResultMessage.Rows) result).result;
+                    page = UntypedResultSet.create(resultSet).iterator();
+                    pagingState = resultSet.metadata.getPagingState();
+                    exhausted = pagingState == null;
+                }
+                return page.next();
+            }
+        };
+    }
+
+    /**
      * @return this partition's chunk rows, in emission order, decoded a window at a time. The caller
      *         owns the iterator and must {@link CloseableIterator#close() close} it -- closing is
      *         what stops the remaining windows from ever being fetched.
@@ -179,16 +369,18 @@ final class ChunkRowSource
     CloseableIterator<Row> rowsFor(DecoratedKey key)
     {
         List<ByteBuffer> tagValues = tagValues(key);
-        List<Window> windows = windows(tagValues);
-        if (windows.isEmpty())
-            return CloseableIterator.empty();
-        if (descending)
-            Collections.reverse(windows);                 // the window list arrives ascending
-        return new ChunkRows(tagValues, windows);
+        return new ChunkRows(tagValues, windows(tagValues));
     }
 
-    /** The windows whose data can reach into this query's range, in ascending {@code window_start} order. */
-    private List<Window> windows(List<ByteBuffer> tagValues)
+    /**
+     * The windows whose data can reach into this query's range, in emission order — ascending
+     * {@code window_start}, or descending when the query emits newest-first.
+     *
+     * <p>Lazy: the rows are pulled a page at a time as the consumer walks them, so a query that
+     * stops early never pays for the windows past the one that satisfied it. Listing them all was
+     * the dominant cost of an unbounded {@code LIMIT 1} on a tag with years of history.
+     */
+    private Iterator<Window> windows(List<ByteBuffer> tagValues)
     {
         // A chunk of width W starting at S holds timestamps in [S, S+W), so it can reach into the
         // range iff S > startMs - W. Unbounded slice ends arrive as Long.MIN/MAX_VALUE - clamp to
@@ -203,23 +395,47 @@ final class ChunkRowSource
         values.add(TimestampType.instance.decompose(new Date(windowLow)));
         values.add(TimestampType.instance.decompose(new Date(windowHigh)));
 
-        List<Window> windows = new ArrayList<>();
+        Iterator<UntypedResultSet.Row> rows;
         try
         {
-            // Paged on both branches: a partition holding years of hourly windows has tens of
-            // thousands of them, and while each row is tiny, one unpaged page of them is not.
-            Iterable<UntypedResultSet.Row> rows =
-                cl == null ? QueryProcessor.executeInternalWithPaging(windowSelect, TieredStorageService.PAGE_SIZE,
-                                                                      values.toArray())
-                           : TieredStorageService.pagedSelect(windowSelect, cl, values);
-            for (UntypedResultSet.Row row : rows)
-                windows.add(new Window(row.getBytes("window_start"), row.getLong("max_row_writetime")));
+            // Paged AND lazily consumed on both branches: a partition holding years of hourly
+            // windows has tens of thousands of them, and while each row is tiny, materializing all
+            // of them before the first payload is read is what made `LIMIT 1` cost a full scan.
+            // Prepared on both branches too -- executeInternalWithPaging resolves through
+            // QueryProcessor's internal-statement cache, and pagedRows is pagedSelectLazy with the
+            // per-page re-parse taken out (see prepare and pagedRows).
+            rows = cl == null
+                   ? QueryProcessor.executeInternalWithPaging(windowSelect, TieredStorageService.PAGE_SIZE,
+                                                              values.toArray()).iterator()
+                   : pagedRows(windowStatement(), values);
         }
         catch (RuntimeException e)
         {
             throw chunkReadFailed(e);
         }
-        return windows;
+
+        // The failure contract is per-page, not per-call: paging means a later page can throw long
+        // after this method returned, and that must surface as the same chunk-read failure rather
+        // than as a raw driver exception from inside the row iterator.
+        return new AbstractIterator<Window>()
+        {
+            @Override
+            protected Window computeNext()
+            {
+                try
+                {
+                    if (!rows.hasNext())
+                        return endOfData();
+                    UntypedResultSet.Row row = rows.next();
+                    windowRowsListed.incrementAndGet();
+                    return new Window(row.getBytes("window_start"), row.getLong("max_row_writetime"));
+                }
+                catch (RuntimeException e)
+                {
+                    throw chunkReadFailed(e);
+                }
+            }
+        };
     }
 
     /**
@@ -308,12 +524,11 @@ final class ChunkRowSource
     private final class ChunkRows extends AbstractIterator<Row>
     {
         private final List<ByteBuffer> tagValues;
-        private final List<Window> windows;
-        private int nextWindow;
+        private final Iterator<Window> windows;
         private Iterator<Row> current = Collections.emptyIterator();
         private boolean closed;
 
-        ChunkRows(List<ByteBuffer> tagValues, List<Window> windows)
+        ChunkRows(List<ByteBuffer> tagValues, Iterator<Window> windows)
         {
             this.tagValues = tagValues;
             this.windows = windows;
@@ -330,9 +545,11 @@ final class ChunkRowSource
                     if (selects(row))
                         return row;
                 }
-                if (closed || nextWindow >= windows.size())
+                // hasNext() on the window iterator is what fetches the next page of the window
+                // listing, so a consumer that stopped early never triggers it.
+                if (closed || !windows.hasNext())
                     return endOfData();
-                current = decode(windows.get(nextWindow++));
+                current = decode(windows.next());
             }
         }
 
@@ -415,9 +632,14 @@ final class ChunkRowSource
             UntypedResultSet result;
             try
             {
+                // Once per window, so the statement must not be re-parsed here: this is the call
+                // that made preparation O(windows decoded). Both branches now run a statement the
+                // process has already prepared -- executeInternal through QueryProcessor's internal
+                // cache, execute(...) through ours -- and both still run it at the same consistency
+                // level they always did.
                 result = cl == null
                          ? QueryProcessor.executeInternal(payloadSelect, values.toArray())
-                         : QueryProcessor.process(payloadSelect, cl, values);
+                         : execute(payloadStatement(), values);
             }
             catch (RuntimeException e)
             {

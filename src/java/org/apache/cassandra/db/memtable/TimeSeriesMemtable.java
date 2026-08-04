@@ -66,9 +66,6 @@ import org.apache.cassandra.db.partitions.Partition;
 import org.apache.cassandra.db.partitions.PartitionUpdate;
 import org.apache.cassandra.db.partitions.UnfilteredPartitionIterator;
 import org.apache.cassandra.db.partitions.UnfilteredPartitionIterators;
-import org.apache.cassandra.db.rows.Cell;
-import org.apache.cassandra.db.rows.ColumnData;
-import org.apache.cassandra.db.rows.ComplexColumnData;
 import org.apache.cassandra.db.rows.EncodingStats;
 import org.apache.cassandra.db.rows.Row;
 import org.apache.cassandra.db.rows.Unfiltered;
@@ -266,6 +263,17 @@ public class TimeSeriesMemtable extends AbstractAllocatorMemtable
         return shards;
     }
 
+    /**
+     * The interned key index, for tests of the one-instance-per-key invariant and of the ordering
+     * rule in {@link #putSingleWindow} (a key must never be missing here while a shard holds its
+     * partition).
+     */
+    @VisibleForTesting
+    public ConcurrentNavigableMap<PartitionPosition, DecoratedKey> keys()
+    {
+        return keys;
+    }
+
     // ------------------------------------------------------------------------------------- writes
 
     /**
@@ -276,7 +284,6 @@ public class TimeSeriesMemtable extends AbstractAllocatorMemtable
     public long put(PartitionUpdate update, UpdateTransaction indexer, OpOrder.Group opGroup, boolean assumeMissing)
     {
         Cloner cloner = allocator.cloner(opGroup);
-        DecoratedKey key = internKey(update.partitionKey(), cloner, opGroup);
         TimeSeriesCompactionStrategyOptions opts = options;
 
         // An UpdateTransaction is scoped to one partition update and guarantees start() before
@@ -288,10 +295,15 @@ public class TimeSeriesMemtable extends AbstractAllocatorMemtable
         indexer.start();
         try
         {
-            Long window = singleWindowOf(update, opts);
-            colUpdateTimeDelta = window != null
-                                 ? shardFor(window).put(key, update, scoped, cloner, opGroup, assumeMissing, liveDataSize)
-                                 : putSplitByWindow(key, update, scoped, cloner, opGroup, opts);
+            long window = singleWindowOf(update, opts);
+            colUpdateTimeDelta =
+                window != NO_SINGLE_WINDOW
+                ? putSingleWindow(window, update, scoped, cloner, opGroup, assumeMissing)
+                // The split path writes the same key into several shards, so it interns up front:
+                // there is no single shard to probe first, and the alternative would be a probe per
+                // window.
+                : putSplitByWindow(internKey(update.partitionKey(), cloner, opGroup),
+                                   update, scoped, cloner, opGroup, opts);
         }
         finally
         {
@@ -306,6 +318,58 @@ public class TimeSeriesMemtable extends AbstractAllocatorMemtable
         statsCollector.update(update.stats());
         currentOperations.addAndGet(update.operationCount());
         return colUpdateTimeDelta;
+    }
+
+    /**
+     * The whole-update fast path: everything in {@code update} belongs to window {@code window}, so
+     * it goes to one shard, whole.
+     *
+     * <p><b>One skip-list probe per write, not two.</b> Every write used to probe {@link #keys} (to
+     * intern the key) and then the shard's {@code partitions} map (to find the partition) with the
+     * same key. On a shard hit the interned key is not wanted for anything —
+     * {@link WindowShard#put} uses it only to construct a partition that is missing — so the shard
+     * is probed first and a hit writes straight through, interning nothing.
+     *
+     * <p>The interned key is deliberately <b>not</b> taken from {@code partition.partitionKey()} on
+     * that path: for a {@link TimeSeriesColumnarPartition} that accessor goes through
+     * {@code allocator.ensureOnHeap().applyToPartitionKey(...)}, which <em>copies</em> under a
+     * native or off-heap-objects allocator — an allocation on the path being optimised, and a second
+     * key instance for a key that is supposed to have exactly one.
+     *
+     * <p><b>The miss branch's order is load-bearing:</b> {@code keys.putIfAbsent} (inside
+     * {@link #internKey}) strictly before {@code partitions.putIfAbsent} (inside
+     * {@link WindowShard#put}). {@link #isClean()} answers from {@code keys} alone, and
+     * {@code ColumnFamilyStore} <em>discards a clean memtable without flushing it</em> — so a
+     * partition visible in a shard whose key is not yet in {@code keys} is not a slow read, it is
+     * silent data loss. In this order a reader that sees the partition sees the key too: the
+     * {@code keys} write precedes the {@code partitions} write in program order, and the concurrent
+     * map's publication carries it. {@link #partitionCount()}, {@link #lastToken()} and the flush
+     * set's key-size estimate all read {@code keys} the same way and inherit the same guarantee.
+     */
+    private long putSingleWindow(long window,
+                                 PartitionUpdate update,
+                                 UpdateTransaction indexer,
+                                 Cloner cloner,
+                                 OpOrder.Group opGroup,
+                                 boolean assumeMissing)
+    {
+        WindowShard shard = shardFor(window);
+        DecoratedKey updateKey = update.partitionKey();
+
+        // assumeMissing is the caller's assertion that this key is new, which is exactly the licence
+        // to skip this probe (Memtable#put: "MAY clone the key and attempt putIfAbsent without first
+        // looking for the keys' presence").
+        if (!assumeMissing)
+        {
+            ShardPartition existing = shard.partitions.get(updateKey);
+            if (existing != null)
+                return existing.put(update, indexer, cloner, opGroup, liveDataSize);
+        }
+
+        // A miss here has established absence — or the caller asserted it — so the shard is told not
+        // to look a third time; its putIfAbsent still settles any race with a concurrent writer.
+        return shard.put(internKey(updateKey, cloner, opGroup),
+                         update, indexer, cloner, opGroup, true, liveDataSize);
     }
 
     /**
@@ -394,60 +458,72 @@ public class TimeSeriesMemtable extends AbstractAllocatorMemtable
     }
 
     /**
-     * @return the one window every element of {@code update} routes to, or {@code null} if they do not
-     *         all agree and the update has to be split. The common case — a single row, or a batch of
-     *         rows written at the same time — takes the non-null answer and is then applied whole, with
-     *         no per-row wrapping at all.
+     * The "no single window" sentinel. Not {@code Long.MIN_VALUE}: every real window start is a
+     * multiple of 1000 or a saturation output ({@code Long.MIN_VALUE}/{@code MAX_VALUE}) of the
+     * {@code TimeUnit} conversions, so {@code MIN_VALUE + 1} is provably unreachable. Even a
+     * collision would be benign, not wrong: a false split sends the update down
+     * {@link #putSplitByWindow}, which re-derives the same window per element.
      */
-    private @Nullable Long singleWindowOf(PartitionUpdate update, TimeSeriesCompactionStrategyOptions opts)
+    private static final long NO_SINGLE_WINDOW = Long.MIN_VALUE + 1;
+
+    /**
+     * @return the one window every element of {@code update} routes to, or {@link #NO_SINGLE_WINDOW}
+     *         if they do not all agree and the update has to be split. The common case — a single
+     *         row, or a batch of rows written at the same time — takes the single-window answer and
+     *         is then applied whole, with no per-row wrapping at all.
+     *
+     * <p>Folds the elements' routing timestamps to a [min, max] and computes only two windows.
+     * Exact, not approximate: {@code windowOf} is monotone non-decreasing (truncating division and
+     * saturating {@code TimeUnit} conversions), so every element's timestamp lies in [lo, hi] and
+     * {@code windowOf(lo) == windowOf(hi)} holds if and only if all element windows are equal.
+     */
+    private static long singleWindowOf(PartitionUpdate update, TimeSeriesCompactionStrategyOptions opts)
     {
-        long window = 0;
-        boolean seen = false;
+        long lo = Long.MAX_VALUE;
+        long hi = Long.MIN_VALUE;
 
         DeletionInfo deletionInfo = update.deletionInfo();
         DeletionTime partitionDeletion = deletionInfo.getPartitionDeletion();
         if (!partitionDeletion.isLive())
         {
-            window = windowOf(partitionDeletion.markedForDeleteAt(), opts);
-            seen = true;
+            long t = partitionDeletion.markedForDeleteAt();
+            lo = Math.min(lo, t);
+            hi = Math.max(hi, t);
         }
 
         if (deletionInfo.hasRanges())
         {
             for (Iterator<RangeTombstone> it = deletionInfo.rangeIterator(false); it.hasNext(); )
             {
-                long candidate = windowOf(it.next().deletionTime().markedForDeleteAt(), opts);
-                if (seen && candidate != window)
-                    return null;
-                window = candidate;
-                seen = true;
+                long t = it.next().deletionTime().markedForDeleteAt();
+                lo = Math.min(lo, t);
+                hi = Math.max(hi, t);
             }
         }
 
         Row staticRow = update.staticRow();
         if (!staticRow.isEmpty())
         {
-            long candidate = windowOf(maxTimestamp(staticRow), opts);
-            if (seen && candidate != window)
-                return null;
-            window = candidate;
-            seen = true;
+            long t = maxTimestamp(staticRow);
+            lo = Math.min(lo, t);
+            hi = Math.max(hi, t);
         }
 
         for (Row row : update)
         {
             if (row.isEmpty())
                 continue;
-            long candidate = windowOf(maxTimestamp(row), opts);
-            if (seen && candidate != window)
-                return null;
-            window = candidate;
-            seen = true;
+            long t = maxTimestamp(row);
+            lo = Math.min(lo, t);
+            hi = Math.max(hi, t);
         }
 
         // An update with nothing timestamped in it stores nothing; the window it nominally lands in is
         // arbitrary, so use the epoch one rather than reading a clock.
-        return seen ? window : windowOf(0L, opts);
+        if (lo > hi)
+            return windowOf(0L, opts);
+        long low = windowOf(lo, opts);
+        return low == windowOf(hi, opts) ? low : NO_SINGLE_WINDOW;
     }
 
     /**
@@ -469,22 +545,10 @@ public class TimeSeriesMemtable extends AbstractAllocatorMemtable
         if (!row.deletion().isLive())
             max = Math.max(max, row.deletion().time().markedForDeleteAt());
 
-        for (ColumnData data : row)
-        {
-            if (data.column().isSimple())
-            {
-                max = Math.max(max, ((Cell<?>) data).timestamp());
-            }
-            else
-            {
-                ComplexColumnData complex = (ComplexColumnData) data;
-                if (!complex.complexDeletion().isLive())
-                    max = Math.max(max, complex.complexDeletion().markedForDeleteAt());
-                for (Cell<?> cell : complex)
-                    max = Math.max(max, cell.timestamp());
-            }
-        }
-        return max;
+        // ColumnData.maxTimestamp() folds a simple cell's timestamp, or a complex column's cells
+        // plus its complex deletion — exactly the hand-rolled loop this replaces, minus the
+        // per-row iterator allocation (accumulate walks the BTree in place).
+        return row.accumulate((data, v) -> Math.max(v, data.maxTimestamp()), max);
     }
 
     /**
@@ -497,6 +561,11 @@ public class TimeSeriesMemtable extends AbstractAllocatorMemtable
         return opts.windowStartFor(TimeUnit.MILLISECONDS.convert(writeTimestamp, opts.timestampResolution));
     }
 
+    /**
+     * The one instance of {@code key} every shard shares, cloned into memtable memory on first sight.
+     * Called only when a partition may have to be <em>created</em> — a shard hit needs no key at all
+     * (see {@link #putSingleWindow}) — so on the steady-state ingest path this map is not touched.
+     */
     private DecoratedKey internKey(DecoratedKey key, Cloner cloner, OpOrder.Group opGroup)
     {
         DecoratedKey existing = keys.get(key);
@@ -515,15 +584,30 @@ public class TimeSeriesMemtable extends AbstractAllocatorMemtable
         return cloned;
     }
 
+    /**
+     * The shard the last write used. A single volatile reference, never a (window, shard) field
+     * pair: two fields can be read torn, and a torn read routes rows into the wrong window's
+     * shard. The shard carries its own final {@code windowStart}, so one volatile read plus a
+     * final-field compare is self-consistent by construction. Benignly racy: shards are never
+     * removed from {@link #shards}, so a stale hit is impossible — a miss just pays the map probe.
+     */
+    private volatile WindowShard lastShard;
+
     private WindowShard shardFor(long windowStart)
     {
-        WindowShard shard = shards.get(windowStart);
-        if (shard != null)
-            return shard;
+        WindowShard cached = lastShard;
+        if (cached != null && cached.windowStart() == windowStart)
+            return cached;
 
-        WindowShard created = new WindowShard(windowStart, metadata, allocator, columnarStorage);
-        WindowShard raced = shards.putIfAbsent(windowStart, created);
-        return raced != null ? raced : created;
+        WindowShard shard = shards.get(windowStart);
+        if (shard == null)
+        {
+            WindowShard created = new WindowShard(windowStart, metadata, allocator, columnarStorage);
+            WindowShard raced = shards.putIfAbsent(windowStart, created);
+            shard = raced != null ? raced : created;
+        }
+        lastShard = shard;
+        return shard;
     }
 
     // -------------------------------------------------------------------------------------- reads
@@ -673,6 +757,11 @@ public class TimeSeriesMemtable extends AbstractAllocatorMemtable
 
     // --------------------------------------------------------------------------------- statistics
 
+    /**
+     * Answered from {@link #keys} alone, which is why a key is always published <em>before</em> the
+     * partition it belongs to (see {@link #putSingleWindow}): {@code ColumnFamilyStore} discards a
+     * memtable that says it is clean without flushing it.
+     */
     @Override
     public boolean isClean()
     {
@@ -912,9 +1001,18 @@ public class TimeSeriesMemtable extends AbstractAllocatorMemtable
         long put(PartitionUpdate update, UpdateTransaction indexer, Cloner cloner, OpOrder.Group opGroup, AtomicLong liveDataSize);
 
         /**
-         * A fully-materialized, stable view for the flush path. Unlike the read path this must not
-         * leave a cached materialization behind, or flushing a memtable would rebuild — and pin —
-         * the object form of every partition at once.
+         * This partition as the flush path reads it: every row, in order, once, and then dropped.
+         * Not required to be materialized and not required to be a stable snapshot —
+         * {@link TimeSeriesColumnarPartition} streams straight off its arrays, and nothing writes to
+         * a memtable being flushed anyway (the flush task awaits the {@code Keyspace.writeOrder}
+         * barrier before the flush set is built). What no implementation may do is leave a cached
+         * materialization behind: the flush set walks every partition, so pinning each one's object
+         * form would rebuild the whole memtable on the heap at flush time — the footprint the
+         * columnar arrays exist to avoid, and the shape of the OOM that f70a0a0610 removed.
+         *
+         * <p>The view must also not put rows or the partition key through
+         * {@code MemtableAllocator.ensureOnHeap()}, unlike the read path's accessors: flush never
+         * has, and the sstable writer copies what it needs as it serializes.
          */
         Partition flushView();
 

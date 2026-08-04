@@ -26,7 +26,8 @@ import java.util.Set;
  * {@link #advance()} before every other accessor; it returns {@code false} once the payload is
  * exhausted.
  * <p>
- * Unlike {@link SampleCursor}, a chunk can outlive a table's schema at encode time, so columns
+ * Unlike the removed single-column format's {@code SampleCursor} (one value stream, no names),
+ * a chunk can outlive a table's schema at encode time, so columns
  * are looked up by name rather than assumed to exist: {@link #hasColumn} reports whether a
  * column is known to this cursor at all (false for a column ADDed to the table after this chunk
  * was written, or for one excluded from the projection), and {@link #isNull}/{@link #getBytes}

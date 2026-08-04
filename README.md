@@ -24,31 +24,33 @@ ORDER BY timestamp ASC;
 
 **2. 오래된 데이터는 자동 압축, 조회는 그대로.** 계층형 저장이 지난 데이터를 컬럼 지향 청크로 압축해 옮기고, `SELECT`는 압축 여부를 몰라도 됩니다(투명 읽기가 자동 병합).
 
-**3. 압축이 조회까지 빠르게 만듭니다 — 단, 집계에 한해서.** 운영 테이블 형태(`tm_tag_point`,
-일반 컬럼 8개) 3,000만 건 실측 — [벤치마크 전문](doc/timeseries/tiering-benchmark.md):
+**3. 압축이 조회까지 빠르게 만듭니다 — 저장과 질의 양쪽에서 이깁니다.** 운영 테이블
+형태(`tm_tag_point`, 일반 컬럼 8개) 2,000만 건 실측 — 호스트 234(Xeon Silver 4114T, 40스레드),
+chunk format v4 — [벤치마크 전문](doc/timeseries/tiering-benchmark.md):
 
-| 항목 | 계층화 전 | 계층화 후 | 효과 |
+| 항목 | 계층화 전 | 계층화 후 (v4) | 효과 |
 | --- | --- | --- | --- |
-| 저장 용량 | 356.8 MB | **72.4 MB** | **4.9× 절감** (11.9 → 2.41 B/행) |
-| `time_bucket` + 집계 | 306~371 ms | **66~114 ms** | **3.1~4.4× 빠름** |
-| gap-fill (locf / interpolate) | 163~374 ms | **35~88 ms** | **4.3~4.7× 빠름** |
-| 100개 태그 태그별 p95 (500만 행) | 28.8 s | **5.5 s** | **5.2× 빠름** |
-| 100개 태그 시간별 평균 (500만 행) | 33.2 s | **8.3 s** | **4.0× 빠름** |
-| 1시간 범위 + 컬럼 투영 | 56~57 ms | **33~34 ms** | **1.7× 빠름** |
-| 최신 1,000행 `SELECT *` (시간 범위 없음) | 43~45 ms | 144 ms | **3.2배 느림** |
-| 재인코딩 처리량 | — | 64k rows/s | |
+| 저장 용량 | 237.8 MB | **33.3 MB** | **7.1× 절감** (11.9 → ~1.7 B/행) |
+| `count(*)` (4만 행 파티션) | 303 ms | **50 ms** | **6.1× 빠름** |
+| `time_bucket` + 집계 | 150~270 ms | **31~64 ms** | **3~6× 빠름** |
+| gap-fill (locf / interpolate) | 162~284 ms | **30~53 ms** | **5.4× 빠름** |
+| 90개 태그 태그별 p95 (360만 행) | 14.2 s | **2.6 s** | **5.4× 빠름** |
+| 90개 태그 시간별 평균 (360만 행) | 14.9 s | **4.2 s** | **3.5× 빠름** |
+| 1시간 범위 + 컬럼 투영 | 55~56 ms | **30~33 ms** | **1.8× 빠름** |
+| 최신 1,000행 `SELECT *` (시간 범위 없음) | 52~56 ms | **38~45 ms** | 동률 이상 |
+| 재인코딩 처리량 | — | **108k rows/s** | 게이트(50k)의 2.2배 |
 
-> **느려지는 건 "행 단위 조회"가 아니라 "시간 범위 없는 질의"입니다.** 범위를 걸면 해당 창의 청크
-> 하나만, 걸지 않으면 파티션의 청크를 **전부** 디코드합니다 — `LIMIT`은 디코드 뒤에 적용돼 도움이
-> 되지 않습니다. 같은 `SELECT *`라도 1시간 범위를 건 쪽은 동률이고, 컬럼까지 좁히면 1.7배
-> 빨라집니다. `static` 컬럼만 읽는 질의는 4 ms → 44 ms로 11배 느려집니다(절대값은 작습니다).
-> **계층화된 테이블에는 항상 시간 범위를 거십시오.**
+> **측정한 모든 질의에서 계층화 후가 같거나 빠릅니다** — 시간 범위 없는 조회·행 단위 조회·static
+> 조회 포함. 시간 범위 없는 `LIMIT` 조회는 질의 방향 순서로(DESC면 최신 창부터) 창을 하나씩
+> 디코드하다 `LIMIT`이 차면 멈추므로 느려지지 않습니다.
 >
 > **`hot_window` 안쪽 질의는 비용이 없습니다** — 콜드 경계 위에서 시작하는 질의는 병합을 건너뛰고
 > 핫 이터레이터를 그대로 돌려줍니다. 위 수치는 전 구간을 콜드로 만든 최대 부하 조건입니다.
 >
-> **형태에 크게 좌우됩니다.** `double` 컬럼 1개짜리 테이블에서는 같은 코드가 디스크 35% 절감에
-> 질의는 동률~30% 느림으로 나옵니다 — 접을 상수 컬럼이 없기 때문입니다.
+> **주의 두 가지.** 파티션 키 없는 풀스캔 집계는 계층화된 테이블에서 오답을 냅니다 — 청크를
+> 병합하지 않는 경로입니다([벤치마크 §주의](doc/timeseries/tiering-benchmark.md) 참고). 그리고
+> 저장 절감 폭은 형태에 좌우됩니다 — 접을 상수·null 컬럼이 없는 최소 형태(고엔트로피 `double`
+> 1컬럼)는 v4 기준 재측정 전이니, 도입 전 자기 테이블 형태로 재보십시오.
 
 **4. 시계열에 맞는 컴팩션·보존.** 시간 창 단위로 SSTable을 정렬·동결(창당 1개)하고, 보존 만료 창은 컴팩션 없이 통째 삭제합니다. 엣지 장비의 지각 백필도 자기 시간대로 자동 격리됩니다.
 
@@ -62,7 +64,7 @@ ORDER BY timestamp ASC;
 | **Gap-fill** | `GROUP BY time_bucket_gapfill(width, ts, start, finish)` — 빈 버킷 실체화 + `locf()`/`interpolate()` 채움 정책 | [사용법 §3](#3-빈-구간-채우기--time_bucket_gapfill) |
 | **풀텍스트 검색** | SAI `LIKE` + `index_analyzer`(ngram/standard/cjk/keyword + JSON) — 단어 중간 조각·공백 걸침·한글까지 진짜 부분문자열 매치, ALLOW FILTERING 불필요 | [fulltext-search.md](doc/timeseries/fulltext-search.md) |
 | **시계열 컴팩션 (TSCS)** | `TimeSeriesCompactionStrategy` — 창 정렬 + 창 내부 UCS 위임 + retention 창 통삭제 + 닫힌 창 동결(창당 1 SSTable, `WindowFrozenListener` 이벤트 훅, far-future 가드 `max_future_window`, **동결 시점에** 이미 만료된 TTL 데이터는 retention 없이 회수 — 동결 이후 만료되는 데이터는 `retention` 필요) + 지각 격리(flush/스트리밍 창 경계 스플릿 — 백필이 과거 창에 국소 편입, 레거시 걸침 SSTable 자동 분할) + **전용 memtable**(테이블별 옵트인 — 행을 쓰기 시점에 TSCS 창으로 배정해 flush 라우팅·64 MiB 파티션 상한 제거, 원시 배열 컬럼 저장으로 행당 힙 **5.5×↓** 실측, 계층화 테이블의 콜드 창은 flush 시점에 바로 청크로) | [timeseries-compaction.md](doc/timeseries/timeseries-compaction.md) · [timeseries-memtable.md](doc/timeseries/timeseries-memtable.md) · [설계 스펙](docs/superpowers/specs/2026-07-31-timeseries-compaction-design.md) |
-| **컬럼 지향 청크 코덱** *(계층형 저장 1단계)* | 창 1개 = 공유 타임스탬프 축(델타-오브-델타) + 일반 컬럼별 독립 섹션의 무손실 압축. `double`은 Chimp128 값 스트림(양자화 워크/주기 신호에서 1.4~2.5 B/샘플), `boolean`은 비트팩, 정수·시각 계열은 zigzag varint 델타, `text`는 사전, 그 외 타입은 불투명 바이트 폴백. 값이 일정한 컬럼은 CONSTANT, 전부 null인 컬럼은 ALL_NULL로 O(1) 처리. 운영 형태 3,000만 건 스케일 실측 **2.41 B/행** (행 저장 11.9 B/행 대비 **4.9×**); 단위 측정(창당 3,600행)은 3.39 B/행 | [포맷 규격+실측](doc/timeseries/columnar-chunks.md) · [bake-off 결과](doc/timeseries/codec-bakeoff.md) · [설계 스펙](docs/superpowers/specs/2026-07-31-industrial-tiered-storage-design.md) |
+| **컬럼 지향 청크 코덱 (chunk format v4)** *(계층형 저장 1단계)* | 창 1개 = 공유 타임스탬프 축 + 일반 컬럼별 독립 섹션의 무손실 압축, 모든 블록이 독립 디코드·랜덤 접근. `double`은 ALP/ALP-RD(유일한 double 코덱), 정수·시각 계열은 FOR/델타 비트팩, `boolean`은 1비트팩, `text`·불투명 바이트는 사전(DICT)/RAW. 값이 일정한 컬럼은 CONSTANT, 전부 null인 컬럼은 ALL_NULL로 O(1) 처리. 운영 형태 2,000만 건 실측 **~1.7 B/행** (행 저장 11.9 B/행 대비 **7.1×**, 호스트 234) | [포맷 규격](doc/timeseries/chunk-format-v4.md) · [코덱 실측 비교](doc/timeseries/codec-bakeoff.md) · [설계 스펙](docs/superpowers/specs/2026-07-31-industrial-tiered-storage-design.md) |
 | **계층형 저장 (청크 스토어)** *(계층형 저장 2단계)* | 테이블 확장 `timeseries_tiering` 정책 — 백그라운드 재인코더가 hot_window를 지난 창을 청크로 압축해 `<테이블>__chunks`로 이동(지각 데이터 병합, cold_window 만료, CL 쿼럼 하한). `nodetool retier`/`tieringstatus`, `system_views.timeseries_tiering`. **투명 읽기(SP3)**: 베이스 테이블 SELECT가 핫 로우+청크를 자동 병합 — 시간범위·포인트·집계·gap-fill·LIMIT/DESC가 핫·콜드에 걸쳐 동작 | [tiered-storage.md](doc/timeseries/tiered-storage.md) |
 | **테스트 인프라** | 도커 통합 테스트 52건(릴리스 게이트), 1억 건 스케일 하네스, 3노드 jvm-dtest, GC 비교(ZGC vs G1) | [보고서들](doc/timeseries/) |
 | **배포/CI** | Testcontainers 호환 도커 이미지, GitLab CI(빌드→테스트→이미지→통합 게이트→릴리스), 태그 릴리스 자동화 | [.gitlab-ci.yml](.gitlab-ci.yml) |
@@ -77,18 +79,21 @@ ORDER BY timestamp ASC;
 | [Continuous Aggregates 설계 (continuous-aggregates-design.md)](doc/timeseries/continuous-aggregates-design.md) | 시간 버킷 롤업(연속 집계) 설계안 — 진행 중 |
 | **[풀텍스트 검색 (fulltext-search.md)](doc/timeseries/fulltext-search.md)** | SAI `LIKE` + `index_analyzer` — 로그/메시지 본문 부분문자열 검색 (한글 포함) |
 | **[프로덕션 투입 체크리스트 (production-rollout.md)](doc/timeseries/production-rollout.md)**  | 계층화를 실 운영 테이블에 처음 켜기 전 확인 목록 — 되돌릴 수 없는 지점, 스키마 요건, TTL→`cold_window` 이관, 애플리케이션 영향, 검증 절차 |
-| **[계층화 벤치마크 (tiering-benchmark.md)](doc/timeseries/tiering-benchmark.md)** | 운영 형태 3,000만 건 전/후 실측 — 저장 **4.9×↓**, 집계 **2.2×↑**, gap-fill **4.3×↑**, 행 단위 조회 3배↓, 재인코딩 64k rows/s |
+| **[계층화 벤치마크 (tiering-benchmark.md)](doc/timeseries/tiering-benchmark.md)** | 운영 형태 2,000만 건 전/후 실측 (호스트 234, chunk v4) — 저장 **7.1×↓**, 집계 **3~6×↑**, gap-fill **5.4×↑**, 범위 없는 조회 포함 전 질의 동률 이상, 재인코딩 108k rows/s |
 | **[운영 튜닝 가이드 (operations-tuning.md)](doc/timeseries/operations-tuning.md)** | 장기 보존(10년) 전환 실전 가이드 — 용량 산수, 적용 순서, 원본·**청크 테이블** 튜닝값과 근거, TTL과 계층화의 관계, 점검 목록 |
 | **[시계열 컴팩션 (timeseries-compaction.md)](doc/timeseries/timeseries-compaction.md)** | `TimeSeriesCompactionStrategy` — 창 크기·동결·`retention` 설정, 창의 일생, 지각 데이터 격리, 파킹된 창의 두 원인과 진단법, TTL이 아니라 `retention`이 만료를 담당하는 이유, **운영 노드 실측** |
 | **[시계열 전용 Memtable (timeseries-memtable.md)](doc/timeseries/timeseries-memtable.md)** | `TimeSeriesMemtable` — 켜는 법(yaml 설정 키 + `ALTER TABLE`, 두 단계를 틀리기 쉬운 이유), 지원/미지원 스키마와 폴백 동작, 파킹 원인 제거·행당 힙 5.5× 실측·**스트리밍 읽기**(슬라이스 이진 탐색, 필요한 행만 조립, 보유 0)·콜드 창 청크 직접 flush(내구성 순서), 확인 절차 |
 | **[운영 투입 보고서 2026-08-02 (prod-ops-report-2026-08-02.md)](doc/timeseries/prod-ops-report-2026-08-02.md)** | 실 노드 12시간 기록 — 배포 5회, 사고 2건의 전말과 재발 방지, 판단이 뒤집힌 것들, 실측 절차 |
 | **[운영 TSCS 설정과 파킹 진단 (prod-tscs-settings.md)](doc/timeseries/prod-tscs-settings.md)** | 75개 테이블의 현재 설정과 근거, 파킹된 창의 두 원인을 가르는 진단 절차, 24k rows/s 유입 중 실측값 |
 | **[계층형 저장 (tiered-storage.md)](doc/timeseries/tiered-storage.md)** | `timeseries_tiering` 정책·청크 재인코더 — 설정, 청크 조회 패턴, 운영(nodetool/가상 테이블), 불변식과 제한사항 |
-| **[압축 설명 (compression.md)](doc/timeseries/compression.md)** | 컬럼별로 무엇이 왜 얼마나 줄어드는가 — 두 압축 층의 관계, 타입별 인코딩과 행당 비용, 4.9×의 컬럼별 분해(8컬럼 중 4개가 0바이트), 내 테이블 추정 규칙과 실측 방법 |
-| **[청크 포맷 v3 (columnar-chunks.md)](doc/timeseries/columnar-chunks.md)** | 컬럼 지향 청크의 **와이어 포맷 규격** — 헤더·디렉토리·null 비트맵·타입별 인코딩, 결정성/멱등성 규칙, 스키마 진화, 크기 한계, 행당 바이트 실측 |
-| [코덱 bake-off (codec-bakeoff.md)](doc/timeseries/codec-bakeoff.md) | Gorilla vs Chimp128 압축률 실측과 Chimp128 단일화 근거 |
+| **[압축 설명 (compression.md)](doc/timeseries/compression.md)** | 컬럼별로 무엇이 왜 얼마나 줄어드는가 — 두 압축 층의 관계, 타입별 인코딩과 행당 비용, 절감폭의 컬럼별 분해(8컬럼 중 4개가 0바이트), 내 테이블 추정 규칙과 실측 방법 |
+| **[청크 포맷 v4 (chunk-format-v4.md)](doc/timeseries/chunk-format-v4.md)** | 유일한 청크 포맷의 **와이어 포맷 규격** — 헤더·디렉토리·블록 테이블·presence 4모드·타입별 블록 인코딩(ALP 포함), 결정성 규칙, 크기 한계 (v1~v3는 제거된 포맷 — 읽으면 `UnsupportedChunkFormatException`) |
+| [코덱 bake-off (codec-bakeoff.md)](doc/timeseries/codec-bakeoff.md) | double 코덱 실측 비교 — **ALP/ALP-RD 단일화** 결론과 분포별 B/값 (Gorilla·Chimp128 대비) |
 | [통합 테스트 보고서](doc/timeseries/integration-test-report.md) | 실제 컨테이너에서 실행한 52개 검증의 CQL·결과·소요 시간 |
-| [스케일 테스트 보고서 (1억 건)](doc/timeseries/scale-test-report.md) | 1억 행 적재 후 측정한 쿼리별 CQL 실행 시간 |
+| [스케일 테스트 보고서 (1억 건)](doc/timeseries/scale-test-report.md) | 1억 행 용량 검증 — 적재·집계의 스캔 행 수 선형성 (구형 호스트 기록; 현재 수치는 계층화 벤치마크) |
+| **[읽기/쓰기 처리량 벤치마크 (rw-throughput-benchmark.md)](doc/timeseries/rw-throughput-benchmark.md)** | 초당 처리량 실측 — 적재 **233k rows/s**(호스트 234) · 쓰기 경로 424k rows/s·청크 인코딩 684k rows/s·청크 풀스캔 740µs/3,600행(호스트 237, JMH) · 재인코딩 108k rows/s · 패턴별 읽기 ops/s는 v4 재측정 대기 |
+| **[Memtable 쓰기 튜닝 기록 (memtable-write-tuning.md)](doc/timeseries/memtable-write-tuning.md)** | 쓰기 경로 최적화 기록 — DESC가 끄는 두 고속 경로, 설정 튜닝의 한계, 코드 수정 3라운드(min 가드·역순 long 스토어·꼬리 인덱스), ALTER 순서 함정 |
+| [SP4 계획 (sp4-plan.md)](doc/timeseries/sp4-plan.md) | SP4 로드맵 — Compressed Query·vectorized 집계 커널·SIMD 등의 삽입 지점·마일스톤·검증 게이트 (진행 상태는 문서 참고) |
 | [GC 비교: ZGC generational vs G1](doc/timeseries/gc-comparison.md) | 같은 1억 건 데이터로 두 GC의 쿼리 시간·쓰기 처리량 비교 (원자료) |
 | **[아티클: 시계열 DB에서 G1GC vs Generational ZGC](doc/timeseries/g1gc-vs-zgc-article.md)** | 위 측정을 정리한 성능 비교 아티클 (환경·방법·해석·권장 설정) |
 
@@ -603,7 +608,7 @@ SELECT site_id, tag_name, type FROM pp.tm_tag_point WHERE tag_id='TAG-001' LIMIT
 | `interval` | 백그라운드 재인코딩 주기 (예: `1h`). 60초 스위퍼가 주기 도래 테이블만 처리 |
 | `consistency` | 재인코더 CL — `LOCAL_QUORUM`(기본) / `QUORUM` / `EACH_QUORUM` / `ALL`만 허용 (약한 CL은 데이터 유실 위험이라 차단) |
 
-**코덱 선택은 없습니다**: Chimp128이 유일한 청크 코덱이라 고를 것이 없습니다 (예전 `codec` 옵션은 제거됐고, 남아 있으면 `ALTER TABLE`이 거부합니다). 값이 거의 변하지 않는 상수 계열은 코덱을 타기 전에 컬럼 지향 청크의 CONSTANT 플래그가 O(1)로 처리합니다 — [실측](doc/timeseries/codec-bakeoff.md) 참고.
+**코덱 선택은 없습니다**: `double`은 ALP/ALP-RD가 유일한 청크 코덱이라 고를 것이 없습니다 (예전 `codec` 옵션은 제거됐고, 남아 있으면 `ALTER TABLE`이 거부합니다). 값이 거의 변하지 않는 상수 계열은 코덱을 타기 전에 컬럼 지향 청크의 CONSTANT 플래그가 O(1)로 처리합니다 — [실측](doc/timeseries/codec-bakeoff.md) 참고.
 
 ### 12.4 끄기·바꾸기
 
@@ -661,9 +666,13 @@ SCALE_ROWS=100000000 SCALE_SERIES=1000 SCALE_LOADERS=16 SCALE_HEAP=16G \
 
 GC를 바꿔 비교할 수도 있습니다 — `SCALE_GC=g1`(기본은 `zgc`, `conf/jvm21-server.options`에 이미 generational ZGC가 켜져 있음), `SCALE_PASSES=2`(웜업 후 측정), `SCALE_WBENCH_ROWS=10000000`(쓰기 벤치). 두 실행 결과를 `docker/gc-compare.py <prefix-a> <prefix-b>`에 넣으면 비교표가 나옵니다 → **[GC 비교 결과](doc/timeseries/gc-comparison.md)**.
 
-결과는 `build/timeseries-scale-report.html`(+ 같은 내용의 `.md`)에 생성됩니다. **실행 결과 예시: [스케일 테스트 보고서 (1억 건)](doc/timeseries/scale-test-report.md)** — 쿼리별 CQL 실행 시간이 요약표로 정리돼 있습니다.
+결과는 `build/timeseries-scale-report.html`(+ 같은 내용의 `.md`)에 생성됩니다. 용량 검증 기록: **[스케일 테스트 보고서 (1억 건)](doc/timeseries/scale-test-report.md)** — 1억 행 완주와 스캔 행 수 선형성. 현재 기준 성능 수치는 [계층화 벤치마크](doc/timeseries/tiering-benchmark.md)에 있습니다.
 
 주의: 수백만 행 이상을 집계하려면 서버 타임아웃을 올려야 합니다. `read/range_request_timeout`뿐 아니라 **`native_transport_timeout`(기본 12초)** 이 요청 전체를 자르므로 이 값도 함께 올려야 하며, 이 키는 기본 `cassandra.yaml`에 없어서 추가해야 합니다. 스크립트가 이 설정을 대신 해 줍니다.
+
+### 초당 처리량 (ops/s) 벤치마크
+
+위 스케일 테스트가 분석 쿼리 1건의 실행 시간을 잰다면, **초당 몇 건을 처리하는가**는 별도로 측정합니다: 쓰기는 `scale-workload.py load`의 적재 속도(rows/s)가 곧 측정값이고, 읽기는 [docker/rwbench-read.py](docker/rwbench-read.py)(운영 형태 3패턴 — 태그 최신값 / 단건 / 100행 시간창)와 번들 `cassandra-stress`(서버 한계 확인용)로 잽니다. **실행 결과: [읽기/쓰기 처리량 벤치마크](doc/timeseries/rw-throughput-benchmark.md)** — 적재 233k rows/s(호스트 234, 100행 배치), 쓰기 경로 424k rows/s·청크 인코딩 684k rows/s(호스트 237, JMH); 패턴별 읽기 ops/s는 v4 기준 재측정 대기. 재현 명령 전체가 리포트에 있습니다.
 
 ## CI 및 릴리스
 

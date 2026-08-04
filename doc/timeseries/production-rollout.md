@@ -18,14 +18,25 @@
 
 # 계층형 저장 프로덕션 투입 체크리스트
 
-계층화를 실제 운영 테이블에 처음 켜기 전에 확인할 것들입니다. **계층화는 아직 어디에도 적용된 적이
-없습니다** — 이 문서는 첫 투입을 위한 것입니다.
+계층화를 실제 운영 테이블에 처음 켜기 전에 확인할 것들입니다. **운영 테이블에는 아직 계층화가
+켜져 있지 않습니다** — 운영 노드(41)는 청크 포맷 v4 빌드로 돌고 있고(2026-08-04 배포), 이전
+시험 가동에서 만들어졌던 v3 청크 테이블은 v4 전환 때 폐기됐습니다. 이 문서는 첫 투입을 위한
+것입니다.
 
 ---
 
-## 0. 되돌릴 수 없는 지점 두 개
+## 0. 되돌릴 수 없는 지점들
 
-투입 전에 이 둘을 이해하고 시작하십시오.
+투입 전에 이것들을 이해하고 시작하십시오.
+
+### 0.0 청크 포맷은 v4 하나입니다 — v4 빌드에서만 켜십시오
+
+현재 빌드가 쓰고 읽는 청크 페이로드는 **청크 포맷 v4**뿐입니다([chunk-format-v4.md](chunk-format-v4.md)).
+v4 이전 빌드가 만든 청크(v1/v2/v3)는 읽을 때 `UnsupportedChunkFormatException`으로 **쿼리가
+실패**하며, 변환 도구는 의도적으로 없습니다. 반대로 v4 청크는 구버전 빌드가 읽지 못합니다.
+따라서 **클러스터의 모든 노드가 v4 빌드(배선 머지 `5cbdf914fa` + 정리 머지 `6f4ce9faa7` 포함)로
+올라온 뒤에만** 계층화를 켜십시오. 구버전 빌드로 만들어 둔 청크 테이블이 남아 있다면 켜기 전에
+`DROP`해야 합니다 — 그 데이터는 복구되지 않으므로(§0.2) 재생성 가능한 데이터인지 먼저 확인하십시오.
 
 ### 0.1 구버전 빌드로 켜면 노드가 죽습니다
 
@@ -72,7 +83,7 @@
 ```bash
 nodetool drain                                   # memtable flush + 커밋로그 정리
 systemctl stop cassandra
-# 기존 jar 교체 (이름이 같으므로 그대로 덮어쓰기)
+# 기존 jar 교체 (설치본의 기존 jar 파일명 그대로 덮어쓰기)
 cp apache-cassandra-6.0.0.jar "$CASSANDRA_HOME/lib/"
 systemctl start cassandra
 nodetool version && nodetool status              # 올라왔는지, 링에 붙었는지
@@ -81,11 +92,39 @@ nodetool version && nodetool status              # 올라왔는지, 링에 붙�
 **주의 두 가지:**
 
 1. **`lib/`에 6.0.0 jar이 하나뿐인지 확인하십시오.** 이름이 다른 6.0.0 jar이 남아 있으면 둘 다
-   클래스패스에 올라갑니다 — `ls $CASSANDRA_HOME/lib/apache-cassandra*.jar`.
+   클래스패스에 올라갑니다 — `ls $CASSANDRA_HOME/lib/apache-cassandra*.jar`. 설치본마다 jar
+   파일명 관례가 다를 수 있으므로(운영 노드 41은 `apache-cassandra-timeseries-6.0.0.jar`),
+   **기존 파일명을 그대로 유지한 채** 교체하십시오 — 다른 이름으로 추가하면 두 jar이 함께
+   올라갑니다.
 2. **롤링으로 하십시오.** 온디스크 포맷과 CQL 문법은 업스트림 그대로이고 새 기능은 전부
    옵트인(테이블 확장 / 컴팩션 전략)이므로, **jar만 바꾼 시점에는 동작이 전혀 달라지지 않습니다.**
    계층화나 TSCS는 그 뒤에 테이블별로 켜면 됩니다. 이 성질 덕분에 바이너리 교체와 기능 활성화를
    분리해서 각각 검증할 수 있습니다.
+
+### 0.6 운영 노드 41의 배포 절차 (실측으로 확립된 것)
+
+노드 41(Haswell E5-2676 v3, 48스레드)에서 실제로 쓰는 절차와, 이 노드 특유의 함정입니다.
+
+```bash
+# 배포: jar 검증 → drain → 정지 → lib-backup 백업 → 교체 → 기동 → OOM 보호 확인
+python3 -c "import zipfile;z=zipfile.ZipFile('x.jar');print(len(z.namelist()),z.testzip())"
+nodetool drain && bash bin/stop.sh
+mv lib/apache-cassandra-timeseries-6.0.0.jar lib-backup/...jar.$(date +%Y%m%d-%H%M%S)
+\cp -f /tmp/new.jar lib/apache-cassandra-timeseries-6.0.0.jar && bash bin/start.sh
+cat /proc/$(pgrep -f '[o]rg.apache.cassandra.service.CassandraDaemon' | head -1)/oom_score_adj  # -1000
+# 롤백 (실측 3분): lib-backup 의 최신 타임스탬프 jar 로 위 절차 역방향
+```
+
+- **HA 워치독이 카산드라를 감시합니다.** `plantpulse-ha`가 정지된 카산드라를 **약 30초 만에 자동
+  재기동**합니다. 따라서 배포는 **새 jar을 `lib/`에 먼저 넣고 나서** 카산드라를 내리는 순서여야
+  합니다 — HA가 먼저 올려버려도 새 jar로 뜹니다. 재기동을 원치 않는 작업 창에서는 HA를 잠시
+  정지하십시오.
+- **`start.sh`의 OOM 보호는 기동 후 반드시 확인하십시오.** `oom_score_adj = -1000`이어야 합니다.
+  스크립트 수정본은 플랫폼(ppctl) 재동기화가 되돌릴 수 있으므로, 플랫폼 소스 템플릿에 반영되기
+  전까지는 기동 후 확인·수동 설정이 운영 절차입니다.
+- **상시 감시 항목** (5분 주기 스크립트, JMX 포함): 노드 상태·예외·ERROR·드롭 / 쓰기 지연·데이터
+  신선도 / 청크 증가·콜드 flush 실패(`cf_fail`)·memtable 폴백(`fallback`) / JMX
+  `ParkedTimeSeriesWindows`·`FarFutureTimeSeriesSSTables`(비어야 정상).
 
 ---
 
@@ -111,22 +150,23 @@ DESCRIBE TABLE pp.tm_tag_point;
 
 ## 2. TTL을 `cold_window`로 넘기기
 
-`tm_tag_point`는 현재 `default_time_to_live = 5356800`(62일)입니다. 계층화를 켤 때 이 관계를 반드시
-정리해야 합니다:
+`tm_tag_point`의 `default_time_to_live`는 현재 315,360,000초(10년)입니다 — 62일에서 상향된
+값이며, TTL은 **쓰기 시점에** 셀에 박히므로 **상향 이전에 쓰인 행은 여전히 원래의 62일 만료를
+들고 있습니다.** 계층화를 켤 때 이 관계를 반드시 정리해야 합니다:
 
 - **청크로 옮겨진 데이터에는 TTL이 적용되지 않습니다.** 재인코더는 셀의 `WRITETIME`만 읽고 `TTL`은
   읽지 않으며, 청크 포맷에 TTL 자리가 없습니다. 청크화된 데이터의 유일한 만료 장치는 `cold_window`입니다.
 - **`hot_window >= TTL`이면 아무것도 압축되지 않습니다** — TTL이 먼저 지웁니다. WARN만 남고 조용히
   아무 일도 일어나지 않습니다.
 
-> **⚠️ `default_time_to_live` 변경은 기존 행에 소급 적용되지 않습니다.** TTL은 **쓰기 시점에** 셀에
-> 박힙니다. 62일 → 10년으로 바꿔도 **이미 저장된 행은 원래의 62일 만료를 그대로 들고 있습니다.**
-> 옵션만 바꾸고 안심하면 기존 데이터는 예정대로 사라집니다.
+> **⚠️ `default_time_to_live` 변경은 기존 행에 소급 적용되지 않았습니다.** TTL은 **쓰기 시점에**
+> 셀에 박히므로, 62일 → 10년 상향은 신규 행에만 적용됐고 **상향 전에 저장된 행은 원래의 62일
+> 만료를 그대로 들고 있습니다** — 그 행들은 예정대로 사라집니다.
 >
-> **그런데 계층화가 이걸 구해 줍니다.** `hot_window`가 남은 TTL보다 짧으면(예: `hot_window 7d` vs
-> 62일 TTL), 기존 행은 TTL이 터지기 전에 청크로 옮겨지고 **그 순간 TTL이 벗겨집니다** — 이후로는
-> `cold_window`가 지배합니다. 따라서 **기존 데이터를 살리려면 계층화를 먼저 켜십시오.** TTL 옵션
-> 변경은 그다음에 해도 되고, 신규 행에만 영향을 줍니다.
+> **계층화가 이걸 구해 줍니다.** `hot_window`가 남은 TTL보다 짧으면(예: `hot_window 7d` vs
+> 62일 잔여 TTL), 기존 행은 TTL이 터지기 전에 청크로 옮겨지고 **그 순간 TTL이 벗겨집니다** —
+> 이후로는 `cold_window`가 지배합니다. 따라서 **62일 TTL을 담은 기존 행을 살리려면 그 만료 전에
+> 계층화를 켜야 합니다.**
 >
 > TTL 상한은 20년(`Attributes.MAX_TTL` = 630,720,000초)이므로 10년(315,360,000초)은 허용됩니다.
 
@@ -232,9 +272,10 @@ ALTER TABLE pp.tm_tag_point WITH compaction = {
 
 1. **전략 변경은 전체 재컴팩션을 유발합니다.** 기존 대용량 테이블에서는 상당한 IO 이벤트이므로
    비피크 시간대에, 한 노드씩 진행하십시오.
-2. **분산 검증이 아직 없습니다.** 계층화는 3노드 jvm-dtest를 통과했지만 **TSCS는 분산 테스트가
-   없습니다.** 특히 스트리밍 창 스플릿(repair/bootstrap으로 SSTable이 도착할 때 동작)은 2대 이상에서
-   실행된 적이 없습니다.
+2. **분산 검증은 3노드 jvm-dtest까지입니다.** TSCS는 스트리밍 창 스플릿(repair/bootstrap으로
+   SSTable이 도착할 때 동작), 노드별 동결 수렴, 만료 통삭제, 지각 백필 격리가
+   `TimeSeriesCompactionDistributedTest`(3노드)로 덮여 있습니다. 실 운영 다중 노드 클러스터
+   경험은 아직 없습니다(§6).
 3. **되돌리기**: `ALTER TABLE ... WITH compaction = {'class': 'UnifiedCompactionStrategy', ...}`.
    데이터 손실 없이 원복되며, 다시 전체 재컴팩션이 일어납니다.
 
@@ -283,6 +324,11 @@ JMX (`org.apache.cassandra.db:type=Tables,keyspace=pp,table=tm_tag_point`):
 | `ParkedTimeSeriesWindows` | 컴팩션이 진척을 못 내 파킹한 창 — 비어 있는 것이 정상 |
 | `FarFutureTimeSeriesSSTables` | `max_future_window` 밖이라 모든 자동 경로에서 제외된 sstable |
 
+빌드 자체의 검증 배터리(릴리스 게이트, 현재 master/v4 기준 전부 초록): 단위 398 어서션 ·
+통합([docker/integration-test.sh](../../docker/integration-test.sh)) 75 어서션 ·
+3노드 실컨테이너([docker/cluster-test.sh](../../docker/cluster-test.sh)) 49 어서션, 그리고
+JIT 티어 간 인코더 바이트 결정성 테스트(`ChunkV4CodecTest.encoderIsDeterministicAcrossJitTiers`).
+
 ---
 
 ## 6. 아직 검증되지 않은 것 (투입 판단에 필요한 정보)
@@ -292,9 +338,9 @@ JMX (`org.apache.cassandra.db:type=Tables,keyspace=pp,table=tm_tag_point`):
 - **실제 다중 노드 운영 클러스터에서 돌려본 적이 없습니다.** 3노드 jvm-dtest는 통과했고(재인코더의
   프라이머리 레인지 분할, 코디네이터 독립 투명 읽기, 지각 행 생존, 노드 재시작), 그 테스트가 실제
   스키마 전파 결함을 잡아냈지만, 이는 실 운영 부하와 다릅니다.
-- **TSCS(시계열 컴팩션)는 분산 테스트가 없습니다.** 계층화와 독립적으로 켤 수 있으므로, 첫 투입에서는
-  계층화만 켜고 컴팩션 전략은 기존 것을 유지하는 편이 변수가 적습니다.
-- **질의 성능은 패턴에 따라 갈립니다** ([벤치마크](tiering-benchmark.md)). 운영 형태 실측 기준
-  집계는 약 2.2× 빨라지고 gap-fill은 4.3× 빨라지지만, **행 단위 조회(`SELECT *`로 최신 N행)는 3배,
-  static 컬럼만 읽는 질의는 31배 느려집니다.** 조회 패턴이 집계 중심인지 원시 행 인출 중심인지
-  먼저 확인하십시오. `hot_window` 안쪽만 보는 질의는 병합을 건너뛰므로 **비용이 없습니다.**
+- **질의 성능** ([벤치마크](tiering-benchmark.md), 2026-08-04 · 234 = Xeon Silver 4114T · v4 실측):
+  저장 **7.1×** 절감(237.8 → 33.3 MB, 20M행), 집계·gap-fill은 비계층 대비 **4~6× 빠릅니다** —
+  v3 시절의 "저장 절감의 대가로 질의 감속" 트레이드오프는 v4에서 사라졌습니다. 재인코딩 처리량
+  108k rows/s. 남는 주의점은 **시간 범위 없는 질의**입니다(범위가 없으면 병합이 그 파티션의 창
+  목록 전체를 대상으로 하며, `LIMIT` 질의는 창 단위 지연 디코드로 필요한 창만 풉니다 — 벤치마크
+  문서의 운영 규칙 참고). `hot_window` 안쪽만 보는 질의는 병합을 건너뛰므로 **비용이 없습니다.**

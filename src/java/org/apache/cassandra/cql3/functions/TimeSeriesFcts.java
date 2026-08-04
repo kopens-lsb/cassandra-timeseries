@@ -865,29 +865,63 @@ public final class TimeSeriesFcts
     }
 
     /**
-     * Returns an index permutation of {@code [0, size)} ordering {@code times} ascending. When {@code sorted} is true
-     * the input is already ordered and the identity permutation is returned; otherwise a stable, allocation-light
-     * insertion sort of the indices is used (no autoboxing).
+     * Returns an index permutation of {@code [0, size)} ordering {@code times} ascending, stably: indices whose
+     * timestamps tie keep their arrival order, which is what lets a re-written sample at the same timestamp win.
+     *
+     * <p>Three paths, because the one that used to be missing was the common one. An insertion sort is O(n) on an
+     * already-sorted input and O(n²) on a reversed one — and a table declared
+     * {@code CLUSTERING ORDER BY (timestamp DESC)}, which is the ordinary time-series shape, delivers rows in
+     * exactly that reversed order. On a 100,000-row partition that was ~5e9 comparisons and measured at 14.4 s,
+     * against ~0.5 s for every other aggregate over the same scan. So:
+     * <ul>
+     *   <li>already ascending ({@code sorted}) — identity, O(n);</li>
+     *   <li>strictly descending — reverse, O(n). Strictly, because a reversal is only stable when no two
+     *       timestamps tie; with a tie the merge below is required to keep arrival order;</li>
+     *   <li>anything else — bottom-up merge sort of the indices, O(n log n), stable, one {@code int[]} of scratch
+     *       and no autoboxing.</li>
+     * </ul>
      */
     private static int[] timestampOrder(long[] times, int size, boolean sorted)
     {
         int[] order = new int[size];
         for (int i = 0; i < size; i++)
             order[i] = i;
-        if (!sorted)
+        if (sorted || size < 2)
+            return order;
+
+        boolean strictlyDescending = true;
+        for (int i = 1; i < size && strictlyDescending; i++)
+            strictlyDescending = times[i - 1] > times[i];
+        if (strictlyDescending)
         {
-            for (int i = 1; i < size; i++)
+            for (int lo = 0, hi = size - 1; lo < hi; lo++, hi--)
             {
-                int idx = order[i];
-                long key = times[idx];
-                int j = i - 1;
-                while (j >= 0 && times[order[j]] > key)
-                {
-                    order[j + 1] = order[j];
-                    j--;
-                }
-                order[j + 1] = idx;
+                int swap = order[lo];
+                order[lo] = order[hi];
+                order[hi] = swap;
             }
+            return order;
+        }
+
+        int[] scratch = new int[size];
+        for (int width = 1; width < size; width <<= 1)
+        {
+            for (int lo = 0; lo < size; lo += width << 1)
+            {
+                int mid = Math.min(lo + width, size);
+                int hi = Math.min(lo + (width << 1), size);
+                int i = lo, j = mid, k = lo;
+                // '<=' keeps the left run first on a tie, which is what makes the sort stable.
+                while (i < mid && j < hi)
+                    scratch[k++] = times[order[i]] <= times[order[j]] ? order[i++] : order[j++];
+                while (i < mid)
+                    scratch[k++] = order[i++];
+                while (j < hi)
+                    scratch[k++] = order[j++];
+            }
+            int[] swap = order;
+            order = scratch;
+            scratch = swap;
         }
         return order;
     }
